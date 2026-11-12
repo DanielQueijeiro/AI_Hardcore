@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from src.agents.graph import run_orchestration
 from src.config import get_settings
+from src.db.support_store import ensure_seeded_database
+from src.rag.retriever import get_retriever
 from src.schemas import (
     ChatRequest,
     ChatResponse,
@@ -17,10 +21,20 @@ from src.schemas import (
     SafetyTier,
 )
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Pre-seed SQLite fixtures and warm the Hybrid RAG index on application startup."""
+    ensure_seeded_database()
+    get_retriever()
+    yield
+
+
 app = FastAPI(
     title="Getnet Multi-Agent Support System",
     version="0.1.0",
     description="Multi-agent customer support and knowledge orchestration service for Getnet Merchants.",
+    lifespan=lifespan,
 )
 
 

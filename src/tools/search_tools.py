@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 except ImportError:  # pragma: no cover
-    DDGS = None  # type: ignore[assignment,misc]
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        DDGS = None  # type: ignore[assignment,misc]
 
 from src.config import get_settings
 from src.rag.retriever import RetrievedChunk, get_retriever
@@ -98,7 +102,7 @@ def _should_use_live_httpx(enable_live_http: bool | None) -> bool:
 
 def _should_use_live_ddgs(enable_live_http: bool | None) -> bool:
     """Return True when live HTTP is enabled or when DDGS has been monkeypatched by a test."""
-    if DDGS is not None and not getattr(DDGS, "__module__", "").startswith("duckduckgo_search"):
+    if DDGS is not None and not getattr(DDGS, "__module__", "").startswith(("ddgs", "duckduckgo_search")):
         return True
     return _should_use_live_http(enable_live_http)
 
@@ -180,7 +184,7 @@ def _fetch_open_meteo_forecast(query: str, use_live_http: bool, timeout_seconds:
                 "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
                 f"&timezone={tz}&forecast_days=2"
             )
-            response = httpx.get(url, timeout=timeout_seconds)
+            response = httpx.get(url, timeout=timeout_seconds, follow_redirects=True)
             response.raise_for_status()
             payload: dict[str, Any] = response.json()
             daily = payload.get("daily", {})
@@ -226,7 +230,7 @@ def _fetch_frankfurter_fx(query: str, use_live_http: bool, timeout_seconds: floa
     if use_live_http:
         try:
             url = f"https://api.frankfurter.app/latest?from={base}&to={symbols}"
-            response = httpx.get(url, timeout=timeout_seconds)
+            response = httpx.get(url, timeout=timeout_seconds, follow_redirects=True)
             response.raise_for_status()
             payload: dict[str, Any] = response.json()
             rates = payload.get("rates") or {}
@@ -267,14 +271,18 @@ def _fetch_frankfurter_fx(query: str, use_live_http: bool, timeout_seconds: floa
     )
 
 
-def _try_ddg_live_search(query: str, max_results: int = 3) -> str | None:
+def _try_ddg_live_search(query: str, max_results: int = 3, timeout_seconds: int = 2) -> str | None:
     """Attempt live DuckDuckGo text search and return formatted markdown or None when empty/rate-limited."""
     if DDGS is None:
         return None
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            with DDGS() as ddgs:
+            try:
+                client_cm = DDGS(timeout=timeout_seconds)
+            except TypeError:
+                client_cm = DDGS()
+            with client_cm as ddgs:
                 results = list(ddgs.text(query, max_results=max_results) or [])
         if results:
             formatted_items: list[str] = []
@@ -305,6 +313,35 @@ def _fetch_ddg_general_search(query: str, use_live_http: bool, max_results: int 
     )
 
 
+def _run_structured_with_ddgs(
+    structured_fn: Any,
+    query: str,
+    live_httpx: bool,
+    live_ddgs: bool,
+    timeout_seconds: float,
+) -> str:
+    """Run a structured zero-key lookup concurrently with DuckDuckGo when live search is enabled."""
+    if live_ddgs and live_httpx:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            structured_fut = pool.submit(
+                structured_fn,
+                query,
+                use_live_http=live_httpx,
+                timeout_seconds=timeout_seconds,
+            )
+            ddg_fut = pool.submit(_try_ddg_live_search, query)
+            structured_text = structured_fut.result()
+            ddg_hit = ddg_fut.result()
+    else:
+        structured_text = structured_fn(
+            query,
+            use_live_http=live_httpx,
+            timeout_seconds=timeout_seconds,
+        )
+        ddg_hit = _try_ddg_live_search(query) if live_ddgs else None
+    return f"{structured_text}\n\n{ddg_hit}" if ddg_hit else structured_text
+
+
 def search_web_general(
     query: str,
     enable_live_http: bool | None = None,
@@ -313,28 +350,26 @@ def search_web_general(
     """Execute resilient zero-key web search (`ddgs` + automatic structured fallback to Open-Meteo / Frankfurter)."""
     live_httpx = _should_use_live_httpx(enable_live_http)
     live_ddgs = _should_use_live_ddgs(enable_live_http)
-    ddg_hit = _try_ddg_live_search(query) if live_ddgs else None
 
     if is_weather_query(query):
-        structured_weather = _fetch_open_meteo_forecast(
+        return _run_structured_with_ddgs(
+            _fetch_open_meteo_forecast,
             query,
-            use_live_http=live_httpx,
+            live_httpx=live_httpx,
+            live_ddgs=live_ddgs,
             timeout_seconds=timeout_seconds,
         )
-        if ddg_hit:
-            return f"{structured_weather}\n\n{ddg_hit}"
-        return structured_weather
 
     if is_fx_query(query):
-        structured_fx = _fetch_frankfurter_fx(
+        return _run_structured_with_ddgs(
+            _fetch_frankfurter_fx,
             query,
-            use_live_http=live_httpx,
+            live_httpx=live_httpx,
+            live_ddgs=live_ddgs,
             timeout_seconds=timeout_seconds,
         )
-        if ddg_hit:
-            return f"{structured_fx}\n\n{ddg_hit}"
-        return structured_fx
 
+    ddg_hit = _try_ddg_live_search(query) if live_ddgs else None
     if ddg_hit:
         return ddg_hit
     return _fetch_ddg_general_search(query, use_live_http=False)

@@ -40,6 +40,8 @@ def test_evaluation_benchmark_suite_runs_all_12_scenarios_with_100_percent_pass_
     """The evaluation runner must execute all 10 official inquiries + 2 guardrail checks, validate safety_tier, agent_sequence, and tools_called, and render a Markdown summary table."""
     from scripts.evaluate_scenarios import (
         BENCHMARK_SCENARIOS,
+        format_console_report,
+        format_json_report,
         format_markdown_report,
         main,
         run_evaluation_suite,
@@ -67,6 +69,8 @@ def test_evaluation_benchmark_suite_runs_all_12_scenarios_with_100_percent_pass_
     assert summary.passed == 12
     assert summary.failed == 0
     assert summary.pass_rate == 100.0
+    assert summary.llm_provider in {"heuristic", "groq", "gemini", "ollama", "openai"}
+    assert summary.p95_latency_ms >= 0
 
     for result in summary.results:
         assert result.passed is True, f"Scenario {result.scenario_id} failed: {result.failure_reasons}"
@@ -81,8 +85,18 @@ def test_evaluation_benchmark_suite_runs_all_12_scenarios_with_100_percent_pass_
     for sid in scenario_ids:
         assert f"| **{sid}** |" in markdown
 
+    console = format_console_report(summary, show_answers=True, use_color=False)
+    assert "12/12 (100.0%)" in console
+    assert "Sample Grounded Answers" in console
+    assert "PASS" in console
+
+    json_report = format_json_report(summary)
+    assert '"pass_rate": 100.0' in json_report
+
     exit_code = main([])
     assert exit_code == 0
+    assert main(["--format", "markdown"]) == 0
+    assert main(["--format", "json"]) == 0
 
 
 def test_readme_comprehensive_documentation() -> None:
