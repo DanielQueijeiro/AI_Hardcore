@@ -8,7 +8,7 @@
 
 ## 1. System Overview & Architectural Topology
 
-The system is a containerized, multi-agent customer support and knowledge orchestration service built with **Python 3.12**, **FastAPI**, **LangGraph**, **Pydantic v2**, **ChromaDB (Local ONNX)**, and **SQLite**.
+The system is a containerized, multi-agent customer support and knowledge orchestration service built with **Python 3.12**, **FastAPI**, **LangGraph**, **Pydantic v2**, **LocalCPUEmbedder Hybrid Vector + Lexical RAG**, and **SQLite**.
 
 ```mermaid
 flowchart TD
@@ -20,7 +20,7 @@ flowchart TD
     Router -- "Tier 1 (Account / POS Inquiry)" --> Support["Agent 3: Customer Support Agent"]
 
     subgraph Knowledge_Tools ["Knowledge Tools"]
-        RAG["Getnet Hybrid RAG (ChromaDB + ONNX)"]
+        RAG["Getnet Hybrid RAG (LocalCPUEmbedder + Lexical)"]
         WebSearch["Resilient Web Search (DDGS + Open-Meteo + Frankfurter)"]
     end
 
@@ -126,7 +126,7 @@ class OrchestrationState(TypedDict):
 ### 3.2 Agent 2 — Knowledge Agent (`knowledge_agent`)
 - **Responsibility**: Answers product/service inquiries via Hybrid RAG ([ADR-0003](./docs/adr/0003-hybrid-rag-ingestion-with-curated-fallback.md)) and general utility queries via Resilient Web Search ([ADR-0004](./docs/adr/0004-zero-cost-multi-provider-llm-and-local-embeddings.md)). When invoked after `customer_support_agent` (e.g., Scenario #5), combines the POS diagnostic findings with official troubleshooting steps.
 - **Tools**:
-  1. `retrieve_getnet_knowledge(query: str) -> list[DocumentChunk]`: Queries ChromaDB vector store populated from `https://www.getnet.net/en` + `data/getnet_knowledge_base.md`.
+  1. `retrieve_getnet_knowledge(query: str) -> KnowledgeRetrievalResult`: Queries the local CPU Hybrid RAG index (`GetnetHybridRetriever` with `LocalCPUEmbedder`) populated from `https://www.getnet.net/en` + `data/getnet_knowledge_base.md`.
   2. `search_web_general(query: str) -> str`: Executes `ddgs` search with automatic structured fallback to `api.open-meteo.com` (for weather queries like Porto Alegre) and `api.frankfurter.app` (for EUR/BRL/USD exchange rate queries).
 
 ### 3.3 Agent 3 — Customer Support Agent (`customer_support_agent`)
@@ -151,7 +151,7 @@ To guarantee all 10 official test scenarios produce rich, accurate, and verifiab
 - **Yesterday's Sales & Settlement Schedule (Scenario #3)**:
   - **Pix Sales**: `R$ 850.00` → Settled instantly (`D+0`, already credited).
   - **Debit Card Sales**: `R$ 1,240.00` → Scheduled for **today (`D+1`) by 14:00 BRT**.
-  - **Credit Card Sales (1x)**: `R$ 2,600.00` → Scheduled for **D+2** under active *Receivables Advance* plan (or `D+30` standard), net deposit `R$ 2,524.60` tomorrow.
+  - **Credit Card Sales (1x)**: `R$ 2,600.00` → Scheduled for **D+2** under active *Receivables Advance* plan (or `D+30` standard), net Settlement `R$ 2,524.60` tomorrow.
 - **POS Terminal Diagnostics (Scenarios #5 & #8)**:
   - **Terminal ID**: `POS-GS-99812` | **Model**: `Get Smart` (Android Touchscreen, 4G + Wi-Fi + NFC)
   - **Connectivity Status (Scenario #5)**: `OFFLINE_GPRS_TIMEOUT` — Dual-SIM 4G session stalled; Wi-Fi interface disabled; requires APN reset (`getnet.br`) or Wi-Fi reconnection (`Settings > Network`).

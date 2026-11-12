@@ -239,37 +239,33 @@ def _evaluate_single_response(
     )
 
 
+def _run_scenarios_with_client(client: Any) -> list[ScenarioResult]:
+    """Execute all 12 benchmark scenarios against any HTTP client supporting `.post('/chat', json=...)`."""
+    results: list[ScenarioResult] = []
+    for scenario in BENCHMARK_SCENARIOS:
+        started = time.perf_counter()
+        response = client.post(
+            "/chat",
+            json={"message": scenario.message, "user_id": scenario.user_id},
+        )
+        elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
+        data = response.json() if response.status_code == 200 else {}
+        results.append(
+            _evaluate_single_response(scenario, response.status_code, data, elapsed_ms)
+        )
+    return results
+
+
 def run_evaluation_suite(base_url: str | None = None, timeout: float = 15.0) -> EvaluationSummary:
     """Run all 12 benchmark scenarios against TestClient (default) or a live HTTP server."""
-    results: list[ScenarioResult] = []
     target_label = base_url.rstrip("/") if base_url else "in-process (FastAPI TestClient)"
-
-    if base_url:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout) as client:
-            for scenario in BENCHMARK_SCENARIOS:
-                started = time.perf_counter()
-                response = client.post(
-                    "/chat",
-                    json={"message": scenario.message, "user_id": scenario.user_id},
-                )
-                elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
-                data = response.json() if response.status_code == 200 else {}
-                results.append(
-                    _evaluate_single_response(scenario, response.status_code, data, elapsed_ms)
-                )
-    else:
-        with TestClient(app) as client:
-            for scenario in BENCHMARK_SCENARIOS:
-                started = time.perf_counter()
-                response = client.post(
-                    "/chat",
-                    json={"message": scenario.message, "user_id": scenario.user_id},
-                )
-                elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
-                data = response.json() if response.status_code == 200 else {}
-                results.append(
-                    _evaluate_single_response(scenario, response.status_code, data, elapsed_ms)
-                )
+    client_cm: Any = (
+        httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+        if base_url
+        else TestClient(app)
+    )
+    with client_cm as client:
+        results = _run_scenarios_with_client(client)
 
     total = len(results)
     passed = sum(1 for r in results if r.passed)

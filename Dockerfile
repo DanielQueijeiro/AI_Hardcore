@@ -9,16 +9,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Copy packaging metadata and source files
+# Copy packaging metadata and runtime source files
 COPY pyproject.toml README.md GLOS* SPEC.md ./
 COPY src ./src
 COPY data ./data
 COPY scripts ./scripts
-COPY tests ./tests
 
-# Install runtime and test dependencies
+# Install runtime dependencies
 RUN pip install --upgrade pip && \
-    pip install ".[dev]"
+    pip install --no-cache-dir .
 
 # Pre-seed the deterministic SQLite store so container startup is instantaneous
 RUN python -c "from src.db.support_store import ensure_seeded_database; ensure_seeded_database()"

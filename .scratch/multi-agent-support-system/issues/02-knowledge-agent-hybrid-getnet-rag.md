@@ -4,7 +4,7 @@
 
 **Blocked by:** 01: Walking Skeleton — POST /chat API, State Graph & Router Safety Policy Guardrail
 
-**Status:** done
+**Status:** resolved
 
 - [x] Official Scenario **#1** (*"What's the difference between the Get Clássica and the Get Smart?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, populates `rag_sources`, and explains the differences between both **POS Terminal** models.
 - [x] Official Scenario **#4** (*"Do I need a bank account to receive my sales via Pix?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and clarifies Getnet digital account vs. traditional bank account **Settlement** options for **Pix**.

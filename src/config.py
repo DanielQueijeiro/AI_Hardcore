@@ -61,6 +61,32 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def _call_openai_compatible_chat(
+    endpoint: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout_seconds: float,
+) -> str:
+    """Execute an OpenAI-compatible chat completions POST request (used by Groq and OpenAI)."""
+    response = httpx.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+        },
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+
 def generate_completion(
     system_prompt: str,
     user_prompt: str,
@@ -75,38 +101,24 @@ def generate_completion(
 
     try:
         if provider == "groq" and settings.groq_api_key:
-            response = httpx.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-                json={
-                    "model": settings.groq_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.1,
-                },
-                timeout=timeout_seconds,
+            return _call_openai_compatible_chat(
+                endpoint="https://api.groq.com/openai/v1/chat/completions",
+                api_key=settings.groq_api_key,
+                model=settings.groq_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout_seconds=timeout_seconds,
             )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
 
         if provider == "openai" and settings.openai_api_key:
-            response = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {settings.openai_api_key}"},
-                json={
-                    "model": settings.openai_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.1,
-                },
-                timeout=timeout_seconds,
+            return _call_openai_compatible_chat(
+                endpoint="https://api.openai.com/v1/chat/completions",
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout_seconds=timeout_seconds,
             )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
 
         if provider == "gemini" and settings.gemini_api_key:
             url = (

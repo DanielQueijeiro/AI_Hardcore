@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from src.schemas import OrchestrationState, PrimaryIntent, SafetyTier
+from src.tools.search_tools import is_fx_query, is_general_utility_query, is_weather_query
 
 PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"ignore\s+(all\s+)?(previous|prior|above)?\s*(rules|instructions|prompts|guardrails)", re.I),
@@ -92,36 +93,8 @@ def classify_inquiry(message: str, user_id: str) -> RoutingDecision:
                 ),
             )
 
-    # 4. Check Tier 2: Benign General Utility (weather forecast, foreign exchange rate)
-    is_weather_query = any(
-        kw in lower
-        for kw in (
-            "weather",
-            "forecast",
-            "temperature",
-            "rain",
-            "clima",
-            "previsão do tempo",
-            "previsao do tempo",
-            "porto alegre tomorrow",
-        )
-    )
-    is_fx_query = any(
-        kw in lower
-        for kw in (
-            "exchange rate",
-            "euro",
-            "eur",
-            "dollar",
-            "usd",
-            "cotação",
-            "cotacao",
-            "câmbio",
-            "cambio",
-            "currency rate",
-        )
-    )
-    if is_weather_query or is_fx_query:
+    # 4. Check Tier 2: Benign General Utility (weather forecast, foreign exchange rate, general public utility)
+    if is_weather_query(normalized) or is_fx_query(normalized) or is_general_utility_query(normalized):
         return RoutingDecision(
             safety_tier=SafetyTier.GENERAL_UTILITY,
             primary_intent=PrimaryIntent.GENERAL_WEB_SEARCH,

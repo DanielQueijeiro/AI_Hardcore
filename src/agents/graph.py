@@ -7,132 +7,26 @@ from typing import Literal
 
 from langgraph.graph import END, START, StateGraph
 
+from src.agents.escalation import run_escalation_agent
+from src.agents.knowledge import run_knowledge_agent
 from src.agents.router import router_node
+from src.agents.support import run_customer_support_agent
 from src.schemas import OrchestrationState, PrimaryIntent, SafetyTier
 
 
 def knowledge_node(state: OrchestrationState) -> OrchestrationState:
-    """Agent 2 (Knowledge Agent) node — delegates to src.agents.knowledge when present, else stub."""
-    try:
-        from src.agents.knowledge import run_knowledge_agent  # type: ignore[import-not-found]
-
-        return run_knowledge_agent(state)
-    except ImportError:
-        pass
-
-    sequence = list(state.get("agent_sequence", []))
-    sequence.append("knowledge_agent")
-    tools = list(state.get("tools_called", []))
-    rag_sources = list(state.get("rag_sources", []))
-
-    intent = state.get("primary_intent", PrimaryIntent.PRODUCT_KNOWLEDGE.value)
-    if intent == PrimaryIntent.GENERAL_WEB_SEARCH.value:
-        if "search_web_general" not in tools:
-            tools.append("search_web_general")
-        answer = (
-            f"[Knowledge Agent Web Search] Processed general utility inquiry for '{state.get('message', '')}'."
-        )
-    else:
-        if "retrieve_getnet_knowledge" not in tools:
-            tools.append("retrieve_getnet_knowledge")
-        if not rag_sources:
-            rag_sources.append("data/getnet_knowledge_base.md")
-        support_ctx = state.get("support_context") or {}
-        if support_ctx:
-            answer = (
-                f"{state.get('final_answer', '')}\n\n"
-                "[Knowledge Agent RAG] Enriched POS Terminal diagnostics with official Getnet troubleshooting steps."
-            ).strip()
-        else:
-            answer = (
-                f"[Knowledge Agent RAG] Processed Getnet product inquiry for '{state.get('message', '')}'."
-            )
-
-    return {
-        **state,
-        "agent_sequence": sequence,
-        "tools_called": tools,
-        "rag_sources": rag_sources,
-        "final_answer": answer,
-    }
+    """Agent 2 (Knowledge Agent) node."""
+    return run_knowledge_agent(state)  # type: ignore[return-value]
 
 
 def customer_support_node(state: OrchestrationState) -> OrchestrationState:
-    """Agent 3 (Customer Support Agent) node — delegates to src.agents.support when present, else stub."""
-    try:
-        from src.agents.support import run_customer_support_agent  # type: ignore[import-not-found]
-
-        return run_customer_support_agent(state)
-    except ImportError:
-        pass
-
-    sequence = list(state.get("agent_sequence", []))
-    sequence.append("customer_support_agent")
-    tools = list(state.get("tools_called", []))
-
-    needs_kb = bool(state.get("needs_knowledge_enrichment", False))
-    needs_handoff = bool(state.get("needs_human_handoff", False))
-
-    if needs_kb or needs_handoff:
-        if "get_pos_terminal_diagnostics" not in tools:
-            tools.append("get_pos_terminal_diagnostics")
-        support_context = {
-            "merchant_id": state.get("user_id", ""),
-            "terminal_model": "Get Smart",
-            "status": "OFFLINE_GPRS_TIMEOUT" if needs_kb else "ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN",
-        }
-        answer = (
-            f"[Customer Support Agent] Executed POS Terminal diagnostics for Merchant '{state.get('user_id', '')}'."
-        )
-    else:
-        if "get_merchant_profile_and_settlements" not in tools:
-            tools.append("get_merchant_profile_and_settlements")
-        support_context = {
-            "merchant_id": state.get("user_id", ""),
-            "settlement_summary": "Pix D+0, Debit D+1, Credit D+2",
-        }
-        answer = (
-            f"[Customer Support Agent] Retrieved Settlement schedule for Merchant '{state.get('user_id', '')}'."
-        )
-
-    return {
-        **state,
-        "agent_sequence": sequence,
-        "tools_called": tools,
-        "support_context": support_context,
-        "final_answer": answer,
-    }
+    """Agent 3 (Customer Support Agent) node."""
+    return run_customer_support_agent(state)
 
 
 def escalation_node(state: OrchestrationState) -> OrchestrationState:
-    """Agent 4 (Escalation Agent) node — delegates to src.agents.escalation when present, else stub."""
-    try:
-        from src.agents.escalation import run_escalation_agent  # type: ignore[import-not-found]
-
-        return run_escalation_agent(state)
-    except ImportError:
-        pass
-
-    sequence = list(state.get("agent_sequence", []))
-    sequence.append("escalation_agent")
-    tools = list(state.get("tools_called", []))
-    if "create_support_ticket_or_escalate" not in tools:
-        tools.append("create_support_ticket_or_escalate")
-
-    ticket_id = state.get("handoff_ticket_id") or "TKT-1988-001"
-    answer = (
-        f"{state.get('final_answer', '')}\n\n"
-        f"[Escalation Agent] Human Handoff initiated with Support Ticket {ticket_id}."
-    ).strip()
-
-    return {
-        **state,
-        "agent_sequence": sequence,
-        "tools_called": tools,
-        "needs_human_handoff": True,
-        "handoff_ticket_id": ticket_id,
-        "final_answer": answer,
-    }
+    """Agent 4 (Escalation Agent) node."""
+    return run_escalation_agent(state)  # type: ignore[return-value]
 
 
 def route_from_router(

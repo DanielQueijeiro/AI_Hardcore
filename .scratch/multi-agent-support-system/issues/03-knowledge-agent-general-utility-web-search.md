@@ -4,8 +4,8 @@
 
 **Blocked by:** 02: Knowledge Agent — Hybrid Getnet RAG for Product & Service Inquiries
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Official Scenario **#2** (*"What's the weather forecast in Porto Alegre tomorrow?"*) routes through `["router_agent", "knowledge_agent"]` with `safety_tier: "GENERAL_UTILITY"`, invokes `["search_web_general"]`, and returns a weather forecast for Porto Alegre.
-- [ ] Official Scenario **#7** (*"What's the euro exchange rate today?"*) routes through `["router_agent", "knowledge_agent"]` with `safety_tier: "GENERAL_UTILITY"`, invokes `["search_web_general"]`, and returns the current Euro exchange rate.
-- [ ] Both scenarios pass deterministically in automated `POST /chat` tests and live container runs without requiring any paid search API keys.
+- [x] Official Scenario **#2** (*"What's the weather forecast in Porto Alegre tomorrow?"*) routes through `["router_agent", "knowledge_agent"]` with `safety_tier: "GENERAL_UTILITY"`, invokes `["search_web_general"]`, and returns a weather forecast for Porto Alegre.
+- [x] Official Scenario **#7** (*"What's the euro exchange rate today?"*) routes through `["router_agent", "knowledge_agent"]` with `safety_tier: "GENERAL_UTILITY"`, invokes `["search_web_general"]`, and returns the current Euro exchange rate.
+- [x] Both scenarios pass deterministically in automated `POST /chat` tests and live container runs without requiring any paid search API keys.
