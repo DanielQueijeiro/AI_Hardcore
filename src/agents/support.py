@@ -85,7 +85,7 @@ def _format_settlement_response(profile_data: dict[str, Any]) -> str:
         notes = item["notes"]
         if gross != net:
             lines.append(
-                f"- **{modality}** (`{cycle}`): Gross **{gross}** → Net deposit **{net}** — {window}. {notes}"
+                f"- **{modality}** (`{cycle}`): Gross **{gross}** → Net Settlement **{net}** — {window}. {notes}"
             )
         else:
             lines.append(

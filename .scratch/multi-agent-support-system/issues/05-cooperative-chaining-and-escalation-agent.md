@@ -4,8 +4,8 @@
 
 **Blocked by:** 02: Knowledge Agent — Hybrid Getnet RAG for Product & Service Inquiries, 04: Customer Support Agent — Merchant Profile, Settlements & Deterministic Tools
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Official Scenario **#5** (*"My card machine won't connect to the internet, what should I do?"* for `user_id: "cliente1988"`) executes the cooperative sequence `["router_agent", "customer_support_agent", "knowledge_agent"]`, invokes `["get_pos_terminal_diagnostics", "retrieve_getnet_knowledge"]`, populates `rag_sources`, and returns both the `Get Smart` terminal diagnostic status and step-by-step reconnection instructions.
-- [ ] Official Scenario **#8** (*"My card machine is showing a transaction decline error."* for `user_id: "cliente1988"`) executes the cooperative sequence `["router_agent", "customer_support_agent", "escalation_agent"]`, invokes `["get_pos_terminal_diagnostics", "create_support_ticket_or_escalate"]`, sets `escalated_to_human: true`, populates `handoff_ticket_id`, and explains the detected **Transaction Decline** code along with the **Human Handoff** details.
-- [ ] Full integration test suite at `POST /chat` verifies all 10 official challenge scenarios and 2 guardrail scenarios end-to-end.
+- [x] Official Scenario **#5** (*"My card machine won't connect to the internet, what should I do?"* for `user_id: "cliente1988"`) executes the cooperative sequence `["router_agent", "customer_support_agent", "knowledge_agent"]`, invokes `["get_pos_terminal_diagnostics", "retrieve_getnet_knowledge"]`, populates `rag_sources`, and returns both the `Get Smart` terminal diagnostic status and step-by-step reconnection instructions.
+- [x] Official Scenario **#8** (*"My card machine is showing a transaction decline error."* for `user_id: "cliente1988"`) executes the cooperative sequence `["router_agent", "customer_support_agent", "escalation_agent"]`, invokes `["get_pos_terminal_diagnostics", "create_support_ticket_or_escalate"]`, sets `escalated_to_human: true`, populates `handoff_ticket_id`, and explains the detected **Transaction Decline** code along with the **Human Handoff** details.
+- [x] Full integration test suite at `POST /chat` verifies all 10 official challenge scenarios and 2 guardrail scenarios end-to-end.

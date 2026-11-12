@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from src.config import get_settings
 from src.rag.ingest import DocumentChunk, load_hybrid_corpus
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -170,15 +172,32 @@ class GetnetHybridRetriever:
         return scored[: max(1, top_k)]
 
 
+def _resolve_live_scrape_flag(enable_live_scrape: bool | None) -> bool:
+    """Resolve None via settings.enable_live_web_scrape while avoiding live HTTP during pytest runs unless explicit."""
+    if enable_live_scrape is not None:
+        return enable_live_scrape
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return False
+    return bool(get_settings().enable_live_web_scrape)
+
+
 @lru_cache(maxsize=4)
-def get_retriever(
-    knowledge_base_path: str | None = None,
-    enable_live_scrape: bool = False,
+def _get_cached_retriever(
+    knowledge_base_path: str | None,
+    enable_live_scrape: bool,
 ) -> GetnetHybridRetriever:
-    """Return a cached GetnetHybridRetriever instance."""
     kb_path = Path(knowledge_base_path) if knowledge_base_path else None
     chunks = load_hybrid_corpus(
         knowledge_base_path=kb_path,
         enable_live_scrape=enable_live_scrape,
     )
     return GetnetHybridRetriever(chunks=chunks)
+
+
+def get_retriever(
+    knowledge_base_path: str | None = None,
+    enable_live_scrape: bool | None = None,
+) -> GetnetHybridRetriever:
+    """Return a cached GetnetHybridRetriever instance."""
+    resolved_scrape = _resolve_live_scrape_flag(enable_live_scrape)
+    return _get_cached_retriever(knowledge_base_path, resolved_scrape)

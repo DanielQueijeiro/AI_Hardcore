@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,7 @@ try:
 except ImportError:  # pragma: no cover
     DDGS = None  # type: ignore[assignment,misc]
 
+from src.config import get_settings
 from src.rag.retriever import RetrievedChunk, get_retriever
 
 CITY_COORDINATES: dict[str, tuple[str, float, float, str]] = {
@@ -49,11 +51,16 @@ class KnowledgeRetrievalResult:
 
 def retrieve_getnet_knowledge(
     query: str,
-    top_k: int = 2,
-    enable_live_scrape: bool = False,
+    top_k: int = 3,
+    enable_live_scrape: bool | None = None,
 ) -> KnowledgeRetrievalResult:
     """Query the local CPU Hybrid RAG index and return top chunks with source citations."""
-    retriever = get_retriever(enable_live_scrape=enable_live_scrape)
+    resolved_scrape = (
+        enable_live_scrape
+        if enable_live_scrape is not None
+        else (False if "PYTEST_CURRENT_TEST" in os.environ else get_settings().enable_live_web_scrape)
+    )
+    retriever = get_retriever(enable_live_scrape=resolved_scrape)
     matched = retriever.retrieve(query=query, top_k=top_k)
 
     sources: list[str] = []
@@ -77,13 +84,28 @@ def _should_use_live_http(enable_live_http: bool | None) -> bool:
     """Determine whether to issue live external HTTP calls or use fast test mode unless monkeypatched."""
     if enable_live_http is not None:
         return enable_live_http
-    # If httpx.get is monkeypatched in a test, allow the call through so mock responses are exercised
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return False
+    return bool(get_settings().enable_live_web_scrape)
+
+
+def _should_use_live_httpx(enable_live_http: bool | None) -> bool:
+    """Return True when live HTTP is enabled or when httpx.get has been monkeypatched by a test."""
     if getattr(httpx.get, "__module__", "") != "httpx":
         return True
-    return "PYTEST_CURRENT_TEST" not in os.environ
+    return _should_use_live_http(enable_live_http)
 
 
-def _is_weather_query(lower_query: str) -> bool:
+def _should_use_live_ddgs(enable_live_http: bool | None) -> bool:
+    """Return True when live HTTP is enabled or when DDGS has been monkeypatched by a test."""
+    if DDGS is not None and not getattr(DDGS, "__module__", "").startswith("duckduckgo_search"):
+        return True
+    return _should_use_live_http(enable_live_http)
+
+
+def is_weather_query(text: str) -> bool:
+    """Return True when the text asks for a weather forecast or climate conditions."""
+    lower_query = text.strip().lower()
     return any(
         kw in lower_query
         for kw in (
@@ -94,12 +116,54 @@ def _is_weather_query(lower_query: str) -> bool:
             "clima",
             "previsão do tempo",
             "previsao do tempo",
+            "porto alegre tomorrow",
             "porto alegre",
         )
     )
 
 
-def _fetch_open_meteo_weather(query: str, use_live_http: bool, timeout_seconds: float = 2.0) -> str:
+def is_fx_query(text: str) -> bool:
+    """Return True when the text asks for a currency or foreign exchange rate."""
+    lower_query = text.strip().lower()
+    return any(
+        kw in lower_query
+        for kw in (
+            "exchange rate",
+            "euro",
+            "eur",
+            "dollar",
+            "usd",
+            "cotação",
+            "cotacao",
+            "câmbio",
+            "cambio",
+            "currency rate",
+        )
+    )
+
+
+def is_general_utility_query(text: str) -> bool:
+    """Return True when the text is a benign general utility query (weather, FX, benchmark rates, public holidays)."""
+    lower_query = text.strip().lower()
+    if is_weather_query(lower_query) or is_fx_query(lower_query):
+        return True
+    return any(
+        kw in lower_query
+        for kw in (
+            "selic",
+            "benchmark rate",
+            "central bank",
+            "ipca",
+            "inflation rate",
+            "public holiday",
+            "feriado",
+            "current time in",
+            "timezone in",
+        )
+    )
+
+
+def _fetch_open_meteo_forecast(query: str, use_live_http: bool, timeout_seconds: float = 2.0) -> str:
     """Query Open-Meteo zero-key forecast endpoint with deterministic fallback."""
     lower = query.lower()
     city_label, lat, lon, tz = CITY_COORDINATES["porto alegre"]
@@ -153,25 +217,7 @@ def _fetch_open_meteo_weather(query: str, use_live_http: bool, timeout_seconds: 
     )
 
 
-def _is_fx_query(lower_query: str) -> bool:
-    return any(
-        kw in lower_query
-        for kw in (
-            "exchange rate",
-            "euro",
-            "eur",
-            "dollar",
-            "usd",
-            "cotação",
-            "cotacao",
-            "câmbio",
-            "cambio",
-            "currency rate",
-        )
-    )
-
-
-def _fetch_frankfurter_fx_rate(query: str, use_live_http: bool, timeout_seconds: float = 2.0) -> str:
+def _fetch_frankfurter_fx(query: str, use_live_http: bool, timeout_seconds: float = 2.0) -> str:
     """Query Frankfurter (ECB) zero-key FX endpoint for EUR/BRL and EUR/USD with deterministic fallback."""
     lower = query.lower()
     base = "USD" if ("dollar" in lower or "usd" in lower) and "euro" not in lower and "eur" not in lower else "EUR"
@@ -221,25 +267,37 @@ def _fetch_frankfurter_fx_rate(query: str, use_live_http: bool, timeout_seconds:
     )
 
 
-def _fetch_ddg_general_search(query: str, use_live_http: bool, max_results: int = 3) -> str:
-    """Query DuckDuckGo text search with graceful fallback on rate limits or offline execution."""
-    if use_live_http and DDGS is not None:
-        try:
+def _try_ddg_live_search(query: str, max_results: int = 3) -> str | None:
+    """Attempt live DuckDuckGo text search and return formatted markdown or None when empty/rate-limited."""
+    if DDGS is None:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results) or [])
-            if results:
-                formatted_items: list[str] = []
-                for item in results[:max_results]:
-                    title = str(item.get("title", "Web Result")).strip()
-                    body = str(item.get("body", "")).strip()
-                    href = str(item.get("href", "")).strip()
-                    formatted_items.append(f"- **{title}**: {body} ({href})")
-                return (
-                    f"**Web Search Results for '{query}'**\n\n"
-                    + "\n".join(formatted_items)
-                )
-        except Exception:
-            pass
+        if results:
+            formatted_items: list[str] = []
+            for item in results[:max_results]:
+                title = str(item.get("title", "Web Result")).strip()
+                body = str(item.get("body", "")).strip()
+                href = str(item.get("href", "")).strip()
+                formatted_items.append(f"- **{title}**: {body} ({href})")
+            return (
+                f"**Web Search Results for '{query}'**\n\n"
+                + "\n".join(formatted_items)
+            )
+    except Exception:
+        return None
+    return None
+
+
+def _fetch_ddg_general_search(query: str, use_live_http: bool, max_results: int = 3) -> str:
+    """Query DuckDuckGo text search with graceful fallback on rate limits or offline execution."""
+    if use_live_http:
+        live_hit = _try_ddg_live_search(query, max_results=max_results)
+        if live_hit:
+            return live_hit
 
     return (
         f"**General Utility Web Search Result for '{query}'**\n\n"
@@ -252,15 +310,32 @@ def search_web_general(
     enable_live_http: bool | None = None,
     timeout_seconds: float = 2.0,
 ) -> str:
-    """Execute resilient zero-key web search for General Utility Inquiries (ADR-0004)."""
-    use_live_http = _should_use_live_http(enable_live_http)
-    lower = query.strip().lower()
+    """Execute resilient zero-key web search (`ddgs` + automatic structured fallback to Open-Meteo / Frankfurter)."""
+    live_httpx = _should_use_live_httpx(enable_live_http)
+    live_ddgs = _should_use_live_ddgs(enable_live_http)
+    ddg_hit = _try_ddg_live_search(query) if live_ddgs else None
 
-    if _is_weather_query(lower):
-        return _fetch_open_meteo_weather(query, use_live_http=use_live_http, timeout_seconds=timeout_seconds)
+    if is_weather_query(query):
+        structured_weather = _fetch_open_meteo_forecast(
+            query,
+            use_live_http=live_httpx,
+            timeout_seconds=timeout_seconds,
+        )
+        if ddg_hit:
+            return f"{structured_weather}\n\n{ddg_hit}"
+        return structured_weather
 
-    if _is_fx_query(lower):
-        return _fetch_frankfurter_fx_rate(query, use_live_http=use_live_http, timeout_seconds=timeout_seconds)
+    if is_fx_query(query):
+        structured_fx = _fetch_frankfurter_fx(
+            query,
+            use_live_http=live_httpx,
+            timeout_seconds=timeout_seconds,
+        )
+        if ddg_hit:
+            return f"{structured_fx}\n\n{ddg_hit}"
+        return structured_fx
 
-    return _fetch_ddg_general_search(query, use_live_http=use_live_http)
+    if ddg_hit:
+        return ddg_hit
+    return _fetch_ddg_general_search(query, use_live_http=False)
 

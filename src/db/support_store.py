@@ -167,7 +167,7 @@ def ensure_seeded_database(db_path: Path | str | None = None) -> Path:
                     "D+1",
                     "SCHEDULED_TODAY",
                     "Today (D+1) by 14:00 BRT",
-                    "Scheduled for deposit today (D+1) by 14:00 BRT.",
+                    "Scheduled for Settlement today (D+1) by 14:00 BRT.",
                 ),
                 (
                     "STL-1988-CREDIT",
@@ -179,7 +179,7 @@ def ensure_seeded_database(db_path: Path | str | None = None) -> Path:
                     "D+2",
                     "SCHEDULED_RECEIVABLES_ADVANCE",
                     "Tomorrow (D+2) under active Receivables Advance plan (or D+30 standard)",
-                    "Scheduled for D+2 under active Receivables Advance (Antecipação) plan, net deposit R$ 2,524.60 tomorrow.",
+                    "Scheduled for D+2 Settlement under active Receivables Advance (Antecipação) plan, net Settlement R$ 2,524.60 tomorrow.",
                 ),
                 (
                     "STL-2026-PIX",
@@ -203,7 +203,7 @@ def ensure_seeded_database(db_path: Path | str | None = None) -> Path:
                     "D+1",
                     "SCHEDULED_TODAY",
                     "Today (D+1) by 14:00 BRT",
-                    "Scheduled for deposit today (D+1) by 14:00 BRT.",
+                    "Scheduled for Settlement today (D+1) by 14:00 BRT.",
                 ),
                 (
                     "STL-2026-CREDIT",

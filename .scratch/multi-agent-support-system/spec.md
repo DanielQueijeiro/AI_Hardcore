@@ -82,7 +82,7 @@ Every HTTP response returns both the synthesized natural-language answer for the
 
 - **Hybrid RAG Pipeline (per ADR-0003)**:
   - The knowledge ingestion module fetches and parses live content from `https://www.getnet.net/en` (with graceful timeout/WAF fallback) and merges it with a curated Getnet product corpus covering *Get Clássica*, *Get Smart*, *Pix*, *Receivables Advance* (*Antecipação*), *Crediário*, *Payment Link* (*Link de Pagamento* / WhatsApp), and **POS Terminal** troubleshooting.
-  - Chunks are indexed in an embedded local vector store using local CPU ONNX embeddings (`all-MiniLM-L6-v2`) with source metadata preserved for citation in `rag_sources`.
+  - Chunks are indexed in an embedded local vector store using deterministic 384-dimensional local CPU embeddings (`LocalCPUEmbedder` with signed feature hashing + lexical BM25 hybrid retrieval, compatible with optional `ChromaDB` indexing) with source metadata preserved for citation in `rag_sources`.
 
 - **Zero-Cost Multi-Provider LLM & Resilient Free Web Search (per ADR-0004)**:
   - Model inference is abstracted behind a configurable provider interface supporting free-tier cloud providers (`groq`, `gemini`), local `ollama`, `openai`, and a deterministic `heuristic` fallback mode so the service and test suite run out-of-the-box with zero cost ($0.00) even when no external API key is supplied.
@@ -127,7 +127,7 @@ Every HTTP response returns both the synthesized natural-language answer for the
   - Good tests verify observable system behavior (`ChatResponse` payload, HTTP status codes, `agent_sequence`, `tools_called`, `rag_sources`, `escalated_to_human`, and domain facts present in `answer`) through the public entrypoint rather than asserting on private agent prompts or internal LangGraph node implementation details.
 - **Primary Seam (Single High-Level Seam)**:
   - **The HTTP API Boundary (`POST /chat` via FastAPI `TestClient` / `httpx.AsyncClient`)** is the primary testing seam for the entire orchestration system.
-  - At this seam, requests enter with `{"message": "...", "user_id": "cliente1988"}` and traverse the real `Router Agent`, real `LangGraph` state transitions, real local ChromaDB/ONNX RAG retriever, and real SQLite `Customer Support Agent` tools.
+  - At this seam, requests enter with `{"message": "...", "user_id": "cliente1988"}` and traverse the real `Router Agent`, real `LangGraph` state transitions, real local CPU Hybrid RAG retriever (`LocalCPUEmbedder` + `GetnetHybridRetriever`), and real SQLite `Customer Support Agent` tools.
   - External network boundaries (external LLM API and live weather/FX HTTP endpoints during offline unit/integration runs) are controlled via the configurable provider port so the full test suite executes deterministically in <3 seconds with zero network flakiness and $0.00 cost.
 - **Modules & Scenarios Covered**:
   1. All 10 official challenge **Inquiries** verified end-to-end through `POST /chat`, asserting exact `safety_tier`, `agent_sequence`, `tools_called`, and expected domain information in `answer`.

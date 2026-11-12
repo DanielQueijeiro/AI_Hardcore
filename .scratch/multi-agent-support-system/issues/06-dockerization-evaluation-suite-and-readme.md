@@ -4,8 +4,8 @@
 
 **Blocked by:** 03: Knowledge Agent — Resilient Web Search for General Utility Inquiries, 05: Cooperative Multi-Agent Chaining & Escalation Agent (Support -> Knowledge / Escalation)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `Dockerfile` and `docker-compose.yml` build cleanly and expose the FastAPI service on port `8000` with a working healthcheck.
-- [ ] The evaluation benchmark script runs all 10 official test scenarios plus 2 guardrail scenarios and prints a Markdown summary table verifying 100% pass rate on expected `safety_tier`, `agent_sequence`, and `tools_called`.
-- [ ] `README.md` covers how to build, configure, and run the application and tests, plus detailed sections on orchestration architecture, message workflow, Hybrid RAG pipeline (ingestion → storage → retrieval → generation), LLM tool usage, guardrails, and production observability/evaluation strategy.
+- [x] `Dockerfile` and `docker-compose.yml` build cleanly and expose the FastAPI service on port `8000` with a working healthcheck.
+- [x] The evaluation benchmark script runs all 10 official test scenarios plus 2 guardrail scenarios and prints a Markdown summary table verifying 100% pass rate on expected `safety_tier`, `agent_sequence`, and `tools_called`.
+- [x] `README.md` covers how to build, configure, and run the application and tests, plus detailed sections on orchestration architecture, message workflow, Hybrid RAG pipeline (ingestion → storage → retrieval → generation), LLM tool usage, guardrails, and production observability/evaluation strategy.
