@@ -6,7 +6,11 @@ from typing import Any
 
 from src.config import generate_completion
 from src.schemas import OrchestrationState, PrimaryIntent
-from src.tools.search_tools import KnowledgeRetrievalResult, retrieve_getnet_knowledge
+from src.tools.search_tools import (
+    KnowledgeRetrievalResult,
+    retrieve_getnet_knowledge,
+    search_web_general,
+)
 
 KNOWLEDGE_SYSTEM_PROMPT = (
     "You are the Getnet Knowledge Agent assisting a Getnet Merchant. "
@@ -15,6 +19,12 @@ KNOWLEDGE_SYSTEM_PROMPT = (
     "Always preserve specific product names (Get Clássica, Get Smart, Pix, Antecipação / "
     "Receivables Advance, Crediário, Payment Link / Get Pay), timeframes (D+0, D+1, D+2, "
     "up to 24x-36x), and technical parameters (OFFLINE_GPRS_TIMEOUT, APN getnet.br)."
+)
+
+GENERAL_WEB_SEARCH_SYSTEM_PROMPT = (
+    "You are the Getnet Knowledge Agent answering a benign General Utility inquiry for a Merchant. "
+    "Synthesize a clear, accurate response grounded strictly in the provided live web search context, "
+    "preserving all numerical values (temperatures in °C, precipitation %, or EUR/BRL/USD exchange rates)."
 )
 
 
@@ -128,24 +138,21 @@ def run_knowledge_agent(state: OrchestrationState) -> dict[str, Any]:
     support_context = state.get("support_context") or {}
 
     if intent == PrimaryIntent.GENERAL_WEB_SEARCH.value:
-        # Delegate to search_web_general if implemented (Ticket 03), else deterministic fallback
-        try:
-            from src.tools.search_tools import search_web_general  # type: ignore[attr-defined]
-
-            if "search_web_general" not in tools:
-                tools.append("search_web_general")
-            web_result = search_web_general(message)
-            answer = web_result if isinstance(web_result, str) else str(web_result)
-        except (ImportError, AttributeError):
-            if "search_web_general" not in tools:
-                tools.append("search_web_general")
-            answer = f"[Knowledge Agent Web Search] Processed general utility inquiry for '{message}'."
+        if "search_web_general" not in tools:
+            tools.append("search_web_general")
+        web_result = search_web_general(message)
+        answer = generate_completion(
+            system_prompt=GENERAL_WEB_SEARCH_SYSTEM_PROMPT,
+            user_prompt=f"Merchant Inquiry: {message}\n\nWeb Search Result:\n{web_result}",
+            fallback_text=web_result,
+        )
 
         return {
             **state,
             "agent_sequence": sequence,
             "tools_called": tools,
             "rag_sources": rag_sources,
+            "knowledge_context": web_result,
             "final_answer": answer,
         }
 
