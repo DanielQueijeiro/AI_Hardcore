@@ -7,6 +7,7 @@ from typing import Any
 from src.config import generate_completion
 from src.schemas import OrchestrationState, PrimaryIntent
 from src.tools.support_tools import (
+    create_support_ticket_or_escalate,
     get_merchant_profile_and_settlements,
     get_pos_terminal_diagnostics,
 )
@@ -131,12 +132,39 @@ def run_customer_support_agent(state: OrchestrationState) -> OrchestrationState:
         if "get_pos_terminal_diagnostics" not in tools:
             tools.append("get_pos_terminal_diagnostics")
 
+        handoff_ticket_id = state.get("handoff_ticket_id")
+        support_context: dict[str, Any] = dict(diag_data)
+
         if diag_data.get("found"):
-            if diag_data.get("connectivity_status") == "OFFLINE_GPRS_TIMEOUT" and not needs_handoff:
-                needs_kb = True
+            support_context.setdefault("terminal_model", diag_data.get("model", ""))
+            support_context.setdefault("status", diag_data.get("connectivity_status", ""))
+
             decline_info = diag_data.get("last_transaction_decline", {})
-            if decline_info.get("requires_l2_escalation") and "decline" in message.lower():
+            lower_msg = message.lower()
+            is_decline_inquiry = needs_handoff or any(
+                kw in lower_msg
+                for kw in ("decline", "error", "recusad", "pin-pad", "pinpad")
+            )
+            if decline_info.get("requires_l2_escalation") and is_decline_inquiry:
                 needs_handoff = True
+                needs_kb = False
+                issue_summary = (
+                    f"POS Terminal {diag_data.get('terminal_id')} ({diag_data.get('model')}) "
+                    f"Transaction Decline {decline_info.get('decline_code')} on transaction "
+                    f"{decline_info.get('transaction_id')} ({decline_info.get('amount_brl')}): "
+                    f"{decline_info.get('reason')}"
+                )
+                ticket_data = create_support_ticket_or_escalate(
+                    merchant_id=user_id,
+                    issue_summary=issue_summary,
+                    severity="HIGH",
+                )
+                if "create_support_ticket_or_escalate" not in tools:
+                    tools.append("create_support_ticket_or_escalate")
+                handoff_ticket_id = ticket_data.get("ticket_id")
+                support_context["support_ticket"] = ticket_data
+            elif diag_data.get("connectivity_status") == "OFFLINE_GPRS_TIMEOUT" and not needs_handoff:
+                needs_kb = True
 
         fallback_answer = _format_pos_diagnostics_summary(diag_data)
         final_answer = (
@@ -153,9 +181,10 @@ def run_customer_support_agent(state: OrchestrationState) -> OrchestrationState:
             **state,
             "agent_sequence": sequence,
             "tools_called": tools,
-            "support_context": diag_data,
+            "support_context": support_context,
             "needs_knowledge_enrichment": needs_kb,
             "needs_human_handoff": needs_handoff,
+            "handoff_ticket_id": handoff_ticket_id,
             "final_answer": final_answer,
         }
 
