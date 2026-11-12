@@ -4,11 +4,11 @@
 
 **Blocked by:** 01: Walking Skeleton — POST /chat API, State Graph & Router Safety Policy Guardrail
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Official Scenario **#1** (*"What's the difference between the Get Clássica and the Get Smart?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, populates `rag_sources`, and explains the differences between both **POS Terminal** models.
-- [ ] Official Scenario **#4** (*"Do I need a bank account to receive my sales via Pix?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and clarifies Getnet digital account vs. traditional bank account **Settlement** options for **Pix**.
-- [ ] Official Scenario **#6** (*"How does receivables advance (antecipação) work with Getnet?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and explains **Receivables Advance** mechanics and timeframes.
-- [ ] Official Scenario **#9** (*"How many installments can I split a sale into with the crediário?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and states the **Crediário** installment limits.
-- [ ] Official Scenario **#10** (*"Can I sell through WhatsApp using the Payment Link?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and confirms how **Merchants** share a **Payment Link** over WhatsApp.
-- [ ] RAG ingestion runs with local CPU embeddings at $0.00 cost and succeeds even when external scraping of `getnet.net` is slow or unreachable.
+- [x] Official Scenario **#1** (*"What's the difference between the Get Clássica and the Get Smart?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, populates `rag_sources`, and explains the differences between both **POS Terminal** models.
+- [x] Official Scenario **#4** (*"Do I need a bank account to receive my sales via Pix?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and clarifies Getnet digital account vs. traditional bank account **Settlement** options for **Pix**.
+- [x] Official Scenario **#6** (*"How does receivables advance (antecipação) work with Getnet?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and explains **Receivables Advance** mechanics and timeframes.
+- [x] Official Scenario **#9** (*"How many installments can I split a sale into with the crediário?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and states the **Crediário** installment limits.
+- [x] Official Scenario **#10** (*"Can I sell through WhatsApp using the Payment Link?"*) routes through `["router_agent", "knowledge_agent"]`, calls `["retrieve_getnet_knowledge"]`, and confirms how **Merchants** share a **Payment Link** over WhatsApp.
+- [x] RAG ingestion runs with local CPU embeddings at $0.00 cost and succeeds even when external scraping of `getnet.net` is slow or unreachable.
