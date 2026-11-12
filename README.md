@@ -16,6 +16,9 @@ This repository was designed and implemented following **Spec-Driven Development
    - [`ADR-0003`](./docs/adr/0003-hybrid-rag-ingestion-with-curated-fallback.md): Hybrid RAG combining live `https://www.getnet.net/en` scraping with a version-controlled Getnet Brazil Markdown corpus (`data/getnet_knowledge_base.md`).
    - [`ADR-0004`](./docs/adr/0004-zero-cost-multi-provider-llm-and-local-embeddings.md): Zero-cost multi-provider LLM factory (`heuristic`, `groq`, `gemini`, `ollama`, `openai`), local CPU feature-hashing embeddings (`LocalCPUEmbedder`), and resilient zero-key web search (`ddgs` + Open-Meteo + Frankfurter ECB FX).
    - [`ADR-0005`](./docs/adr/0005-cooperative-agent-chaining.md): Cooperative multi-agent chaining (`customer_support_agent` → `knowledge_agent` and `customer_support_agent` → `escalation_agent`).
+4. **How AI/LLM Coding Tools Were Leveraged Within 60-Min SDD**:
+   - AI coding assistants were used to accelerate boilerplate, test scaffolding, and refactoring while keeping architectural decisions and security boundaries strictly human-governed through `GLOSSARY.md`, `SPEC.md`, and `docs/adr/`.
+   - Implementation was broken into **6 vertical-slice issues** (`.scratch/multi-agent-support-system/issues/`), where each slice required failing integration tests first (**TDD**), targeted implementation, and independent **standards** + **spec-compliance** code-review passes verified by `pytest` and `scripts/evaluate_scenarios.py`.
 
 ---
 
@@ -72,6 +75,8 @@ Per [`ADR-0004`](./docs/adr/0004-zero-cost-multi-provider-llm-and-local-embeddin
 | `ollama` | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | Connects to a local Ollama server (default `llama3.2` on `http://localhost:11434`). |
 | `openai` | `OPENAI_API_KEY`, `OPENAI_MODEL` | Optional OpenAI completion adapter (default `gpt-4o-mini`). |
 
+Additional storage & RAG settings in [`.env.example`](./.env.example): `SQLITE_DB_PATH` (`data/support.db`), `KNOWLEDGE_BASE_PATH` (`data/getnet_knowledge_base.md`), `GETNET_SCRAPE_URL` (`https://www.getnet.net/en`), and `ENABLE_LIVE_WEB_SCRAPE` (`true`).
+
 ### 2.4 Example API Request (`POST /chat`)
 
 Both `POST /chat` and `POST /api/v1/chat` accept the challenge payload contract:
@@ -91,9 +96,9 @@ Example JSON response:
 {
   "user_id": "cliente1988",
   "message": "My card machine won't connect to the internet, what should I do?",
-  "answer": "### POS Terminal Connectivity Diagnosis & Troubleshooting (`cliente1988`)...",
+  "answer": "### POS Terminal Diagnostics for **Padaria & Café Gaúcho LTDA** (`cliente1988`)...",
   "orchestration": {
-    "trace_id": "trc-9b2f8d4e1a0c",
+    "trace_id": "trc-5d207e133c99",
     "safety_tier": "GETNET_DOMAIN",
     "primary_intent": "COMPOUND_SUPPORT_AND_KB",
     "agent_sequence": [
@@ -106,11 +111,12 @@ Example JSON response:
       "retrieve_getnet_knowledge"
     ],
     "rag_sources": [
-      "data/getnet_knowledge_base.md#pos-connectivity-troubleshooting"
+      "data/getnet_knowledge_base.md#pos-terminal-connectivity-troubleshooting",
+      "data/getnet_knowledge_base.md#get-classica-vs-get-smart"
     ],
     "escalated_to_human": false,
     "handoff_ticket_id": null,
-    "latency_ms": 14
+    "latency_ms": 22
   }
 }
 ```
@@ -122,10 +128,11 @@ Example JSON response:
 pytest -v
 
 # Run the automated 12-scenario evaluation benchmark in-process (FastAPI TestClient)
-python scripts/evaluate_scenarios.py
+# (Prefix PYTHONPATH=. on Linux/macOS or $env:PYTHONPATH="." in PowerShell if running without pip install -e .)
+python scripts/evaluate_scenarios.py --show-answers
 
 # Or run the evaluation benchmark against a live Docker container
-python scripts/evaluate_scenarios.py --base-url http://localhost:8000
+python scripts/evaluate_scenarios.py --base-url http://localhost:8000 --show-answers --format markdown
 ```
 
 ---
@@ -192,7 +199,7 @@ flowchart TD
 
 4. **Agent 4 — Human Escalation Agent (`escalation_agent` in `src/agents/escalation.py` — Bonus)**
    - **Role**: Executes structured `Human Handoff` when automated self-service cannot safely resolve a critical hardware or financial issue.
-   - **Actions**: Verifies or creates a persistent `Support Ticket` (`TKT-1988-001`), packages the full diagnostic context (`POS-GS-99812`, `TX-88410`, `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN`) for the L2 specialist queue, and provides immediate temporary mitigation options (such as *Payment Link* via WhatsApp or Tap on Phone) so the Merchant can keep selling.
+   - **Actions**: Verifies or creates a persistent `Support Ticket` (`TKT-1988-NNN`, e.g., `TKT-1988-001` on initial seed), packages the full diagnostic context (`POS-GS-99812`, `TX-88410`, `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN`) for the L2 specialist queue, and provides immediate temporary mitigation options (**Payment Link / Get Pay** or **Pix QR Code** in the **App Getnet**) so the Merchant can keep selling.
 
 ---
 
@@ -203,27 +210,29 @@ flowchart TD
 Per [`ADR-0003`](./docs/adr/0003-hybrid-rag-ingestion-with-curated-fallback.md) and [`ADR-0004`](./docs/adr/0004-zero-cost-multi-provider-llm-and-local-embeddings.md), the RAG pipeline is engineered for high recall across English and Brazilian Portuguese domain terms (*Get Clássica*, *Get Smart*, *Pix*, *Antecipação*, *Crediário*, *Link de Pagamento*) without fragile cloud embedding dependencies:
 
 1. **Ingestion (`src/rag/ingest.py`)**:
-   - **Curated Corpus**: Parses [`data/getnet_knowledge_base.md`](./data/getnet_knowledge_base.md) into self-contained `DocumentChunk` records split by level-2 Markdown headings with explicit citation anchors (e.g., `data/getnet_knowledge_base.md#pos-terminals-get-classica-vs-get-smart`).
+   - **Curated Corpus**: Parses [`data/getnet_knowledge_base.md`](./data/getnet_knowledge_base.md) into self-contained `DocumentChunk` records split by level-2 Markdown headings with explicit citation anchors (e.g., `data/getnet_knowledge_base.md#get-classica-vs-get-smart`).
    - **Live Website Scraping**: Fetches `https://www.getnet.net/en` via `httpx` + `BeautifulSoup`, strips boilerplate tags (`script`, `style`, `nav`, `footer`), and chunks extracted paragraphs into `web-*` `DocumentChunk` items. If `getnet.net` is slow, offline, or WAF-restricted inside a locked-down container, ingestion degrades gracefully in `<2s` without crashing.
 2. **Storage & Indexing (`src/rag/retriever.py`)**:
    - Uses `LocalCPUEmbedder` to compute deterministic, L2-normalized **384-dimensional dense vectors** on CPU (`$0` cost, zero external model download required at runtime) using signed Blake2b feature hashing over accent-normalized unigrams, bigrams, and character 3/4-grams, paired with pre-tokenized title and body term sets.
 3. **Hybrid Retrieval (`GetnetHybridRetriever.retrieve`)**:
-   - Scores every chunk using a weighted hybrid formula combining dense cosine similarity (`0.45`), title lexical overlap (`0.35`), body lexical overlap (`0.20`), and source specificity, returning the top-$k$ `RetrievedChunk` objects with exact source citations recorded in `orchestration.rag_sources`.
+   - Scores every chunk using a weighted hybrid formula combining dense cosine similarity (`0.45`), title lexical overlap (`0.35`), body lexical overlap (`0.20`), and a `0.05` `curated_kb` origin bonus, returning the top-$k$ `RetrievedChunk` objects (`top_k=2` in `run_knowledge_agent`) with exact source citations recorded in `orchestration.rag_sources`.
 4. **Grounded Generation (`src/agents/knowledge.py`)**:
-   - Synthesizes answers strictly grounded in the retrieved chunks (and upstream `support_context` when chained), citing the underlying Getnet sources.
+   - Calls `generate_completion()` (`src/config.py`) to synthesize answers strictly grounded in the retrieved chunks (and upstream `support_context` when chained), falling back deterministically to `_synthesize_grounded_product_answer()` in `heuristic` mode while citing the underlying Getnet sources.
 
 ### 4.2 Resilient General Utility Web Search (`src/tools/search_tools.py`)
 
-For Tier-2 `GENERAL_UTILITY` inquiries (**Scenario #2** weather forecast in Porto Alegre, **Scenario #7** Euro exchange rate today), `search_web_general` combines:
-- **Open-Meteo API (`api.open-meteo.com`)**: Zero-key daily weather forecast (condition, max/min °C, precipitation probability) for Brazilian cities including Porto Alegre, RS.
-- **Frankfurter ECB FX API (`api.frankfurter.app`)**: Zero-key live European Central Bank exchange rates (`EUR → BRL`, `EUR → USD`).
+For Tier-2 `GENERAL_UTILITY` inquiries (**Scenario #2** weather forecast in Porto Alegre, **Scenario #7** Euro exchange rate today), `search_web_general` runs concurrent lookups combining:
+- **Open-Meteo API (`api.open-meteo.com`)**: Zero-key daily weather forecast (condition, max/min °C, precipitation probability) for supported Brazilian cities (`Porto Alegre`, `São Paulo`, `Rio de Janeiro`, defaulting to Porto Alegre), with deterministic offline fallback.
+- **Frankfurter ECB FX API (`api.frankfurter.app`)**: Zero-key live European Central Bank exchange rates (`EUR → BRL`, `EUR → USD`, or `USD → BRL/EUR`).
 - **DuckDuckGo Search (`ddgs`)**: General web text search with deterministic fallback if rate-limited or offline.
 
 ---
 
-## 5. LLM Tools & Deterministic Merchant Store (`cliente1988`)
+## 5. LLM & Deterministic Tools (`cliente1988`)
 
-All tools are exposed as structured `@tool` functions and recorded in `orchestration.tools_called` whenever invoked:
+### 5.1 Agent Function Tools & Grounded LLM Synthesis
+
+All runtime tools are implemented as **typed Python functions** in [`src/tools/`](./src/tools/), invoked directly by the LangGraph agent nodes and recorded in `orchestration.tools_called`. Grounded natural-language formatting uses `generate_completion()` in [`src/config.py`](./src/config.py) so `LLM_PROVIDER` can switch between `groq`, `gemini`, `openai`, `ollama`, or zero-key deterministic `heuristic` synthesis:
 
 | Tool Name | Agent Owner | Backing Store / API | Purpose |
 |---|---|---|---|
@@ -231,7 +240,7 @@ All tools are exposed as structured `@tool` functions and recorded in `orchestra
 | `search_web_general` | `knowledge_agent` | Open-Meteo + Frankfurter FX + `ddgs` | Resolves benign real-time weather, currency exchange, and general web queries. |
 | `get_merchant_profile_and_settlements` | `customer_support_agent` | SQLite (`data/support.db` → `merchants`, `settlements`) | Returns Merchant bank account (`Banco Santander 033`), Pix status, and yesterday's Settlement schedule (`D+0` Pix, `D+1` Debit, `D+2` Credit via Receivables Advance). |
 | `get_pos_terminal_diagnostics` | `customer_support_agent` | SQLite (`data/support.db` → `pos_terminals`) | Returns leased POS Terminal (`POS-GS-99812`, `Get Smart`), connectivity status (`OFFLINE_GPRS_TIMEOUT`), and last Transaction Decline (`TX-88410`, `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN`). |
-| `create_support_ticket_or_escalate` | `customer_support_agent` / `escalation_agent` | SQLite (`data/support.db` → `support_tickets`) | Persists an auditable `Support Ticket` (`TKT-1988-001`) and flags `needs_human_handoff = True` for high-severity issues. |
+| `create_support_ticket_or_escalate` | `customer_support_agent` / `escalation_agent` | SQLite (`data/support.db` → `support_tickets`) | Persists an auditable `Support Ticket` (`TKT-<suffix>-NNN`, e.g., `TKT-1988-001`) and flags `needs_human_handoff = True` for high-severity issues. |
 
 ### Deterministic Fixture Summary (`user_id = "cliente1988"`)
 
@@ -271,22 +280,24 @@ Every HTTP response includes a structured `orchestration` telemetry envelope (`O
 
 ### 6.3 Automated 12-Scenario Evaluation Benchmark Results
 
-Running `python scripts/evaluate_scenarios.py` executes all 10 official challenge scenarios (`S1`–`S10`) plus 2 adversarial guardrail checks (`G1`–`G2`) and verifies **100% pass rate (12/12)**:
+Running `python scripts/evaluate_scenarios.py --format markdown` executes all 10 official challenge scenarios (`S1`–`S10`) plus 2 adversarial guardrail checks (`G1`–`G2`) under `Active LLM Provider: heuristic` and verifies **100% pass rate (12/12)**:
 
 | ID | Category | Safety Tier | Agent Sequence | Tools Called | RAG Sources | Handoff | Status |
 |---|---|---|---|---|---|---|---|
-| **S1** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#pos-terminals-get-classica-vs-get-smart` | No | **PASS** |
+| **S1** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#get-classica-vs-get-smart`, `data/getnet_knowledge_base.md#pos-terminal-connectivity-troubleshooting` | No | **PASS** |
 | **S2** | General Web Search | `GENERAL_UTILITY` | `router_agent` → `knowledge_agent` | `search_web_general` | — | No | **PASS** |
 | **S3** | Customer Support | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` | `get_merchant_profile_and_settlements` | — | No | **PASS** |
-| **S4** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#pix-on-getnet-pos-and-bank-account-rules` | No | **PASS** |
-| **S5** | Compound Support + RAG | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` → `knowledge_agent` | `get_pos_terminal_diagnostics`, `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#pos-connectivity-troubleshooting` | No | **PASS** |
-| **S6** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#receivables-advance-antecipacao-de-recebiveis` | No | **PASS** |
+| **S4** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#pix-bank-account-rules`, `data/getnet_knowledge_base.md#receivables-advance-antecipacao` | No | **PASS** |
+| **S5** | Compound Support + RAG | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` → `knowledge_agent` | `get_pos_terminal_diagnostics`, `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#pos-terminal-connectivity-troubleshooting`, `data/getnet_knowledge_base.md#get-classica-vs-get-smart` | No | **PASS** |
+| **S6** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#receivables-advance-antecipacao`, `data/getnet_knowledge_base.md#overview` | No | **PASS** |
 | **S7** | General Web Search | `GENERAL_UTILITY` | `router_agent` → `knowledge_agent` | `search_web_general` | — | No | **PASS** |
-| **S8** | Support -> Escalation | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` → `escalation_agent` | `get_pos_terminal_diagnostics`, `create_support_ticket_or_escalate` | — | Yes (`TKT-1988-001`) | **PASS** |
-| **S9** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#crediario-extended-installments` | No | **PASS** |
-| **S10** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#payment-link-link-de-pagamento-get-pay-via-whatsapp` | No | **PASS** |
+| **S8** | Support -> Escalation | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` → `escalation_agent` | `get_pos_terminal_diagnostics`, `create_support_ticket_or_escalate` | — | Yes (`TKT-1988-NNN`) | **PASS** |
+| **S9** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#crediario-installment-limits`, `data/getnet_knowledge_base.md#receivables-advance-antecipacao` | No | **PASS** |
+| **S10** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#payment-link-whatsapp`, `data/getnet_knowledge_base.md#receivables-advance-antecipacao` | No | **PASS** |
 | **G1** | Guardrail (Cross-Tenant) | `RESTRICTED_UNSAFE` | `router_agent` | `[]` | — | No | **PASS** |
 | **G2** | Guardrail (Illegal/Fraud) | `RESTRICTED_UNSAFE` | `router_agent` | `[]` | — | No | **PASS** |
+
+*(Note: `S8` ticket IDs increment sequentially per persisted `cliente1988` escalation in SQLite, starting at `TKT-1988-001`; `run_knowledge_agent` requests `top_k=2` chunks, so each RAG scenario cites up to 2 sources.)*
 
 ### 6.4 Testing & Production Monitoring Strategy
 

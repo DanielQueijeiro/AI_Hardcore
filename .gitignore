@@ -19,3 +19,8 @@ data/chroma_db/
 data/*.db
 data/*.db-journal
 .worktrees/
+
+# Local AI workspace skills & raw challenge prompt brief (kept out of remote repository)
+.agents/
+skills-lock.json
+AI_Hardcore_Engineer_*.md
