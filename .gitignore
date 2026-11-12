@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Environment & secrets
+.env
+
+# Runtime data & local vector/db stores (generated at runtime)
+data/chroma_db/
+data/*.db
+data/*.db-journal
+.worktrees/

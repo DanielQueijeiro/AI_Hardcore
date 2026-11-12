@@ -1,0 +1,5 @@
+# 0002. Three-Tier Safety Policy to Reconcile Guardrails with General Web Search
+
+Status: accepted
+
+The input guardrail enforces a three-tier Safety Policy (**Getnet Domain & Support**, **General Utility**, and **Restricted / Unsafe**) rather than a strict "Getnet-only" topical filter. While the bonus requirements ask for guardrails against irrelevant or unsafe requests, the core specification and official test scenarios (#2 Porto Alegre weather forecast, #7 Euro exchange rate) explicitly require answering general-purpose factual queries via a web search tool. A strict topical guardrail would cause false-positive rejections on the official evaluation scenarios; the three-tier policy blocks adversarial, sensitive, cross-merchant, or unsafe inputs while routing benign general-utility queries to the Knowledge Agent's web search tool.
