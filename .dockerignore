@@ -1,0 +1,23 @@
+# Git & worktrees
+.git
+.gitignore
+.worktrees
+.scratch
+.agents
+
+# Virtual environments & caches
+.venv
+venv
+ENV
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local environment & runtime artifacts
+.env
+*.log
+data/*.db-journal
+data/*.db-wal
