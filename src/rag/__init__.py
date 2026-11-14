@@ -1,14 +1,15 @@
-"""Hybrid RAG ingestion and local CPU vector retrieval package (ADR-0003, ADR-0004)."""
+"""RAG pipeline: corpus loading/chunking (corpus.py) and BM25 / dense / hybrid retrieval (index.py)."""
 
-from src.rag.ingest import DocumentChunk, load_hybrid_corpus, parse_markdown_corpus, scrape_getnet_website
-from src.rag.retriever import GetnetHybridRetriever, RetrievedChunk, get_retriever
+from src.rag.corpus import Chunk, chunk_document, load_corpus
+from src.rag.index import HashingEmbedder, Hit, OpenAIEmbedder, Retriever, build_retriever
 
 __all__ = [
-    "DocumentChunk",
-    "GetnetHybridRetriever",
-    "RetrievedChunk",
-    "get_retriever",
-    "load_hybrid_corpus",
-    "parse_markdown_corpus",
-    "scrape_getnet_website",
+    "Chunk",
+    "HashingEmbedder",
+    "Hit",
+    "OpenAIEmbedder",
+    "Retriever",
+    "build_retriever",
+    "chunk_document",
+    "load_corpus",
 ]
