@@ -1,0 +1,42 @@
+{"id": "r01", "lang": "en", "query": "What's the difference between the Get Clássica and the Get Smart?", "relevant": ["get-smart::differences"]}
+{"id": "r02", "lang": "en", "query": "Do I need a bank account to receive my sales via Pix?", "relevant": ["pix::requirements"]}
+{"id": "r03", "lang": "en", "query": "My card machine won't connect to the internet, what should I do?", "relevant": ["internal-support-runbook::OFFLINE_GPRS_TIMEOUT", "duvidas-faq::Machine connection"]}
+{"id": "r04", "lang": "en", "query": "How does receivables advance (antecipação) work with Getnet?", "relevant": ["antecipacao"]}
+{"id": "r05", "lang": "en", "query": "My card machine is showing a transaction decline error.", "relevant": ["internal-support-runbook::Decline codes", "duvidas-faq::Declined"]}
+{"id": "r06", "lang": "en", "query": "How many installments can I split a sale into with the crediário?", "relevant": ["crediario::installment limit"]}
+{"id": "r07", "lang": "en", "query": "Can I sell through WhatsApp using the Payment Link?", "relevant": ["link-de-pagamento::WhatsApp"]}
+{"id": "r08", "lang": "en", "query": "monthly rent of the smart terminal if I don't sell enough", "relevant": ["get-smart::rental"]}
+{"id": "r09", "lang": "en", "query": "debit card rate on the classic POS", "relevant": ["get-classica::fees"]}
+{"id": "r10", "lang": "en", "query": "how long until crediário sales are paid to the merchant", "relevant": ["crediario::settlement"]}
+{"id": "r11", "lang": "en", "query": "ways to accept Pix with Getnet", "relevant": ["pix::Ways to accept"]}
+{"id": "r12", "lang": "en", "query": "how fast do I receive a Pix sale", "relevant": ["pix::settlement time"]}
+{"id": "r13", "lang": "en", "query": "what is Get Conta", "relevant": ["conta-digital::What Get Conta is"]}
+{"id": "r14", "lang": "en", "query": "what documents do I need to open the digital account", "relevant": ["conta-digital::Opening"]}
+{"id": "r15", "lang": "en", "query": "Getnet customer service phone number and hours", "relevant": ["duvidas-faq::support channels"]}
+{"id": "r16", "lang": "en", "query": "what is a chargeback", "relevant": ["duvidas-faq::Declined"]}
+{"id": "r17", "lang": "en", "query": "how do I create a payment link in the app", "relevant": ["link-de-pagamento::How to create"]}
+{"id": "r18", "lang": "en", "query": "payment link plans and price per transaction", "relevant": ["link-de-pagamento::plans and fees"]}
+{"id": "r19", "lang": "en", "query": "which card machines does Getnet offer", "relevant": ["todas-as-maquininhas::line-up"]}
+{"id": "r20", "lang": "en", "query": "what apps and management features does the Get Smart have", "relevant": ["get-smart::apps", "get-smart::overview"]}
+{"id": "r21", "lang": "en", "query": "what does POS_KEY_SYNC_WARN mean", "relevant": ["internal-support-runbook::Decline codes"]}
+{"id": "r22", "lang": "en", "query": "telemetry status OFFLINE_GPRS_TIMEOUT steps to fix", "relevant": ["internal-support-runbook::OFFLINE_GPRS_TIMEOUT"]}
+{"id": "r23", "lang": "en", "query": "how to run the communication test on the machine", "relevant": ["duvidas-faq::Machine connection"]}
+{"id": "r24", "lang": "en", "query": "when are merchant installment sales paid out", "relevant": ["duvidas-faq::paid out"]}
+{"id": "r25", "lang": "en", "query": "how many pix keys can a company register", "relevant": ["pix::requirements"]}
+{"id": "r26", "lang": "en", "query": "Get Smart battery charging recommendation", "relevant": ["duvidas-faq::Other FAQ"]}
+{"id": "r27", "lang": "en", "query": "is the Get Clássica free above a sales volume", "relevant": ["get-classica::rental", "todas-as-maquininhas::Rental by model"]}
+{"id": "r28", "lang": "en", "query": "who is eligible for the Get Clássica offer", "relevant": ["get-classica::settlement"]}
+{"id": "r29", "lang": "pt", "query": "Qual é a diferença entre a Get Clássica e a Get Smart?", "relevant": ["get-smart::differences"]}
+{"id": "r30", "lang": "pt", "query": "Em quantas parcelas posso vender no crediário?", "relevant": ["crediario::installment limit"]}
+{"id": "r31", "lang": "pt", "query": "Minha maquininha não conecta na internet", "relevant": ["internal-support-runbook::OFFLINE_GPRS_TIMEOUT", "duvidas-faq::Machine connection"]}
+{"id": "r32", "lang": "pt", "query": "Como funciona a antecipação de recebíveis?", "relevant": ["antecipacao"]}
+{"id": "r33", "lang": "pt", "query": "Qual o valor do aluguel da maquininha Get Smart?", "relevant": ["get-smart::rental"]}
+{"id": "r34", "lang": "pt", "query": "Posso vender pelo WhatsApp com o link de pagamento?", "relevant": ["link-de-pagamento::WhatsApp"]}
+{"id": "r35", "lang": "pt", "query": "Quais são as taxas de débito e crédito da Get Clássica?", "relevant": ["get-classica::fees"]}
+{"id": "r36", "lang": "pt", "query": "Qual o telefone da central de atendimento da Getnet?", "relevant": ["duvidas-faq::support channels"]}
+{"id": "r37", "lang": "es", "query": "¿Cuántas cuotas permite el crediário?", "relevant": ["crediario::installment limit"]}
+{"id": "r38", "lang": "es", "query": "¿Necesito una cuenta bancaria para recibir ventas por Pix?", "relevant": ["pix::requirements"]}
+{"id": "r39", "lang": "es", "query": "Mi terminal no se conecta a internet", "relevant": ["internal-support-runbook::OFFLINE_GPRS_TIMEOUT", "duvidas-faq::Machine connection"]}
+{"id": "r40", "lang": "es", "query": "¿Cuánto cuesta el alquiler de la Get Smart?", "relevant": ["get-smart::rental"]}
+{"id": "r41", "lang": "es", "query": "¿Cómo funciona el anticipo de ventas?", "relevant": ["antecipacao"]}
+{"id": "r42", "lang": "en", "query": "second identical sale was cancelled automatically", "relevant": ["duvidas-faq::Declined"]}
