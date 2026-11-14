@@ -1,26 +1,28 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 .venv/
 venv/
-env/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
 dist/
 build/
 
-# Environment & secrets
+# Secrets
 .env
 
-# Runtime data & local vector/db stores (generated at runtime)
-data/chroma_db/
+# Runtime state (generated)
 data/*.db
 data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/embeddings_cache.json
+data/corpus/raw/
+backups/
 .worktrees/
 
-# Local AI workspace skills & raw challenge prompt brief (kept out of remote repository)
+# Local AI workspace skills and the raw challenge brief
 .agents/
 skills-lock.json
 AI_Hardcore_Engineer_*.md

@@ -1,160 +1,108 @@
-"""Application configuration and Zero-Cost multi-provider LLM factory (ADR-0004)."""
+"""Runtime configuration. Every knob is an environment variable; nothing secret has a usable default."""
 
 from __future__ import annotations
 
+import secrets
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-LLMProviderMode = Literal["heuristic", "groq", "gemini", "ollama", "openai"]
 
 
 class Settings(BaseSettings):
-    """Runtime settings loaded from environment variables or .env file."""
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "Getnet Multi-Agent Support System"
-    app_version: str = "0.1.0"
-    llm_provider: LLMProviderMode = "heuristic"
+    app_version: str = "0.2.0"
+    # "demo": the challenge setup (seeded demo users, generated JWT secret allowed).
+    # "production": refuses to start with demo users or without a real JWT secret.
+    app_env: Literal["demo", "production"] = "demo"
 
-    # Optional provider credentials / endpoints
-    groq_api_key: str | None = None
-    groq_model: str = "llama-3.3-70b-versatile"
-    gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"
+    # --- LLM ---------------------------------------------------------------
+    # "openai": agents are driven by the model below (requires OPENAI_API_KEY).
+    # "offline": a deterministic rule policy stands in for the model (CI, no-key demos, outage fallback).
+    llm_provider: Literal["openai", "offline"] = "openai"
     openai_api_key: str | None = None
-    openai_model: str = "gpt-4o-mini"
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.2"
+    openai_base_url: str | None = None
+    openai_model: str = "gpt-6-luna"
+    reasoning_effort: str = "low"
+    guardrail_reasoning_effort: str = "none"
+    llm_timeout_seconds: float = 45.0
+    llm_max_retries: int = 2
+    breaker_failure_threshold: int = 3
+    breaker_cooldown_seconds: float = 60.0
+    # Optional separate model for the evaluation judge, so the system is not graded by itself.
+    judge_model: str | None = None
+    embedding_provider: Literal["openai", "local"] = "local"
+    embedding_model: str = "text-embedding-3-small"
+    # USD per 1M tokens, used only for cost reporting. Override when pricing changes.
+    price_input_per_mtok: float = 0.10
+    price_output_per_mtok: float = 0.50
 
-    # Data & storage paths
-    data_dir: Path = Path("data")
+    # --- Agent loop bounds (bounded autonomy) --------------------------------
+    max_supervisor_steps: int = 6
+    max_specialist_tool_steps: int = 4
+    max_critic_rounds: int = 2
+    history_keep_messages: int = 8
+    history_compact_after: int = 16
+
+    # --- Auth ----------------------------------------------------------------
+    jwt_secret: str | None = None
+    jwt_expires_minutes: int = 60
+    require_chat_auth: bool = False
+    # Demo identities (cliente1988, cliente2026, operador1) so the challenge scenarios can sign in.
+    # Set SEED_DEMO_USERS=false in any real deployment and provision users through your IdP.
+    seed_demo_users: bool = True
+    demo_password: str = "getnet-demo"
+    login_rate_limit_attempts: int = 5
+    login_rate_limit_window_seconds: int = 300
+    chat_rate_limit_attempts: int = 60
+    chat_rate_limit_window_seconds: int = 60
+
+    # --- Human in the loop ----------------------------------------------------
+    hitl_timeout_seconds: int = 900
+    hitl_lease_seconds: int = 600
+    hitl_sweep_interval_seconds: float = 15.0
+
+    # --- HTTP ------------------------------------------------------------------
+    trace_retention_days: int = 30
+    cors_origins: str = ""
+    log_level: str = "INFO"
+
+    # --- Data ------------------------------------------------------------------
     sqlite_db_path: Path = Path("data/support.db")
-    knowledge_base_path: Path = Path("data/getnet_knowledge_base.md")
-    getnet_scrape_url: str = "https://www.getnet.net/en"
-    enable_live_web_scrape: bool = True
+    checkpoint_db_path: Path = Path("data/checkpoints.db")
+    corpus_dir: Path = Path("data/corpus")
+    index_raw_pages: bool = False
+    # Chosen from the ablation in eval/reports: with the keyless embedder BM25 is at least as good as the
+    # hybrid, so the simpler ranker is the default. Re-run `python -m eval.run --suite retrieval` after
+    # switching EMBEDDING_PROVIDER to decide again from data.
+    retrieval_mode: Literal["hybrid", "bm25", "dense"] = "bm25"
+    retrieval_top_k: int = 4
+    enable_live_web: bool = True
+    web_timeout_seconds: float = 4.0
 
-    def resolved_llm_provider(self) -> LLMProviderMode:
-        """Return the effective LLM provider, falling back to heuristic if credentials are absent."""
-        if self.llm_provider == "groq" and self.groq_api_key:
-            return "groq"
-        if self.llm_provider == "gemini" and self.gemini_api_key:
-            return "gemini"
-        if self.llm_provider == "openai" and self.openai_api_key:
-            return "openai"
-        if self.llm_provider == "ollama":
-            return "ollama"
-        return "heuristic"
+    def unsafe_for_production(self) -> list[str]:
+        """What must change before APP_ENV=production may start. Empty in a correctly configured deployment."""
+        problems = []
+        if self.seed_demo_users:
+            problems.append("SEED_DEMO_USERS must be false (demo merchants and a demo operator share a published password)")
+        if not self.jwt_secret or len(self.jwt_secret) < 32:
+            problems.append("JWT_SECRET must be set to at least 32 characters")
+        return problems
+
+    def effective_provider(self) -> str:
+        return "openai" if self.llm_provider == "openai" and self.openai_api_key else "offline"
+
+    def resolved_jwt_secret(self) -> str:
+        return self.jwt_secret or _EPHEMERAL_SECRET
+
+
+# Used only when JWT_SECRET is unset: tokens then die with the process, which is the safe failure mode.
+_EPHEMERAL_SECRET = secrets.token_urlsafe(48)
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return cached application settings."""
     return Settings()
-
-
-def _call_openai_compatible_chat(
-    endpoint: str,
-    api_key: str,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    timeout_seconds: float,
-) -> str:
-    """Execute an OpenAI-compatible chat completions POST request (used by Groq and OpenAI)."""
-    response = httpx.post(
-        endpoint,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.1,
-        },
-        timeout=timeout_seconds,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
-
-
-def generate_completion(
-    system_prompt: str,
-    user_prompt: str,
-    fallback_text: str,
-    timeout_seconds: float = 8.0,
-) -> str:
-    """Execute LLM completion via configured Zero-Cost provider port with deterministic fallback."""
-    settings = get_settings()
-    provider = settings.resolved_llm_provider()
-    if provider == "heuristic":
-        return fallback_text
-
-    try:
-        if provider == "groq" and settings.groq_api_key:
-            return _call_openai_compatible_chat(
-                endpoint="https://api.groq.com/openai/v1/chat/completions",
-                api_key=settings.groq_api_key,
-                model=settings.groq_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                timeout_seconds=timeout_seconds,
-            )
-
-        if provider == "openai" and settings.openai_api_key:
-            return _call_openai_compatible_chat(
-                endpoint="https://api.openai.com/v1/chat/completions",
-                api_key=settings.openai_api_key,
-                model=settings.openai_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                timeout_seconds=timeout_seconds,
-            )
-
-        if provider == "gemini" and settings.gemini_api_key:
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
-            )
-            response = httpx.post(
-                url,
-                json={
-                    "systemInstruction": {"parts": [{"text": system_prompt}]},
-                    "contents": [{"parts": [{"text": user_prompt}]}],
-                },
-                timeout=timeout_seconds,
-            )
-            response.raise_for_status()
-            return (
-                response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            )
-
-        if provider == "ollama":
-            response = httpx.post(
-                f"{settings.ollama_base_url.rstrip('/')}/api/chat",
-                json={
-                    "model": settings.ollama_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "stream": False,
-                },
-                timeout=timeout_seconds,
-            )
-            response.raise_for_status()
-            return response.json()["message"]["content"].strip()
-    except Exception:
-        return fallback_text
-
-    return fallback_text
-

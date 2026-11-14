@@ -1,23 +1,25 @@
-# Git & worktrees
 .git
+.github
 .gitignore
-.worktrees
-.scratch
-.agents
-
-# Virtual environments & caches
 .venv
 venv
-ENV
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-
-# Local environment & runtime artifacts
+.scratch
+.agents
 .env
+.env.*
+!.env.example
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+tests
+docs
+data/*.db*
+data/embeddings_cache.json
+data/corpus/raw
+eval/reports
+backups
 *.log
-data/*.db-journal
-data/*.db-wal
+*.mp4
+skills-lock.json
+AI_Hardcore_Engineer_*.md
