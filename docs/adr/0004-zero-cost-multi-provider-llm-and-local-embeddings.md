@@ -1,5 +1,5 @@
 # 0004. Zero-Cost Multi-Provider LLM Factory, Local CPU Embeddings, and Resilient Free Web Search
 
-Status: accepted
+Status: superseded by [0007](0007-llm-port-with-offline-degradation.md). Canned weather/FX fallback values were removed.
 
 We decouple model inference behind a provider factory (`LLM_PROVIDER=heuristic|groq|gemini|ollama|openai`) defaulting to deterministic heuristic synthesis and free-tier cloud APIs (Groq `llama-3.3-70b-versatile` or Google AI Studio `gemini-2.5-flash`) and local `Ollama`, paired with deterministic 384-dimensional local CPU embeddings (`LocalCPUEmbedder` with signed feature hashing + lexical BM25 hybrid retrieval, compatible with optional `ChromaDB` vector indexing) and zero-key web search (`duckduckgo-search` backed by `open-meteo.com` for weather and `frankfurter.app` for FX rates). This guarantees a $0.00 development and evaluation cost without requiring paid API keys or multi-hundred-megabyte model downloads for embeddings or search, prevents DuckDuckGo container IP rate-limiting from breaking Test Scenarios #2 and #7, and still allows evaluators to plug in `OPENAI_API_KEY` if preferred.

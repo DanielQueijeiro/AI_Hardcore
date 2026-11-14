@@ -1,0 +1,20 @@
+# 0016. A held-out split that is actually unseen, and a judge calibrated on answers it was not adjusted on
+
+Status: accepted (amends [0013](0013-semantic-evaluation-with-a-regression-gate.md))
+
+An audit of the evaluation found two things the numbers did not say about themselves.
+
+The split called held-out had stopped being one. Its items were run against the model, two of them failed, general fixes followed, the acceptable phrasings of two others were widened, and the split was run again. Nothing was tuned to a specific item, but a split that has been re-run between fixes measures the fixes. And the judge's reliability figure was partly circular: four calibration answers were added after the judge disagreed on a golden item, using that item's question, so "16 of 16" included cases the rubric had just been rewritten for.
+
+Both were kept and renamed for what they are, and a clean measurement was added next to each.
+
+- `validation` is the old held-out split (h01-h22). `heldout` is a new sealed split (s01-s24): written after the last change to any prompt, never used to change one, with its regression floor fixed before its first model run and not raised afterwards. Its result is published as measured, including grader mistakes; a wrong regular expression in a sealed item is reported in the README, not corrected into a pass.
+- Calibration items carry a `set`. `original` are the sixteen earlier ones; `independent` are twenty-four whose questions appear in no golden item, in pass/fail pairs covering a wrong number, an unsupported addition, a missing part, an off-topic answer, a contradiction of account data, an invented live value and an action reported as finished. Agreement and Cohen's kappa are reported per set, and the independent agreement has its own floor.
+- One model run is an anecdote. `--repeat N` runs the golden suite N times with nothing changed in between and reports every run, the mean, and which items failed in how many runs. Run 1 is the one the gate reads.
+- Each report records the SHA-256 of the dataset files it ran, so a result can be tied to the exact items.
+
+The offline policy also runs the sealed items, because CI gates on them; no rule of that policy was changed in response.
+
+What the first three-run measurement showed, and an attempt that was measured and discarded. Its gate failed on dev (0.833 in run 1 against 0.94). Re-grading the same six answers four times each showed that the judge at low reasoning effort is not stable: it sometimes calls a sentence unsupported when the evidence contains it. Raising the judge to medium effort, with a rubric line making unasked reference detail optional, was tried together with three dev-only fixes and the whole suite was run again. It was worse: the judge stopped mis-grading groundedness but rejected correct answers over wording of the reference ("ONLINE_4G_OK" for "ONLINE_4G", "specialist" for "operator"), calibration fell to 39 of 40, and the mean semantic pass over three runs fell from 0.958 to 0.865, with the sealed split at 0.792, 0.833, 0.875. Part of that drop was the agent, not the judge: one sealed item whose documented fact was not retrieved failed in all three runs. Those changes were reverted and the published report is the first measurement, whose code and dataset hashes match this version. The dev floor was not lowered. What stands from the exercise: judge noise on a single grading is real, a fix validated on six cases is not validated, and the second run is the more pessimistic estimate of run-to-run variation.
+
+Known weakness that remains: the sealed items and the independent calibration labels were drafted with an LLM coding assistant from the corpus and the fixture data, in one sitting, by the same project. They are unseen by the prompts, not written by an outside party. And a sealed split stays sealed only until someone fixes something because of it; the next change that follows a sealed failure turns it into validation, and a new one has to be written.

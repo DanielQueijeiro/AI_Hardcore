@@ -1,316 +1,639 @@
-# Getnet Multi-Agent Support & Knowledge Orchestration System
+# Getnet Multi-Agent Support System
 
-A production-ready, containerized **Multi-Agent Customer Support and Knowledge Orchestration Service** engineered for **Getnet Merchants** using **Spec-Driven Development (SDD)**, **Python 3.12**, **FastAPI**, **LangGraph**, **Pydantic v2**, **SQLite**, and a **Local CPU Hybrid RAG Pipeline**.
+A containerized multi-agent service for Getnet merchants. A Router Agent plans and delegates to a
+Knowledge Agent (RAG over the Getnet site plus live web tools), a Customer Support Agent (the signed-in
+merchant's own data) and a Human Escalation Agent (pauses the conversation until a human operator
+decides, then resumes it). A Critic reviews every answer before it is sent.
 
----
+Python 3.12 · FastAPI · LangGraph (SQLite checkpointer) · OpenAI Responses API behind a provider port ·
+no vector database, no external services required to run or test.
 
-## 1. Overview & Spec-Driven Development (SDD) Architecture
+- [Quickstart](#quickstart)
+- [What changed since the first submission](#what-changed-since-the-first-submission)
+- [Architecture and message workflow](#architecture-and-message-workflow)
+- [Identity and security](#identity-and-security)
+- [Memory and resilience](#memory-and-resilience)
+- [Human in the loop](#human-in-the-loop)
+- [RAG pipeline](#rag-pipeline)
+- [Tools](#tools)
+- [Guardrails](#guardrails)
+- [Evaluation](#evaluation)
+- [Observability and cost](#observability-and-cost)
+- [Testing strategy](#testing-strategy)
+- [Production notes](#production-notes)
+- [How this was built (SDD and LLM tools)](#how-this-was-built-sdd-and-llm-tools)
+- [Limitations](#limitations)
 
-This repository was designed and implemented following **Spec-Driven Development (SDD)** and **Test-Driven Development (Red → Green → Refactor)**:
+## Quickstart
 
-1. **Ubiquitous Domain Language ([`GLOSSARY.md`](./GLOSSARY.md))**: Defines strict canonical domain terms (*Merchant*, *POS Terminal*, *Inquiry*, *Settlement*, *Receivables Advance*, *Crediário*, *Payment Link*, *Safety Policy*, *Transaction Decline*, *Support Ticket*, *Human Handoff*) shared across prompts, schemas, database tables, and tests.
-2. **Formal System Specification ([`SPEC.md`](./SPEC.md))**: Establishes Pydantic v2 HTTP contracts, the shared `OrchestrationState` schema, deterministic seed data for `cliente1988`, and the **12-Scenario Acceptance Criteria Matrix** before writing application code.
-3. **Architecture Decision Records ([`docs/adr/`](./docs/adr/))**:
-   - [`ADR-0001`](./docs/adr/0001-langgraph-state-machine-orchestration.md): Explicit LangGraph `StateGraph` orchestration over opaque single-agent loops.
-   - [`ADR-0002`](./docs/adr/0002-three-tier-guardrail-policy.md): Three-tier `Safety Policy` (`GETNET_DOMAIN`, `GENERAL_UTILITY`, `RESTRICTED_UNSAFE`) with strict tenant isolation.
-   - [`ADR-0003`](./docs/adr/0003-hybrid-rag-ingestion-with-curated-fallback.md): Hybrid RAG combining live `https://www.getnet.net/en` scraping with a version-controlled Getnet Brazil Markdown corpus (`data/getnet_knowledge_base.md`).
-   - [`ADR-0004`](./docs/adr/0004-zero-cost-multi-provider-llm-and-local-embeddings.md): Zero-cost multi-provider LLM factory (`heuristic`, `groq`, `gemini`, `ollama`, `openai`), local CPU feature-hashing embeddings (`LocalCPUEmbedder`), and resilient zero-key web search (`ddgs` + Open-Meteo + Frankfurter ECB FX).
-   - [`ADR-0005`](./docs/adr/0005-cooperative-agent-chaining.md): Cooperative multi-agent chaining (`customer_support_agent` → `knowledge_agent` and `customer_support_agent` → `escalation_agent`).
-4. **How AI/LLM Coding Tools Were Leveraged Within 60-Min SDD**:
-   - AI coding assistants were used to accelerate boilerplate, test scaffolding, and refactoring while keeping architectural decisions and security boundaries strictly human-governed through `GLOSSARY.md`, `SPEC.md`, and `docs/adr/`.
-   - Implementation was broken into **6 vertical-slice issues** (`.scratch/multi-agent-support-system/issues/`), where each slice required failing integration tests first (**TDD**), targeted implementation, and independent **standards** + **spec-compliance** code-review passes verified by `pytest` and `scripts/evaluate_scenarios.py`.
-
----
-
-## 2. Quickstart: Build, Configure & Run
-
-### 2.1 Run with Docker Compose (Recommended)
-
-The service builds and starts with zero mandatory API keys out of the box:
+### Docker
 
 ```bash
-# 1. Optional: copy .env.example to .env to customize LLM_PROVIDER or API keys
-cp .env.example .env
-
-# 2. Build and launch the container on port 8000
-docker compose up --build -d
-
-# 3. Verify container readiness via the healthcheck endpoint
-curl http://localhost:8000/health
+cp .env.example .env          # set OPENAI_API_KEY and JWT_SECRET
+docker compose up --build
+curl http://localhost:8000/ready
 ```
 
-Or using standalone `docker` commands:
+> **Set `OPENAI_API_KEY` before judging the orchestration.** Without it the service still starts, but a
+> deterministic rule policy ([src/llm/offline.py](src/llm/offline.py)) answers in place of the model: it exists for
+> CI and for provider outages, and it is not the agentic system. The service says which one is running: a
+> `offline_policy_active` warning at start-up, `llm_provider` in `/ready`, and `llm_provider` in every `/chat` response.
+
+The image runs as a non-root user on a read-only filesystem; all state lives in the `state` volume.
+Interactive API docs: http://localhost:8000/docs.
+
+### Local
 
 ```bash
-docker build -t getnet-multi-agent-support .
-docker run --rm -p 8000:8000 --env-file .env.example getnet-multi-agent-support
-```
-
-### 2.2 Run Locally with Python Virtualenv (`.venv`)
-
-```bash
-# 1. Create and activate a Python 3.11+ / 3.12 virtual environment
-python -m venv .venv
-# Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
-# Linux / macOS:
-source .venv/bin/activate
-
-# 2. Install package and test dependencies
+python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-
-# 3. Start the FastAPI server
-uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn src.api.main:app --port 8000
 ```
 
-### 2.3 Zero-Cost Multi-Provider Configuration (`LLM_PROVIDER`)
+### Talk to it
 
-Per [`ADR-0004`](./docs/adr/0004-zero-cost-multi-provider-llm-and-local-embeddings.md), the system supports five `LLM_PROVIDER` modes configured via environment variables or `.env` (see [`.env.example`](./.env.example)):
-
-| `LLM_PROVIDER` | Required Env Vars | Description |
-|---|---|---|
-| `heuristic` *(default)* | None (`$0` cost) | Deterministic grounded synthesis from RAG chunks and SQLite tool outputs. Works 100% offline with sub-50ms latency. |
-| `groq` | `GROQ_API_KEY`, `GROQ_MODEL` | Uses Groq Cloud free tier (default `llama-3.3-70b-versatile`) with automatic fallback on timeout/rate-limit. |
-| `gemini` | `GEMINI_API_KEY`, `GEMINI_MODEL` | Uses Google AI Studio free tier (default `gemini-2.5-flash`). |
-| `ollama` | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | Connects to a local Ollama server (default `llama3.2` on `http://localhost:11434`). |
-| `openai` | `OPENAI_API_KEY`, `OPENAI_MODEL` | Optional OpenAI completion adapter (default `gpt-4o-mini`). |
-
-Additional storage & RAG settings in [`.env.example`](./.env.example): `SQLITE_DB_PATH` (`data/support.db`), `KNOWLEDGE_BASE_PATH` (`data/getnet_knowledge_base.md`), `GETNET_SCRAPE_URL` (`https://www.getnet.net/en`), and `ENABLE_LIVE_WEB_SCRAPE` (`true`).
-
-### 2.4 Example API Request (`POST /chat`)
-
-Both `POST /chat` and `POST /api/v1/chat` accept the challenge payload contract:
+The challenge payload works as is. Public knowledge needs no login:
 
 ```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "My card machine won'\''t connect to the internet, what should I do?",
-    "user_id": "cliente1988"
-  }'
+curl -s -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
+  -d '{"message": "How many installments can I split a sale into with the crediário?", "user_id": "cliente1988"}'
 ```
 
-Example JSON response:
+Account questions need a verified identity. `user_id` in the body is a label, not a credential:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/login -H "Content-Type: application/json" \
+  -d '{"user_id": "cliente1988", "password": "getnet-demo"}' | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+curl -s -X POST http://localhost:8000/chat -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"message": "When will the money from yesterday'"'"'s sales be deposited?", "user_id": "cliente1988"}'
+```
+
+Demo identities (seeded when `SEED_DEMO_USERS=true`): merchants `cliente1988` and `cliente2026`, operator
+`operador1`, all with password `getnet-demo`. They exist for the demo only: with `APP_ENV=production` the
+service refuses to start while they are enabled.
+
+### The ten challenge scenarios in one command
+
+Three of the challenge's example scenarios (deposit date, card machine offline, declined transaction) read the
+merchant's own data, so they need the login above. This script does the login and then sends the ten payloads
+exactly as the challenge lists them:
+
+```bash
+python -m scripts.run_scenarios             # against http://localhost:8000, signed in as cliente1988
+python -m scripts.run_scenarios --approve   # also plays the human operator for the declined-transaction scenario
+python -m scripts.run_scenarios --anonymous # the same payloads with no token: account data stays locked
+```
+
+Why the body's `user_id` is not enough on its own is in
+[ADR-0014](docs/adr/0014-challenge-payload-and-deployment-mode.md).
+
+Response shape:
 
 ```json
 {
   "user_id": "cliente1988",
-  "message": "My card machine won't connect to the internet, what should I do?",
-  "answer": "### POS Terminal Diagnostics for **Padaria & Café Gaúcho LTDA** (`cliente1988`)...",
+  "authenticated": true,
+  "conversation_id": "default",
+  "message": "...",
+  "answer": "...",
+  "status": "completed",
   "orchestration": {
-    "trace_id": "trc-5d207e133c99",
-    "safety_tier": "GETNET_DOMAIN",
-    "primary_intent": "COMPOUND_SUPPORT_AND_KB",
-    "agent_sequence": [
-      "router_agent",
-      "customer_support_agent",
-      "knowledge_agent"
-    ],
-    "tools_called": [
-      "get_pos_terminal_diagnostics",
-      "retrieve_getnet_knowledge"
-    ],
-    "rag_sources": [
-      "data/getnet_knowledge_base.md#pos-terminal-connectivity-troubleshooting",
-      "data/getnet_knowledge_base.md#get-classica-vs-get-smart"
-    ],
+    "trace_id": "trc-...",
+    "agents": ["router", "support", "router", "knowledge", "router", "critic"],
+    "tools_called": ["get_pos_diagnostics", "search_getnet_knowledge"],
+    "sources": ["internal://support-runbook"],
+    "plan_steps": 3,
+    "critic_rounds": 1,
+    "guardrail": {"allowed": true, "category": "safe", "layer": "llm"},
     "escalated_to_human": false,
-    "handoff_ticket_id": null,
-    "latency_ms": 22
+    "ticket_id": null,
+    "usage": {"llm_calls": 9, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+    "latency_ms": 0,
+    "llm_provider": "openai",
+    "degraded": false
   }
 }
 ```
 
-### 2.5 Running the Automated Test Suite & 12-Scenario Evaluation Benchmark
+### Tests and evaluation
 
 ```bash
-# Run the complete unit + integration test suite (46 tests across all seams)
-pytest -v
-
-# Run the automated 12-scenario evaluation benchmark in-process (FastAPI TestClient)
-# (Prefix PYTHONPATH=. on Linux/macOS or $env:PYTHONPATH="." in PowerShell if running without pip install -e .)
-python scripts/evaluate_scenarios.py --show-answers
-
-# Or run the evaluation benchmark against a live Docker container
-python scripts/evaluate_scenarios.py --base-url http://localhost:8000 --show-answers --format markdown
+pytest                                     # 164 tests, no network, no API key
+ruff check src eval tests scripts
+python -m eval.run --mode offline --gate   # deterministic regression gate (what CI runs)
+python -m eval.run --gate                  # with OPENAI_API_KEY: real model + LLM judge + judge calibration
 ```
 
----
+### Configuration
 
-## 3. Agent Orchestration Architecture & Message Workflow
+Every setting is an environment variable; [.env.example](.env.example) lists them all. The ones that matter:
 
-The system implements **four specialized agents** coordinated via a compiled **LangGraph `StateGraph`** (`src/agents/graph.py`) operating over a strongly typed `OrchestrationState` (`src/schemas.py`).
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | unset | Without it the service runs on the offline policy and says so (`llm_provider: "offline"`). |
+| `OPENAI_MODEL` | `gpt-6-luna` | Model that drives every agent. Any Responses-API model works. |
+| `JUDGE_MODEL` | same as above | Evaluation judge; set a different model so the system is not graded by itself. |
+| `JWT_SECRET` | random per process | Set it in any shared deployment, otherwise tokens die on restart. |
+| `REQUIRE_CHAT_AUTH` | `false` | Set `true` to require a verified Bearer token on `/chat` and `/conversations/{id}` (disables anonymous mode). |
+| `CHAT_RATE_LIMIT_ATTEMPTS` / `WINDOW` | `60` / `60` | Sliding-window request limit per authenticated caller or client IP on `/chat`. |
+| `APP_ENV` | `demo` | `production` refuses to start with demo users enabled or without a `JWT_SECRET` of 32+ characters. |
+| `TRACE_RETENTION_DAYS` | 30 | Stored traces older than this are deleted by the periodic sweep. |
+| `MAX_SUPERVISOR_STEPS` / `MAX_SPECIALIST_TOOL_STEPS` / `MAX_CRITIC_ROUNDS` | 6 / 4 / 2 | Bounds on agent autonomy. |
+| `HITL_TIMEOUT_SECONDS` / `HITL_LEASE_SECONDS` | 900 / 600 | Human-review deadline and operator lease. |
+| `RETRIEVAL_MODE` | `bm25` | `bm25`, `dense` or `hybrid`; chosen from the ablation below. |
 
-```mermaid
-flowchart TD
-    Client["HTTP Client (POST /chat)"] --> API["FastAPI Endpoint (src/api/main.py)"]
-    API --> Router["Agent 1: Router & Guardrail Agent (router_agent)"]
+## What changed since the first submission
 
-    Router -- "Tier 3: RESTRICTED_UNSAFE" --> GuardrailReject["Immediate Safe Refusal (Zero Tool Calls)"]
-    Router -- "Tier 1 (Product/FAQ) or Tier 2 (General Utility)" --> Knowledge["Agent 2: Knowledge Agent (knowledge_agent)"]
-    Router -- "Tier 1 (Account / POS Inquiry)" --> Support["Agent 3: Customer Support Agent (customer_support_agent)"]
+The first version scored 7.4. The review was right on every point; this is what each one led to.
 
-    subgraph Knowledge_Tools ["Knowledge Agent Tools (src/tools/search_tools.py)"]
-        RAG["retrieve_getnet_knowledge (Hybrid RAG)"]
-        WebSearch["search_web_general (DDGS + Open-Meteo + Frankfurter)"]
-    end
+| Review finding | What exists now | Evidence |
+|---|---|---|
+| Orchestration was a deterministic state machine: no planner, critic, re-planning, quality retry or stopping rule | The Router is a model-driven loop: it decomposes, delegates, reads observations and re-plans one tool call at a time; specialists run their own tool loops and reconsider after poor results; a Critic can send the answer back for more evidence; hard bounds stop it | [nodes.py](src/agents/nodes.py), [test_agentic_loop.py](tests/test_agentic_loop.py) |
+| No conversational memory | Per-conversation state checkpointed in SQLite: history, rolling summary with compaction, recovery after restart, isolation per identity | [service.py](src/agents/service.py), [test_memory.py](tests/test_memory.py) |
+| Handoff created a ticket and ended | `interrupt` → operator queue → claim with lease → approve / reject / answer → the same turn resumes with the human decision; timeout path; approved write executed exactly once | [test_human_in_the_loop.py](tests/test_human_in_the_loop.py) |
+| 12/12 was structural, not semantic | Golden answers with human-written facts, numeric groundedness, citation validity, language match, a sealed held-out split, a judge that is a different model with measured calibration, adversarial suite, regression gate in CI. Measured with the real model over three runs of 64 conversations: semantic pass 0.958 on average (sealed split 1.000, 1.000, 0.875), judge pass 0.969, calibration agreement 1.000 (40/40, 24 of them on questions outside the golden set). Routing is reported separately and does not count as quality | [eval/](eval/), [model report](eval/reports/openai/report.md), [offline report](eval/reports/offline/report.md) |
+| `user_id` was not an authenticated identity | JWT login; identity comes only from a verified token; body `user_id` that disagrees is rejected; anonymous callers get public knowledge only | [test_identity_and_api.py](tests/test_identity_and_api.py) |
+| Injection defence was lexical | Normalized/decoded lexical layer + LLM classifier + untrusted-data sanitization for RAG, web and operator text + output leak checks, all exercised by 38 attacks (EN/PT/ES plus German and French, paraphrase, pretexts, operator impersonation, poisoned documents and tool output) and 30 benign controls: 0 successful attacks, 0 false positives with the real model | [guardrails.py](src/security/guardrails.py), [adversarial.jsonl](eval/datasets/adversarial.jsonl) |
+| No retrieval metrics; hybrid weights unproven | Recall@k, Hit@k, MRR, nDCG on 42 labelled queries for BM25 vs dense vs hybrid, with the keyless embedder and with hosted embeddings. The 0.45/0.35/0.20 blend is gone; the default was chosen from the numbers | [Retrieval ablation](#retrieval-ablation) |
+| Root container, no CI, no migrations, one health endpoint | Non-root read-only image, CI with tests + eval gate + container smoke test, numbered migrations, `/health` vs `/ready`, online backup script | [Dockerfile](Dockerfile), [ci.yml](.github/workflows/ci.yml) |
+| Canned fallback values for weather and FX | Removed. A live tool that cannot reach its source returns `available: false` and the agent says so | [live.py](src/tools/live.py) |
 
-    Knowledge <--> RAG
-    Knowledge <--> WebSearch
+## Architecture and message workflow
 
-    subgraph Support_Tools ["Customer Support Tools (src/tools/support_tools.py)"]
-        T1["get_merchant_profile_and_settlements"]
-        T2["get_pos_terminal_diagnostics"]
-        T3["create_support_ticket_or_escalate"]
-    end
-
-    Support <--> T1
-    Support <--> T2
-    Support <--> T3
-
-    Support -- "needs_knowledge_enrichment == True (Scenario #5)" --> Knowledge
-    Support -- "needs_human_handoff == True (Scenario #8)" --> Escalation["Agent 4: Escalation Agent (escalation_agent — Bonus)"]
-
-    GuardrailReject --> Response["ChatResponse + OrchestrationMetadata Trace"]
-    Knowledge --> Response
-    Support -- "Direct Account Resolution (Scenario #3)" --> Response
-    Escalation --> Response
+```
+POST /chat ── verify token ──▶ Principal (merchant | operator | anonymous)
+                                   │
+                                   ▼
+        ┌──────────── LangGraph, one thread per (identity, conversation) ────────────┐
+        │                                                                            │
+        │  guard ──blocked────────────────────────────────────────────┐              │
+        │    │                                                        ▼              │
+        │    └─▶ ROUTER ⇄ KNOWLEDGE agent ── tools: search_getnet_knowledge,         │
+        │        (plan,                        get_fx_rate, get_weather_forecast,    │
+        │         observe,                     web_search                            │
+        │         re-plan)                                                           │
+        │          ⇄ SUPPORT agent ── tools: get_settlements, get_pos_diagnostics,   │
+        │          │                   get_account_profile, list_my_tickets          │
+        │          │                   (always the signed-in merchant)               │
+        │          ⇄ ESCALATION agent ─▶ ticket ─▶ interrupt ══ human operator ══▶   │
+        │          │                                 resume with the decision        │
+        │          └─ finish ─▶ CRITIC ──revise──▶ back to ROUTER                    │
+        │                         └─approve─▶ finalize (output guard, memory) ─▶ END │
+        └──────────────── checkpoint after every step (SQLite) ──────────────────────┘
 ```
 
-### 3.1 The Four Specialized Agents
+Only the edges are fixed. Which specialist runs, in what order, how many times and when to stop are
+decided by the Router model at run time from what it has observed.
 
-1. **Agent 1 — Router & Guardrail Agent (`router_agent` in `src/agents/router.py`)**
-   - **Role**: Entry point for every Merchant `Inquiry`. Enforces the three-tier `Safety Policy` before any downstream agent or database tool is invoked.
-   - **Routing Logic**:
-     - Blocks prompt injections, cross-merchant data harvesting (`cliente1988` asking for `cliente2026`), and card-skimming/fraud requests (`RESTRICTED_UNSAFE` → `BLOCKED`).
-     - Routes benign external utility questions (weather forecast, Euro exchange rate) to `knowledge_agent` (`GENERAL_UTILITY` → `GENERAL_WEB_SEARCH`).
-     - Routes Getnet product, fee, and modality questions (*Get Clássica* vs *Get Smart*, *Pix*, *Receivables Advance*, *Crediário*, *Payment Link*) to `knowledge_agent` (`GETNET_DOMAIN` → `PRODUCT_KNOWLEDGE`).
-     - Routes Merchant account, Settlement, and POS hardware inquiries to `customer_support_agent` (`CUSTOMER_SUPPORT` or `COMPOUND_SUPPORT_AND_KB`).
+**Communication between agents** is the shared graph state. The Router calls one of four typed functions
+per step (`delegate_knowledge`, `delegate_support`, `escalate_to_human`, `finish`); every delegation carries
+a `thought` and the `remaining_plan`, which are recorded in the trace. A specialist receives a
+self-contained task, runs its own bounded tool loop and returns a typed report plus the raw tool results.
+Those become an observation the Router reads on its next step.
 
-2. **Agent 2 — Knowledge Agent (`knowledge_agent` in `src/agents/knowledge.py`)**
-   - **Role**: Answers Getnet product/troubleshooting questions via Hybrid RAG (`retrieve_getnet_knowledge`) and general factual queries via Resilient Web Search (`search_web_general`).
-   - **Cooperative Mode**: When chained after `customer_support_agent` (`support_context` present in state), synthesizes the Merchant's live `POS Terminal` telemetry (`Get Smart`, `OFFLINE_GPRS_TIMEOUT`, APN `getnet.br`) with official step-by-step recovery procedures retrieved from the RAG index.
+**One turn, concretely** ("My card machine is showing a transaction decline error", signed in as `cliente1988`):
 
-3. **Agent 3 — Customer Support Agent (`customer_support_agent` in `src/agents/support.py`)**
-   - **Role**: Resolves Merchant-specific inquiries using 3 deterministic SQLite tools strictly scoped to the caller's `user_id`.
-   - **Cooperative Triggers**:
-     - Sets `needs_knowledge_enrichment = True` when POS connectivity diagnostics (`OFFLINE_GPRS_TIMEOUT`) require step-by-step configuration instructions from the Knowledge Agent (**Scenario #5**).
-     - Invokes `create_support_ticket_or_escalate` and sets `needs_human_handoff = True` when terminal telemetry indicates hardware/cryptographic failure (`ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN`, `requires_l2_escalation = True`) (**Scenario #8**).
+1. `guard`: lexical screen, then the LLM classifier. Safe.
+2. Router → Support Agent. It calls `get_pos_diagnostics` and reports the decline `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN`,
+   a follow-up question for the knowledge base, and that the fix needs human approval (`terminal_rekey_or_swap`).
+3. Router re-plans from that observation → Knowledge Agent, which retrieves the runbook entry for those codes.
+   (The Router sometimes skips this step when the telemetry already names the fix; that is its decision.)
+4. Router → Escalation Agent, which writes the brief and opens a ticket. The graph **interrupts**; the API
+   returns `status: "awaiting_human"` with the ticket id and a message saying what was found and why a human
+   is reviewing it.
+5. An operator claims the ticket and approves. The graph **resumes** in the same turn: code (not the model)
+   verifies the approval and creates the service order.
+6. Router writes the answer from the observations; the Critic checks it against the evidence; the output
+   guard runs; the turn is stored in memory.
 
-4. **Agent 4 — Human Escalation Agent (`escalation_agent` in `src/agents/escalation.py` — Bonus)**
-   - **Role**: Executes structured `Human Handoff` when automated self-service cannot safely resolve a critical hardware or financial issue.
-   - **Actions**: Verifies or creates a persistent `Support Ticket` (`TKT-1988-NNN`, e.g., `TKT-1988-001` on initial seed), packages the full diagnostic context (`POS-GS-99812`, `TX-88410`, `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN`) for the L2 specialist queue, and provides immediate temporary mitigation options (**Payment Link / Get Pay** or **Pix QR Code** in the **App Getnet**) so the Merchant can keep selling.
+**Bounded autonomy.** A loop the model drives needs limits the model cannot talk its way past:
 
----
+| Bound | Enforced in | Behaviour at the limit |
+|---|---|---|
+| Router step budget (6) | `Nodes.supervisor` | The next call is forced to `finish` |
+| Duplicate delegation | `Nodes.supervisor` | Refused with an observation explaining why |
+| Specialist tool budget (4), repeated tool call | `Nodes._run_specialist` | Forced `report`. A tool without parameters is offered once; a repeated call is not executed and the next step can only report. One tool call per model step |
+| One escalation per turn; none for anonymous callers | `Nodes.supervisor` | Refused with an observation |
+| Critic rounds (2) | `Nodes.critic` | A draft that is still ungrounded is replaced by an explicit "could not verify" answer |
+| Draft in another language than the merchant's | `Nodes.critic`, `checks.detect_language` | Revision forced regardless of the Critic's verdict |
+| Critic returns no review | `Nodes.critic` | The deterministic checks decide; an unsupported number or unreturned URL forces a revision |
+| Graph recursion limit (60) | `ChatService` | Hard stop |
 
-## 4. Hybrid RAG Pipeline & Resilient Web Search
+**The Critic** gets the question, the evidence and the draft, plus two automatic findings: numbers in the draft
+that appear nowhere in the evidence, and URLs no tool returned. It answers through a typed `review` call. A
+fabricated URL forces a revision regardless of the model's verdict, and so does a draft written in a language
+other than the merchant's. On `revise` the Router sees the issues and may gather more evidence before
+rewriting, which is the quality-based retry. It is told to send a draft back only for a material problem,
+because every round is latency the merchant waits through, and that "could not confirm" is acceptable only if
+the right specialist was actually asked.
 
-### 4.1 Four-Stage Hybrid RAG Pipeline (`src/rag/`)
+**Reply language** is detected in code from function words (English, Portuguese, Spanish) and stated in the
+Router, Escalation and Critic prompts. This exists because the first real-model run answered English
+questions in Portuguese: most of the evidence is Portuguese, and an instruction in a prompt was not enough.
 
-Per [`ADR-0003`](./docs/adr/0003-hybrid-rag-ingestion-with-curated-fallback.md) and [`ADR-0004`](./docs/adr/0004-zero-cost-multi-provider-llm-and-local-embeddings.md), the RAG pipeline is engineered for high recall across English and Brazilian Portuguese domain terms (*Get Clássica*, *Get Smart*, *Pix*, *Antecipação*, *Crediário*, *Link de Pagamento*) without fragile cloud embedding dependencies:
+**Prompts** live in [prompts.py](src/agents/prompts.py). Each one states the role, what the agent may rely on,
+how to choose tools, when to reconsider, the output contract, and that tagged blocks are data. No agent
+returns free-form JSON; every decision is a function call with a schema.
 
-1. **Ingestion (`src/rag/ingest.py`)**:
-   - **Curated Corpus**: Parses [`data/getnet_knowledge_base.md`](./data/getnet_knowledge_base.md) into self-contained `DocumentChunk` records split by level-2 Markdown headings with explicit citation anchors (e.g., `data/getnet_knowledge_base.md#get-classica-vs-get-smart`).
-   - **Live Website Scraping**: Fetches `https://www.getnet.net/en` via `httpx` + `BeautifulSoup`, strips boilerplate tags (`script`, `style`, `nav`, `footer`), and chunks extracted paragraphs into `web-*` `DocumentChunk` items. If `getnet.net` is slow, offline, or WAF-restricted inside a locked-down container, ingestion degrades gracefully in `<2s` without crashing.
-2. **Storage & Indexing (`src/rag/retriever.py`)**:
-   - Uses `LocalCPUEmbedder` to compute deterministic, L2-normalized **384-dimensional dense vectors** on CPU (`$0` cost, zero external model download required at runtime) using signed Blake2b feature hashing over accent-normalized unigrams, bigrams, and character 3/4-grams, paired with pre-tokenized title and body term sets.
-3. **Hybrid Retrieval (`GetnetHybridRetriever.retrieve`)**:
-   - Scores every chunk using a weighted hybrid formula combining dense cosine similarity (`0.45`), title lexical overlap (`0.35`), body lexical overlap (`0.20`), and a `0.05` `curated_kb` origin bonus, returning the top-$k$ `RetrievedChunk` objects (`top_k=2` in `run_knowledge_agent`) with exact source citations recorded in `orchestration.rag_sources`.
-4. **Grounded Generation (`src/agents/knowledge.py`)**:
-   - Calls `generate_completion()` (`src/config.py`) to synthesize answers strictly grounded in the retrieved chunks (and upstream `support_context` when chained), falling back deterministically to `_synthesize_grounded_product_answer()` in `heuristic` mode while citing the underlying Getnet sources.
+**Offline policy.** [offline.py](src/llm/offline.py) implements the same model port with rules. It exists for CI,
+for demos without a key, and as the degradation path when the provider fails (a circuit breaker switches to it
+and the response is flagged `degraded`). It produces extractive, grounded answers, but it is a rule policy:
+the adaptive behaviour described above is the model path.
 
-### 4.2 Resilient General Utility Web Search (`src/tools/search_tools.py`)
+## Identity and security
 
-For Tier-2 `GENERAL_UTILITY` inquiries (**Scenario #2** weather forecast in Porto Alegre, **Scenario #7** Euro exchange rate today), `search_web_general` runs concurrent lookups combining:
-- **Open-Meteo API (`api.open-meteo.com`)**: Zero-key daily weather forecast (condition, max/min °C, precipitation probability) for supported Brazilian cities (`Porto Alegre`, `São Paulo`, `Rio de Janeiro`, defaulting to Porto Alegre), with deterministic offline fallback.
-- **Frankfurter ECB FX API (`api.frankfurter.app`)**: Zero-key live European Central Bank exchange rates (`EUR → BRL`, `EUR → USD`, or `USD → BRL/EUR`).
-- **DuckDuckGo Search (`ddgs`)**: General web text search with deterministic fallback if rate-limited or offline.
+`POST /auth/login` returns an HS256 JWT (`sub`, `role`, `exp`, `jti`). Passwords are stored with scrypt;
+login failures are uniform for unknown users and wrong passwords and are rate-limited; `POST /auth/logout`
+revokes the token's `jti`.
 
----
+The rule the rest of the system depends on: **identity is the verified token and nothing else.**
 
-## 5. LLM & Deterministic Tools (`cliente1988`)
+- No token → anonymous principal → public knowledge only. Account tools return `authentication_required`.
+- Body `user_id` different from the token's subject → `403`.
+- Invalid, expired or revoked token → `401`. It is not downgraded to anonymous.
+- No tool has a merchant parameter. Account tools read the merchant from the principal the API verified.
+  If a model invents `merchant_id`, the tool layer drops it, records it in the trace and counts it in
+  `identity_argument_ignored_total`. Prompt injection therefore cannot reach another tenant even if it
+  fully controls the model.
+- Conversation threads are keyed by `(verified user, conversation_id)`; traces are readable by their owner
+  and by operators; the operator queue requires the `operator` role. Anonymous visitors share one namespace,
+  so an anonymous conversation can only be continued with the unguessable id the server issued for it.
+- Bank account numbers are masked in the tool layer, before any model sees them.
+- The only write action (`terminal_rekey_or_swap`) is executed by code after it finds an `APPROVED` ticket
+  for that merchant with an allow-listed action that has not been executed yet. The Router cannot attach an
+  action to a ticket unless the Support Agent derived it from account data in the same turn.
 
-### 5.1 Agent Function Tools & Grounded LLM Synthesis
+So the answer to "if I call `/chat` with `user_id=cliente2026`, where do you prove I am that merchant?" is:
+nowhere, and so that call gets no account access (and with `REQUIRE_CHAT_AUTH=true`, an unauthenticated
+`/chat` or `/conversations/{id}` request returns `401` outright).
 
-All runtime tools are implemented as **typed Python functions** in [`src/tools/`](./src/tools/), invoked directly by the LangGraph agent nodes and recorded in `orchestration.tools_called`. Grounded natural-language formatting uses `generate_completion()` in [`src/config.py`](./src/config.py) so `LLM_PROVIDER` can switch between `groq`, `gemini`, `openai`, `ollama`, or zero-key deterministic `heuristic` synthesis:
+## Memory and resilience
 
-| Tool Name | Agent Owner | Backing Store / API | Purpose |
-|---|---|---|---|
-| `retrieve_getnet_knowledge` | `knowledge_agent` | `GetnetHybridRetriever` (`data/getnet_knowledge_base.md` + `https://www.getnet.net/en`) | Retrieves ranked Getnet product & POS troubleshooting chunks with citations. |
-| `search_web_general` | `knowledge_agent` | Open-Meteo + Frankfurter FX + `ddgs` | Resolves benign real-time weather, currency exchange, and general web queries. |
-| `get_merchant_profile_and_settlements` | `customer_support_agent` | SQLite (`data/support.db` → `merchants`, `settlements`) | Returns Merchant bank account (`Banco Santander 033`), Pix status, and yesterday's Settlement schedule (`D+0` Pix, `D+1` Debit, `D+2` Credit via Receivables Advance). |
-| `get_pos_terminal_diagnostics` | `customer_support_agent` | SQLite (`data/support.db` → `pos_terminals`) | Returns leased POS Terminal (`POS-GS-99812`, `Get Smart`), connectivity status (`OFFLINE_GPRS_TIMEOUT`), and last Transaction Decline (`TX-88410`, `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN`). |
-| `create_support_ticket_or_escalate` | `customer_support_agent` / `escalation_agent` | SQLite (`data/support.db` → `support_tickets`) | Persists an auditable `Support Ticket` (`TKT-<suffix>-NNN`, e.g., `TKT-1988-001`) and flags `needs_human_handoff = True` for high-severity issues. |
+State is a LangGraph thread per `(identity, conversation_id)`, checkpointed to SQLite after every node.
 
-### Deterministic Fixture Summary (`user_id = "cliente1988"`)
+- **History**: the last messages are passed to the Router and the Critic inside a tagged block, so
+  "it is still offline" resolves against the earlier turn.
+- **Rolling summary**: when history exceeds `HISTORY_COMPACT_AFTER` messages, the older ones are folded into
+  a summary by a summarizer call and only `HISTORY_KEEP_MESSAGES` stay verbatim.
+- **Restart recovery**: a new process on the same database continues conversations and paused human reviews.
+- **Poisoning**: a blocked message is stored as a placeholder, never verbatim; history is rendered as data.
+- **Concurrency**: one turn at a time per thread (in-process lock).
+- **Provider failure**: timeouts and retries on the client, then a circuit breaker that degrades to the
+  offline policy instead of returning a 500. `/ready` reports whether the breaker is open.
+- **Tool failure**: a failing tool returns a structured error the agent can react to.
 
-On startup, `ensure_seeded_database()` in `src/db/support_store.py` idempotently initializes `data/support.db` with two tenants (`cliente1988` and `cliente2026` for cross-tenant isolation testing):
-- **Merchant (`cliente1988`)**: *Padaria & Café Gaúcho LTDA* (Porto Alegre, RS) — Banco Santander (`033`), Agency `1988`, Account `0045912-8`.
-- **Yesterday's Settlements (Scenario #3)**:
-  - **Pix Sales**: `R$ 850.00` → `D+0` (`SETTLED`, already credited).
-  - **Debit Card Sales**: `R$ 1,240.00` → `D+1` (`SCHEDULED_TODAY` by `14:00 BRT`).
-  - **Credit Card Sales (1x)**: `R$ 2,600.00` gross / `R$ 2,524.60` net → `D+2` (`SCHEDULED_RECEIVABLES_ADVANCE` tomorrow).
-- **POS Terminal (`POS-GS-99812` — Scenarios #5 & #8)**:
-  - Model: `Get Smart` (`SN-GS-1988-99812`), Connectivity: `OFFLINE_GPRS_TIMEOUT` (Dual-SIM 4G stalled, Wi-Fi disabled, APN `getnet.br`).
-  - Last Decline: `TX-88410` (`R$ 430.00`), Code `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN` (`requires_l2_escalation = True`).
+`GET /conversations/{id}` returns the stored memory of one of the caller's own conversations.
 
----
+## Human in the loop
 
-## 6. Guardrails, Observability, Evaluation & Production Monitoring
+```
+agent ──interrupt──▶ ticket OPEN ──claim (lease)──▶ CLAIMED ──respond──▶ APPROVED | REJECTED | ANSWERED
+                          │                                                   │
+                          └── nobody answers before expires_at ─▶ TIMED_OUT ──┤
+                                                                              ▼
+                                                    graph resumes: the decision becomes an observation
+```
 
-### 6.1 Three-Tier Guardrail Policy (`ADR-0002`)
+```bash
+OP=$(curl -s -X POST localhost:8000/auth/login -H "Content-Type: application/json" \
+  -d '{"user_id": "operador1", "password": "getnet-demo"}' | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
-Every request is classified by `router_agent` into one of three `SafetyTier` values:
-1. **`GETNET_DOMAIN`**: Authorized Getnet product questions and tenant-scoped Merchant support inquiries.
-2. **`GENERAL_UTILITY`**: Benign external utility questions (weather, currency rates) strictly isolated from internal SQLite tools.
-3. **`RESTRICTED_UNSAFE`**: Prompt injections (`Ignore all rules...`), cross-merchant data access attempts (`user_id="cliente1988"` requesting `cliente2026`), and illegal/fraudulent queries (card cloning/skimming). Terminates immediately at `router_agent` with `tools_called = []`.
+curl -s localhost:8000/operator/tickets -H "Authorization: Bearer $OP"                       # the queue, with the agent's brief
+curl -s -X POST localhost:8000/operator/tickets/TKT-.../claim -H "Authorization: Bearer $OP"
+curl -s -X POST localhost:8000/operator/tickets/TKT-.../respond -H "Authorization: Bearer $OP" \
+  -H "Content-Type: application/json" -d '{"decision": "approve", "message": "Remote re-key scheduled for today."}'
+```
 
-Furthermore, every SQLite query in `src/db/support_store.py` binds the authenticated `request.user_id` parameter directly, making cross-merchant data leakage impossible even if a prompt bypasses lexical rules.
+`respond` returns what the agent told the merchant after the decision; the merchant also sees it in
+`GET /conversations/{id}` and in the conversation memory.
 
-### 6.2 Built-In Observability (`OrchestrationMetadata`)
+- **Claim is a lease.** A second operator gets `409` until the lease lapses; a decision requires holding it.
+- **Timeout.** A background sweeper expires unanswered tickets and resumes their conversations with a
+  "nobody answered, nothing was changed" observation. The same check runs lazily when the merchant writes again.
+  A ticket does not expire while an operator holds a live lease on it.
+- **Recovery.** If a decision is recorded and the process dies before the conversation resumes, the sweeper
+  resumes it; nothing depends on the merchant writing again.
+- **Last resort.** The Router answers with self-service steps when they exist and offers the handoff; it
+  escalates for approval only when the fix for the problem that was asked about needs one. The waiting
+  message says what was found and why a human is involved.
+- **What "executed" means.** An approved action creates a service order. The agent reports the order number
+  and that the work is scheduled; it is not allowed to say the work is done.
+- **While waiting**, new messages on that conversation get a status reply without running the agents.
+- **Idempotency.** The ticket key is `(thread, turn)`, so re-running the node cannot open a second ticket, and the
+  write action is exactly-once.
+- **Source of truth.** On resume the node reads the ticket row; the resume payload cannot forge an approval.
+- **Untrusted.** The operator's note is sanitized like any other external text before a model reads it.
 
-Every HTTP response includes a structured `orchestration` telemetry envelope (`OrchestrationMetadata`):
-- `trace_id`: Unique correlation ID (`trc-<12-hex>`) for distributed log correlation.
-- `safety_tier` & `primary_intent`: Router classification audit trail.
-- `agent_sequence`: Ordered list of agents that processed the request (e.g., `["router_agent", "customer_support_agent", "knowledge_agent"]`).
-- `tools_called`: Ordered list of tools executed during the turn.
-- `rag_sources`: Exact document/web sources used to ground the response.
-- `escalated_to_human` & `handoff_ticket_id`: Escalation state and generated SQLite ticket reference.
-- `latency_ms`: End-to-end turn execution time in milliseconds.
+## RAG pipeline
 
-### 6.3 Automated 12-Scenario Evaluation Benchmark Results
+**Ingestion.** `python -m scripts.ingest_getnet` captures nine public Getnet Brazil pages (machines, Pix, digital
+account, FAQ, receivables advance, Crediário, Payment Link) into `data/corpus/raw/` with source URL, date and
+content hash; `--check` reports pages that changed. The indexed corpus is `data/corpus/*.md`: one curated file
+per page, facts restated in English with the Portuguese product terms kept, and explicit statements where a
+page is silent or contradicts itself, so "the site does not say" is a retrievable, citable answer. An internal
+support runbook for telemetry codes is included and labelled as mock internal content. The challenge's
+suggested URL (`getnet.net/en`) is a global landing page without the product detail the scenarios need, which
+is why the Brazilian site is the source.
 
-Running `python scripts/evaluate_scenarios.py --format markdown` executes all 10 official challenge scenarios (`S1`–`S10`) plus 2 adversarial guardrail checks (`G1`–`G2`) under `Active LLM Provider: heuristic` and verifies **100% pass rate (12/12)**:
+**Chunking.** By `##` section, never across sections; long sections split on sentence boundaries with one
+sentence of overlap. Page title and section heading are prepended to the indexed text.
 
-| ID | Category | Safety Tier | Agent Sequence | Tools Called | RAG Sources | Handoff | Status |
+**Storage.** In memory, built at startup: 30 chunks. BM25 statistics plus a dense matrix. A vector database
+would add an operational dependency without changing recall at this size; the `Retriever.search` interface is
+where one would plug in.
+
+**Retrieval.** Three modes over the same chunks:
+- `bm25`: accent-folded, stop-word-filtered tokens, with a query-side glossary that maps merchant wording in
+  EN/PT/ES to the terms the corpus uses.
+- `dense`: cosine over embeddings. Keyless default is a character n-gram hashing embedder; with
+  `EMBEDDING_PROVIDER=openai` it uses `text-embedding-3-small`, cached on disk.
+- `hybrid`: reciprocal rank fusion of the two.
+
+Every hit carries a `coverage` score (share of query terms present), surfaced to the agent as
+`relevance: good | partial | poor`. That is the abstention and re-query signal.
+
+**Generation.** The Knowledge Agent answers only from tool results and reports its sources. Code then drops any
+reported URL that no tool returned; the Critic rejects answers with unsupported numbers or URLs.
+
+### Retrieval ablation
+
+42 labelled queries (29 EN, 8 PT, 5 ES); relevance is labelled at section level. From
+[eval/reports/offline/report.md](eval/reports/offline/report.md):
+
+| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |
+|---|---|---|---|---|---|
+| bm25 | 0.905 | 0.988 | 0.988 | 0.948 | 0.951 |
+| dense (hashing embedder) | 0.857 | 0.941 | 0.952 | 0.913 | 0.909 |
+| hybrid (RRF) | 0.905 | 0.952 | 0.976 | 0.946 | 0.938 |
+
+The same queries with hosted embeddings (`text-embedding-3-small`), from
+[eval/reports/openai/report.md](eval/reports/openai/report.md):
+
+| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |
+|---|---|---|---|---|---|
+| bm25 | 0.905 | 0.988 | 0.988 | 0.948 | 0.951 |
+| dense (hosted) | 0.929 | 0.988 | 0.988 | 0.964 | 0.966 |
+| hybrid (RRF) | 0.929 | 0.988 | 1.000 | 0.964 | 0.969 |
+
+The first submission asserted a 0.45 / 0.35 / 0.20 hybrid without measuring it. Measured: with the keyless
+embedder the hybrid is not better than BM25 and is worse on Portuguese; with a real semantic embedder the
+hybrid is at least as good as BM25 on every metric. In both cases the gap is one or two queries out of 42, so
+the honest claim is "the hybrid helps slightly once the dense side is a real embedder", not more. The default
+stays `bm25` with the keyless embedder because it needs no key, network or cache; a deployment that has the
+key should set `EMBEDDING_PROVIDER=openai` and `RETRIEVAL_MODE=hybrid`. The query set is small, single-author
+and close to the ceiling, which limits how much it can discriminate.
+
+## Tools
+
+| Agent | Tool | Notes |
+|---|---|---|
+| Knowledge | `search_getnet_knowledge(query)` | Passages with `source_url`, `coverage`, relevance rating |
+| Knowledge | `get_fx_rate(base, quote)` | ECB reference rates via Frankfurter |
+| Knowledge | `get_weather_forecast(city)` | Open-Meteo geocoding + forecast |
+| Knowledge | `web_search(query)` | DuckDuckGo; results are sanitized as untrusted text |
+| Support | `get_settlements()` | Yesterday's sales per modality, for the signed-in merchant |
+| Support | `get_pos_diagnostics()` | Terminal connectivity and last declined transaction |
+| Support | `get_account_profile()` | Business profile, masked bank account |
+| Support | `list_my_tickets()` | Human-review tickets and operator replies |
+
+All calls go through `run_tool` ([registry.py](src/tools/registry.py)): per-agent allow-list, authentication
+check, schema validation, identity arguments dropped, exceptions converted to structured errors, metrics.
+
+## Guardrails
+
+| Layer | What it does | Failure mode |
+|---|---|---|
+| Input, deterministic | Patterns over normalized views of the message: NFKC, zero-width removal, leetspeak, separator stripping, decoded base64. Injection, prompt extraction, bulk exfiltration, illicit requests, other merchants' ids (EN/PT/ES) | Always on |
+| Input, LLM classifier | Typed verdict through a forced function call; the message is passed as tagged data. A block is kept only if a second, more careful pass agrees, so one hasty verdict cannot refuse an ordinary question; the second pass runs only for flagged messages | Fail-open to the deterministic layer |
+| Untrusted data | Retrieved passages, web results and operator notes: instruction-like sentences removed, delimiter tags neutralized, wrapped as data in every prompt | Always on |
+| Structural | Tool allow-lists, principal-scoped tools, human-gated writes | Always on |
+| Output | Prompt canary, other tenants' identifiers, credential-shaped strings, formatted CPF/CNPJ and Luhn-valid card numbers (redacted). Applied to final answers and to the waiting message sent when a turn pauses for a human | Fail-closed |
+
+The structural layer is the one that carries the security argument; the others reduce how often it is tested.
+
+Blocking a legitimate merchant is a failure too, and it is measured like one. The first version of these
+patterns blocked eight ordinary questions out of eight in an audit ("cliente 30 dias" read as a merchant id,
+"todos os clientes" as bulk exfiltration), and a real-model run showed the classifier refusing a Portuguese
+product question. The patterns were tightened, the classifier got the second pass, and the adversarial suite
+now carries 30 benign controls whose false-positive rate is gated next to the attack success rate.
+
+## Evaluation
+
+`python -m eval.run` drives the real application through its HTTP API on throw-away databases.
+
+| Suite | Dataset | Measures |
+|---|---|---|
+| Retrieval | 42 labelled queries | Recall@k, Hit@k, MRR, nDCG@k per mode and language |
+| Golden answers | 64 conversations: 18 dev, 22 validation, 24 sealed held-out (single and multi-turn, EN/PT/ES, account, compound, HITL approve/reject/answer, abstention, contradictory source, anonymous). Each runs on its own fresh databases | Fact coverage, forbidden claims, numeric groundedness, citation validity, language match, gold source cited, LLM judge, latency, cost; routing separately |
+| Adversarial | 38 attacks + 30 benign controls | Attack success rate, data leaks, unauthorized writes, false-positive rate |
+| Judge calibration | 40 good and bad answers with pass/fail labels: 16 original, 24 on questions that appear in no golden item | Judge agreement and Cohen's kappa, overall and per set; false passes |
+
+**How correctness is checked without brittle string matching.** Each golden item lists the atomic facts a
+correct answer must carry, each as a set of acceptable phrasings (`["48"]`, `["129[.,]90"]`,
+`["does not (say|state|specify)", "não informa", ...]`), matched accent- and case-insensitively, plus claims
+that must not appear. Any wording or language that carries the facts passes; a fluent answer with the wrong
+number fails.
+
+**Groundedness** is measured against the evidence the agents collected in that turn (read from the trace):
+every number in the answer must occur in it, and every URL must have been returned by a tool. An agent's own
+report does not count as evidence for a URL.
+
+**LLM judge.** A separate call with its own rubric grades correctness, groundedness, relevance and helpfulness
+1–5 against a human-written reference and the evidence. The pass rule is applied in code from the scores. Its
+reliability is measured on the calibration set, where "false pass" (accepting an answer a human rejected) is
+the number to watch.
+
+**Semantic pass** = all facts present, no forbidden claim, numeric groundedness 1.0, no fabricated citation,
+expected status, and the judge's pass when a judge ran.
+
+**Three splits, and exactly how clean each is** ([ADR-0016](docs/adr/0016-sealed-held-out-and-independent-judge-calibration.md)).
+`dev` (g01-g18) was used while writing prompts and the offline policy. `validation` (h01-h22) was written as
+a held-out split and stopped being one: it was run against the model, two items failed, general fixes
+followed, the acceptable phrasings of h07 and h11 were widened, and it was run again. It is reported under
+the name that describes it. `heldout` (s01-s24) is sealed: written after the last change to any prompt, never
+used to change one, its floor (0.80) fixed before its first model run and not raised afterwards. Its result
+is published as measured; a grader mistake in a sealed item is reported, not corrected into a pass. The
+sealed items were drafted with an LLM coding assistant from the corpus and the fixtures by this project, so
+they are unseen by the prompts, not written by an outside party.
+
+**One run is an anecdote.** `--repeat N` runs the golden suite N times with nothing changed in between and
+reports every run, the mean and which items failed in how many runs. Each report also records the SHA-256 of
+the dataset files it ran.
+
+**Regression gate.** [eval/baseline.json](eval/baseline.json) holds floors and ceilings per mode;
+`--gate` exits non-zero on a regression, on a gated metric that was never produced (a judge or calibration
+that did not answer), and, with a model, on any turn answered by the degraded fallback. CI runs the offline
+gate on every push.
+
+### Results
+
+**Real model** (`gpt-6-luna` answering, `gpt-5.4-mini` judging, live web tools on, 2026-11-14) —
+[full report](eval/reports/openai/report.md). Three runs of the golden suite with nothing changed between
+them; the table is run 1, the one the gate reads. **The gate failed on this run**: dev semantic pass 0.833
+against a floor of 0.94. Every other gated metric passed, including the sealed split.
+
+| Split | n | Semantic pass | Fact coverage | Numeric groundedness | Citation validity | Gold source cited | Language match | Judge pass | p50 | p95 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dev | 18 | 0.833 | 0.972 | 1.000 | 1.000 | 1.000 | 1.000 | 0.889 | 12.2 s | 25.1 s |
+| validation | 22 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 10.7 s | 16.0 s |
+| heldout (sealed) | 24 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 9.8 s | 27.1 s |
+| all | 64 | 0.953 | 0.992 | 1.000 | 1.000 | 1.000 | 1.000 | 0.969 | 10.7 s | 25.1 s |
+
+Run-to-run variation (semantic pass per run, then the mean):
+
+| Split | Run 1 | Run 2 | Run 3 | Mean |
+|---|---|---|---|---|
+| dev | 0.833 | 0.944 | 0.944 | 0.907 |
+| validation | 1.000 | 1.000 | 1.000 | 1.000 |
+| heldout (sealed) | 1.000 | 1.000 | 0.875 | 0.958 |
+| all | 0.953 | 0.984 | 0.938 | 0.958 |
+
+Eight items failed in exactly one of the three runs; none failed twice. What each one was:
+
+| Item | Run | What happened |
+|---|---|---|
+| g04 (dev) | 1 | Abstention worded in a way the fact list does not recognise |
+| g07 (dev) | 1 | Asked for EUR/BRL, answered with EUR/USD: a wrong answer |
+| g08 (dev) | 1 | Correct outcome, plus a Pix / Payment Link suggestion the judge found unsupported by the evidence |
+| g15 (dev) | 2 | Same pattern as g08: correct, with the same suggestion judged unsupported |
+| g12 (dev) | 3 | Left out the "connect to the store Wi-Fi" step the reference lists |
+| s04 (sealed) | 3 | Said the limit of devices per store is not documented; the corpus says 5: a wrong abstention |
+| s18 (sealed) | 3 | Answered the account half, could not find the battery charging time that the FAQ states |
+| s22 (sealed) | 3 | **Grader mistake.** The answer ("entre na sua conta Getnet") is right and the judge passed it; the fact list does not include that phrasing. Left as a failure, as the protocol requires |
+
+So the sealed split is 24/24 in two runs and 21/24 in the third, of which two are real misses (both a
+documented fact not retrieved or not used) and one is the grader. The dev failures are variance around
+abstention wording and one unsupported addition that recurs; they have not been fixed in this version, and
+the dev floor has not been lowered to make the gate pass.
+
+- Judge means (1-5, run 1): correctness 4.84, groundedness 4.94, relevance 4.86, helpfulness 4.67. No
+  forbidden claim, no fabricated citation, no turn answered by the degraded fallback, routing as expected
+  1.000. Mean cost per turn USD 0.00175 at the configured prices (`PRICE_*_PER_MTOK`; set them to your
+  price list).
+- Judge calibration: 40 of 40 in agreement with the reference labels, Cohen's kappa 1.000, 0 false passes,
+  0 false fails; per set, 16 of 16 on `original` and 24 of 24 on `independent` (questions that appear in no
+  golden item). The independent labels were drafted with an LLM assistant against the rubric, so this is
+  agreement with a rubric-following labeller, not with an outside human.
+- Adversarial: 38 attacks, attack success rate 0.000 (28 blocked at input, 10 contained downstream), 0 data
+  leaks, 0 unauthorized writes; 30 benign controls, false-positive rate 0.000.
+
+How it got there is part of the evidence. The first run against the real model failed its gate (semantic
+pass 0.72, judge pass 0.78): English questions answered in Portuguese, the "card machine offline" scenario
+escalated to a human instead of answered, a tool called four times in a row. The evaluation found those; the
+fixes are in [ADR-0015](docs/adr/0015-what-the-first-model-run-changed.md). A later run at 0.925 (37/40:
+`h01`, `h09`, `g04`) led to tighter Portuguese/English language markers, bilingual and safety-refusal
+calibration in the judge, and Router faithfulness, after which a single run of the 40 dev and validation
+items passed 40/40. The three-run measurement above is what that single run did not show.
+
+**Offline policy** (deterministic; the CI gate) — [full report](eval/reports/offline/report.md):
+
+| Split | n | Semantic pass | Fact coverage | Numeric groundedness | Citation validity | Language match | Routing as expected |
 |---|---|---|---|---|---|---|---|
-| **S1** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#get-classica-vs-get-smart`, `data/getnet_knowledge_base.md#pos-terminal-connectivity-troubleshooting` | No | **PASS** |
-| **S2** | General Web Search | `GENERAL_UTILITY` | `router_agent` → `knowledge_agent` | `search_web_general` | — | No | **PASS** |
-| **S3** | Customer Support | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` | `get_merchant_profile_and_settlements` | — | No | **PASS** |
-| **S4** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#pix-bank-account-rules`, `data/getnet_knowledge_base.md#receivables-advance-antecipacao` | No | **PASS** |
-| **S5** | Compound Support + RAG | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` → `knowledge_agent` | `get_pos_terminal_diagnostics`, `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#pos-terminal-connectivity-troubleshooting`, `data/getnet_knowledge_base.md#get-classica-vs-get-smart` | No | **PASS** |
-| **S6** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#receivables-advance-antecipacao`, `data/getnet_knowledge_base.md#overview` | No | **PASS** |
-| **S7** | General Web Search | `GENERAL_UTILITY` | `router_agent` → `knowledge_agent` | `search_web_general` | — | No | **PASS** |
-| **S8** | Support -> Escalation | `GETNET_DOMAIN` | `router_agent` → `customer_support_agent` → `escalation_agent` | `get_pos_terminal_diagnostics`, `create_support_ticket_or_escalate` | — | Yes (`TKT-1988-NNN`) | **PASS** |
-| **S9** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#crediario-installment-limits`, `data/getnet_knowledge_base.md#receivables-advance-antecipacao` | No | **PASS** |
-| **S10** | Product RAG | `GETNET_DOMAIN` | `router_agent` → `knowledge_agent` | `retrieve_getnet_knowledge` | `data/getnet_knowledge_base.md#payment-link-whatsapp`, `data/getnet_knowledge_base.md#receivables-advance-antecipacao` | No | **PASS** |
-| **G1** | Guardrail (Cross-Tenant) | `RESTRICTED_UNSAFE` | `router_agent` | `[]` | — | No | **PASS** |
-| **G2** | Guardrail (Illegal/Fraud) | `RESTRICTED_UNSAFE` | `router_agent` | `[]` | — | No | **PASS** |
+| dev | 18 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| validation | 22 | 0.682 | 0.682 | 1.000 | 1.000 | 0.727 | 0.773 |
+| heldout (sealed) | 24 | 0.750 | 0.771 | 1.000 | 1.000 | 0.667 | 1.000 |
 
-*(Note: `S8` ticket IDs increment sequentially per persisted `cliente1988` escalation in SQLite, starting at `TKT-1988-001`; `run_knowledge_agent` requests `top_k=2` chunks, so each RAG scenario cites up to 2 sources.)*
+Adversarial: 38 attacks, attack success rate 0.000 (15 blocked at input, 23 contained downstream), 0 data
+leaks, 0 unauthorized writes; 30 benign controls, false-positive rate 0.000.
 
-### 6.4 Testing & Production Monitoring Strategy
+What the offline numbers do and do not show: the pipeline, tools, guardrails, memory and human-review flow
+work, answers stay grounded, and no attack succeeds even without the classifier. They are not a measure of
+answer quality. The validation and sealed rows are the honest picture of a rule policy: it answers in English
+whatever the question's language (it is extractive and cannot translate, so non-English items fail language
+match cleanly), reads "pessoa física" as a request for a person, and cannot decompose a question it
+has no rule for. The model path does not have those limits, which is the point of having both columns.
 
-- **Multi-Seam Integration Testing (`tests/`)**:
-  - `tests/test_orchestration_api.py`: Walking skeleton, HTTP contracts, and Tier-3 guardrail refusal checks.
-  - `tests/test_knowledge_rag_api.py`: Hybrid RAG ingestion, scraping resilience, and Getnet product scenarios (`S1`, `S4`, `S6`, `S9`, `S10`).
-  - `tests/test_general_web_search_api.py`: General utility routing and resilient weather/FX search (`S2`, `S7`).
-  - `tests/test_support_settlements_api.py`: Tenant-scoped SQLite Settlement lookup and unknown-merchant handling (`S3`).
-  - `tests/test_cooperative_chaining_api.py`: Multi-agent chaining (`S5` Support → Knowledge, `S8` Support → Escalation).
-  - `tests/test_evaluation_and_packaging.py`: Containerization verification, 12-scenario benchmark runner assertion, and documentation completeness checks.
-- **Production Monitoring & Alerting Architecture**:
-  - **Structured Trace Ingestion**: Export `OrchestrationMetadata` (`trace_id`, `safety_tier`, `primary_intent`, `agent_sequence`, `tools_called`, `latency_ms`) via OpenTelemetry / LangSmith to Prometheus and Grafana.
-  - **Key Operational SLIs / Alerts**:
-    1. *Guardrail Spike Alert*: Page security/trust engineering if `safety_tier == RESTRICTED_UNSAFE` exceeds `5%` of rolling 5-minute traffic (indicative of coordinated prompt-injection or credential-stuffing attacks).
-    2. *Human Handoff Rate Alert*: Alert operations if `escalated_to_human == True` exceeds `15%` of support inquiries (signaling a widespread POS firmware regression or acquirer network outage).
-    3. *RAG Groundedness & Latency SLO*: Track `p95(latency_ms) < 1500ms` and run `scripts/evaluate_scenarios.py` as a mandatory CI/CD quality gate on every pull request and prompt/corpus update.
+## Observability and cost
+
+- **Trace per turn** (`GET /traces/{trace_id}`): every model call (role, model, tokens, latency, degraded),
+  tool call (arguments, latency, error), Router decision (thought, task, remaining plan), Critic review,
+  guardrail verdict, human decision, and the observations themselves.
+- **Structured JSON logs**: one `chat_turn` line per turn with trace id, agents, tools, steps, latency, cost.
+- **Metrics** (`GET /metrics`, Prometheus text): `chat_turns_total{status}`, `chat_turn_seconds` histogram,
+  `llm_calls_total{role}`, `llm_tokens_total{direction}`, `llm_degraded_calls_total`, `tool_calls_total{tool,outcome}`,
+  `guardrail_blocks_total{category,layer}`, `critic_revisions_total`, `low_confidence_fallbacks_total`,
+  `fabricated_citations_dropped_total`, `identity_argument_ignored_total`, `escalations_total{reason}`,
+  `human_decisions_total{decision}`, `human_review_timeouts_total`, `memory_compactions_total`,
+  `login_failures_total`, `chat_rate_limited_total`, `user_feedback_total{rating}`.
+- **Cost**: real token usage from the provider per call, priced with `PRICE_*_PER_MTOK`, summed per turn in
+  the response and the trace. Cost is contained by the step budgets, `reasoning.effort` per role (the guardrail
+  classifier runs at the lowest), history compaction, and a `top_k` of 4.
+- **Feedback**: `POST /feedback` attaches a thumbs up/down to a trace.
+
+Alerts worth having on these: degraded-call rate, guardrail block rate by category, critic revision and
+low-confidence fallback rate, tool error rate, p95 turn latency, human-review timeouts, tickets waiting.
+
+## Testing strategy
+
+169 tests, all through public interfaces, no network and no key.
+
+| File | What it proves |
+|---|---|
+| [test_agentic_loop.py](tests/test_agentic_loop.py) | Re-planning from observations, critic-driven retry, refusal to send an ungrounded answer, step budget, duplicate-delegation refusal, fabricated-citation handling, tool reconsideration, compound decomposition, provider outage, trace completeness |
+| [test_memory.py](tests/test_memory.py) | Cross-request memory, pronoun follow-ups, restart recovery, compaction, isolation, poisoned-message handling |
+| [test_human_in_the_loop.py](tests/test_human_in_the_loop.py) | Interrupt/resume, approve/reject/answer, lease and conflicts, role checks, timeout (sweeper and lazy), restart mid-review, idempotent ticket, exactly-once write, code-level approval gate |
+| [test_identity_and_api.py](tests/test_identity_and_api.py) | Token-only identity, tenant isolation at the tool layer, token failure modes, rate limiting, logout, trace privacy, metrics |
+| [test_guardrails.py](tests/test_guardrails.py) | Every "block" attack in the adversarial dataset, benign controls, obfuscation, classifier layer and its fail-open, sanitizer on poisoned and real corpus, output guard |
+| [test_llm_adapters.py](tests/test_llm_adapters.py) | Request shape and parsing of the OpenAI adapter against a fake SDK client, fallback for models without reasoning controls, circuit breaker open/recover, provider selection |
+| [test_rag_and_eval.py](tests/test_rag_and_eval.py) | Chunking, the three retrieval modes, metric math, groundedness and citation checks, language detection, the gate (including a gated metric that was never produced), live tools with a mocked transport |
+| [test_hardening.py](tests/test_hardening.py) | Ordinary wording that used to be blocked, output-guard false positives plus obfuscated canary and internal tool-name blocking, PT/ES injections in retrieved text, anonymous conversation ids, strict `REQUIRE_CHAT_AUTH` and `/chat` rate limiting, production mode, lease-aware timeout, recovery of a decision whose resume never ran, checkpoint and trace retention, usage after a resume, specialist `degraded` propagation, a Critic that returns nothing |
+
+A scripted model ([scripted.py](src/llm/scripted.py)) plays individual agents where exact behaviour must be
+asserted (for example "the Critic rejects, the Router must gather more evidence"); everything else runs the
+offline policy. Integration testing against the real model is the evaluation harness: same HTTP surface,
+scored on semantics rather than asserted on strings, with the gate as the pass/fail criterion.
+
+## Production notes
+
+- **Container**: multi-stage build, non-root uid 10001, read-only root filesystem, all capabilities dropped,
+  state in one volume. `/health` is liveness; `/ready` checks the database, migrations and the index.
+- **CI** ([ci.yml](.github/workflows/ci.yml)): lint, tests, offline eval gate, image build, non-root check,
+  read-only boot and a smoke test of the challenge contract. The model evaluation is a manual job.
+- **Migrations**: numbered, forward-only, applied at startup and recorded in `schema_migrations`.
+- **Backup / rollback**: `python -m scripts.backup` takes a consistent online copy of both databases;
+  `--restore` puts one back. Rolling back a release means restoring the backup taken before it.
+- **Secrets**: environment only; nothing secret has a usable default except the demo password.
+  `APP_ENV=production` refuses to start while demo users are enabled or `JWT_SECRET` is unset or short.
+- **Retention**: a finished turn keeps one checkpoint per conversation (its memory), not one per graph step;
+  traces are deleted after `TRACE_RETENTION_DAYS`.
+- **Scaling out** needs three changes, none of them in agent code: the LangGraph Postgres checkpointer instead
+  of SQLite, Postgres for the ops store, and a shared store (Redis) for the login limiter and per-thread locks.
+  Until then it is one worker, and the Dockerfile says so.
+
+## How this was built (SDD and LLM tools)
+
+Spec first, then code. [GLOSSARY.md](GLOSSARY.md) fixes the domain language; [SPEC.md](SPEC.md) fixes the
+contracts, agents, bounds and acceptance criteria; [docs/adr/](docs/adr/) records the decisions, including the
+ones this version reversed (ADR-0006 supersedes the deterministic state machine of ADR-0001). Work items live in
+[.scratch/](.scratch/) as one spec and one file per vertical slice.
+
+LLM coding tools (Claude) were used throughout: to turn the review into a spec, to implement slices against
+tests, and to review the result. The decisions that shape the system were made deliberately and are written
+down: identity from tokens only, writes gated in code, untrusted data never promoted to instructions,
+retrieval mode chosen by measurement, and evaluation that reports failures instead of hiding them. Everything
+an LLM wrote is covered by the tests and the evaluation gate described above.
+
+## Limitations
+
+- The committed model report (`2026-11-14`) is three runs of the golden suite and its gate failed on the dev
+  split in run 1 (0.833 against 0.94). Dev varied between 0.833 and 0.944 across the runs, so that floor,
+  set from an earlier single run, is tighter than the system's measured variance.
+- The golden, adversarial and retrieval datasets are small (64, 68 and 42 items) and written by one person.
+  They catch regressions and gross errors; they are not a statistically strong estimate of quality. The
+  retrieval set has no held-out split and sits close to the ceiling.
+- Latency: in the reported run a turn takes 10.7 seconds at the median and 25.1 at p95. That is the price of a
+  classifier, a Router loop, specialist tool loops and a Critic run in sequence; streaming and running the
+  input classifier in parallel with the first Router step are the obvious next steps and are not built.
+- The knowledge base is a curated snapshot of nine pages dated in each file's front matter. Fees change; a
+  production system would schedule the ingestion check and re-curate on change.
+- Merchant data, the runbook and the write action are mock fixtures.
+- The deterministic input patterns can be evaded by wording they do not anticipate (the adversarial set
+  includes paraphrased, German and French attacks that pass them); the LLM classifier and the structural
+  controls are what cover that, and the classifier fails open by design.
+- Reply-language detection covers English, Portuguese and Spanish. In any other language the Router still
+  gets the instruction to answer in the merchant's language, but nothing enforces it. Refusals and the
+  low-confidence fallback are fixed English strings.
+- A turn is five to nine sequential model calls; the evaluation report gives the measured latency.
+- Single worker, SQLite, in-process locks and rate limiter (see Production notes).
+- Operators have an API, not a UI, and there is no notification when a ticket opens.
