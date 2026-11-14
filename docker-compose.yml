@@ -1,28 +1,31 @@
 services:
-  getnet-support-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: getnet-multi-agent-support
+  api:
+    build: .
+    image: getnet-multi-agent-support:0.2.0
     ports:
       - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - LLM_PROVIDER=${LLM_PROVIDER:-heuristic}
-      - GROQ_API_KEY=${GROQ_API_KEY:-}
-      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2}
-      - ENABLE_LIVE_WEB_SCRAPE=${ENABLE_LIVE_WEB_SCRAPE:-true}
+      SQLITE_DB_PATH: /app/state/support.db
+      CHECKPOINT_DB_PATH: /app/state/checkpoints.db
     volumes:
-      - ./data:/app/data
+      - state:/app/state # conversations, tickets, traces: survives restarts and image upgrades
+    read_only: true # the image is immutable; only the state volume and /tmp are writable
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3).status == 200 else 1)"]
       interval: 15s
-      timeout: 5s
+      timeout: 4s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     restart: unless-stopped
+
+volumes:
+  state:
