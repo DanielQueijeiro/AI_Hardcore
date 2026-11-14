@@ -1,9 +1,12 @@
-"""Auto-seeded SQLite database store for Merchant profiles, Settlements, POS Terminals, and Support Tickets."""
+"""Mock merchant back office (profiles, settlements, POS telemetry). Synthetic fixture data, read-only.
+
+Every query is filtered by the merchant id handed in by the tool layer, which takes it from the
+verified principal. Tickets, approvals and users live in src/db/ops_store.py.
+"""
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -57,16 +60,6 @@ CREATE TABLE IF NOT EXISTS pos_terminals (
     FOREIGN KEY (merchant_id) REFERENCES merchants (merchant_id)
 );
 
-CREATE TABLE IF NOT EXISTS support_tickets (
-    ticket_id TEXT PRIMARY KEY,
-    merchant_id TEXT NOT NULL,
-    terminal_id TEXT,
-    issue_summary TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    status TEXT NOT NULL,
-    needs_human_handoff INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-);
 """
 
 
@@ -77,9 +70,15 @@ def _resolve_db_path(db_path: Path | str | None = None) -> Path:
     return target
 
 
+_SEEDED: set[str] = set()
+
+
 def ensure_seeded_database(db_path: Path | str | None = None) -> Path:
-    """Create tables and idempotently seed deterministic fixtures for cliente1988 and cliente2026."""
+    """Create tables and idempotently seed the fixtures for cliente1988 and cliente2026 (once per path)."""
     resolved_path = _resolve_db_path(db_path)
+    if str(resolved_path) in _SEEDED and resolved_path.exists():
+        return resolved_path
+    _SEEDED.add(str(resolved_path))
     with sqlite3.connect(resolved_path) as conn:
         conn.executescript(SCHEMA_SQL)
 
@@ -403,90 +402,4 @@ def fetch_pos_diagnostics(
             "reason": terminal_row["last_decline_reason"],
             "requires_l2_escalation": bool(terminal_row["requires_l2_escalation"]),
         },
-    }
-
-
-def persist_support_ticket(
-    merchant_id: str,
-    issue_summary: str,
-    severity: str = "HIGH",
-    db_path: Path | str | None = None,
-) -> dict[str, Any]:
-    """Create and persist a Support Ticket in SQLite scoped strictly to merchant_id."""
-    normalized_id = merchant_id.strip()
-    normalized_severity = severity.strip().upper() or "HIGH"
-    resolved_path = ensure_seeded_database(db_path)
-
-    with sqlite3.connect(resolved_path) as conn:
-        conn.row_factory = sqlite3.Row
-        merchant_row = conn.execute(
-            "SELECT merchant_id, business_name FROM merchants WHERE merchant_id = ?",
-            (normalized_id,),
-        ).fetchone()
-
-        if merchant_row is None:
-            return {
-                "created": False,
-                "found": False,
-                "merchant_id": normalized_id,
-                "ticket_id": None,
-                "needs_human_handoff": False,
-                "error": f"Cannot create Support Ticket: no active Merchant found for '{normalized_id}'.",
-            }
-
-        terminal_row = conn.execute(
-            "SELECT terminal_id, model FROM pos_terminals WHERE merchant_id = ?",
-            (normalized_id,),
-        ).fetchone()
-        terminal_id = terminal_row["terminal_id"] if terminal_row else None
-
-        count_row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM support_tickets WHERE merchant_id = ?",
-            (normalized_id,),
-        ).fetchone()
-        seq_num = (int(count_row["cnt"]) if count_row else 0) + 1
-        suffix = "".join(ch for ch in normalized_id if ch.isdigit()) or normalized_id.upper()
-        ticket_id = f"TKT-{suffix}-{seq_num:03d}"
-
-        needs_handoff = normalized_severity in {"HIGH", "CRITICAL", "URGENT"}
-        created_at = datetime.now(timezone.utc).isoformat()
-
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO support_tickets (
-                ticket_id,
-                merchant_id,
-                terminal_id,
-                issue_summary,
-                severity,
-                status,
-                needs_human_handoff,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ticket_id,
-                normalized_id,
-                terminal_id,
-                issue_summary.strip(),
-                normalized_severity,
-                "OPEN_ESCALATED" if needs_handoff else "OPEN",
-                1 if needs_handoff else 0,
-                created_at,
-            ),
-        )
-        conn.commit()
-
-    return {
-        "created": True,
-        "found": True,
-        "ticket_id": ticket_id,
-        "merchant_id": normalized_id,
-        "business_name": merchant_row["business_name"],
-        "terminal_id": terminal_id,
-        "issue_summary": issue_summary.strip(),
-        "severity": normalized_severity,
-        "status": "OPEN_ESCALATED" if needs_handoff else "OPEN",
-        "needs_human_handoff": needs_handoff,
-        "created_at": created_at,
     }
