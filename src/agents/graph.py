@@ -1,120 +1,93 @@
-"""LangGraph State-Machine Orchestration for the four specialized Getnet agents (ADR-0001, ADR-0005)."""
+"""Graph wiring.
+
+    guard ──blocked──────────────────────────────────────────────┐
+      │                                                           ▼
+      └─▶ router ⇄ knowledge | support            critic ──▶ finalize ─▶ END
+            │  ▲      (observe → re-plan)            ▲  │
+            │  └── escalation ─▶ human_review        │  └─ revise ─▶ router
+            │        (interrupt: human decides)      │
+            └──────────── finish ────────────────────┘
+
+Only the edges are static. Which specialist runs, in what order, how many times, and when to stop are
+chosen by the Router model each step from what it has observed so far.
+"""
 
 from __future__ import annotations
 
-import uuid
-from typing import Literal
+import sqlite3
+from pathlib import Path
+from typing import Any
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
-from src.agents.escalation import run_escalation_agent
-from src.agents.knowledge import run_knowledge_agent
-from src.agents.router import router_node
-from src.agents.support import run_customer_support_agent
-from src.schemas import OrchestrationState, PrimaryIntent, SafetyTier
+from src.agents.nodes import Nodes
+from src.agents.state import AgentState
+from src.runtime import Runtime
 
 
-def knowledge_node(state: OrchestrationState) -> OrchestrationState:
-    """Agent 2 (Knowledge Agent) node."""
-    return run_knowledge_agent(state)  # type: ignore[return-value]
+def open_checkpointer(path: Path | str) -> SqliteSaver:
+    """Durable checkpoints: conversation memory and paused human reviews survive a process restart."""
+    if str(path) != ":memory:":
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    saver = SqliteSaver(conn)
+    saver.setup()
+    return saver
 
 
-def customer_support_node(state: OrchestrationState) -> OrchestrationState:
-    """Agent 3 (Customer Support Agent) node."""
-    return run_customer_support_agent(state)
+def prune_checkpoints(checkpointer: BaseCheckpointSaver, thread_id: str) -> int:
+    """Keep only the latest checkpoint of a thread (its memory); delete the per-step history before it.
+
+    Only for the SQLite saver, whose schema this relies on; with another saver it is a no-op and retention
+    belongs to that store. Returns the number of checkpoints removed.
+    """
+    if not isinstance(checkpointer, SqliteSaver):
+        return 0
+    with checkpointer.lock:
+        conn = checkpointer.conn
+        latest = conn.execute(
+            "SELECT checkpoint_id FROM checkpoints WHERE thread_id = ? ORDER BY checkpoint_id DESC LIMIT 1", (thread_id,)
+        ).fetchone()
+        if latest is None:
+            return 0
+        removed = conn.execute(
+            "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_id != ?", (thread_id, latest[0])
+        ).rowcount
+        conn.execute("DELETE FROM writes WHERE thread_id = ? AND checkpoint_id != ?", (thread_id, latest[0]))
+        conn.commit()
+        return removed
 
 
-def escalation_node(state: OrchestrationState) -> OrchestrationState:
-    """Agent 4 (Escalation Agent) node."""
-    return run_escalation_agent(state)  # type: ignore[return-value]
+def build_graph(runtime: Runtime, checkpointer: BaseCheckpointSaver) -> Any:
+    nodes = Nodes(runtime)
+    graph = StateGraph(AgentState)
+    graph.add_node("guard", nodes.guard)
+    graph.add_node("router", nodes.supervisor)
+    graph.add_node("knowledge", nodes.knowledge)
+    graph.add_node("support", nodes.support)
+    graph.add_node("escalation", nodes.escalation)
+    graph.add_node("human_review", nodes.human_review)
+    graph.add_node("critic", nodes.critic)
+    graph.add_node("finalize", nodes.finalize)
 
-
-def route_from_router(
-    state: OrchestrationState,
-) -> Literal["knowledge_agent", "customer_support_agent", "escalation_agent", "__end__"]:
-    """Conditional router transition enforcing Tier 3 short-circuit and Tier 1/2 dispatch."""
-    if state.get("safety_tier") == SafetyTier.RESTRICTED_UNSAFE.value:
-        return END
-
-    intent = state.get("primary_intent")
-    if intent == PrimaryIntent.BLOCKED.value:
-        return END
-    if intent in (PrimaryIntent.PRODUCT_KNOWLEDGE.value, PrimaryIntent.GENERAL_WEB_SEARCH.value):
-        return "knowledge_agent"
-    if intent in (PrimaryIntent.CUSTOMER_SUPPORT.value, PrimaryIntent.COMPOUND_SUPPORT_AND_KB.value):
-        return "customer_support_agent"
-    if intent == PrimaryIntent.HUMAN_ESCALATION.value:
-        return "escalation_agent"
-    return "knowledge_agent"
-
-
-def route_from_support(
-    state: OrchestrationState,
-) -> Literal["knowledge_agent", "escalation_agent", "__end__"]:
-    """Conditional post-support transition enabling cooperative multi-agent chaining (ADR-0005)."""
-    if state.get("needs_human_handoff"):
-        return "escalation_agent"
-    if state.get("needs_knowledge_enrichment"):
-        return "knowledge_agent"
-    return END
-
-
-def build_orchestration_graph():
-    """Compile and return the LangGraph orchestration state machine."""
-    workflow = StateGraph(OrchestrationState)
-
-    workflow.add_node("router_agent", router_node)
-    workflow.add_node("knowledge_agent", knowledge_node)
-    workflow.add_node("customer_support_agent", customer_support_node)
-    workflow.add_node("escalation_agent", escalation_node)
-
-    workflow.add_edge(START, "router_agent")
-    workflow.add_conditional_edges(
-        "router_agent",
-        route_from_router,
-        {
-            "knowledge_agent": "knowledge_agent",
-            "customer_support_agent": "customer_support_agent",
-            "escalation_agent": "escalation_agent",
-            END: END,
-        },
+    graph.add_edge(START, "guard")
+    graph.add_conditional_edges(
+        "guard", lambda s: "finalize" if s["guard"].get("allowed") is False else "router", ["finalize", "router"]
     )
-    workflow.add_conditional_edges(
-        "customer_support_agent",
-        route_from_support,
-        {
-            "knowledge_agent": "knowledge_agent",
-            "escalation_agent": "escalation_agent",
-            END: END,
-        },
+    graph.add_conditional_edges(
+        "router",
+        lambda s: {"supervisor": "router"}.get(s["next"], s["next"]),
+        ["router", "knowledge", "support", "escalation", "critic"],
     )
-    workflow.add_edge("knowledge_agent", END)
-    workflow.add_edge("escalation_agent", END)
-
-    return workflow.compile()
-
-
-orchestration_graph = build_orchestration_graph()
-
-
-def run_orchestration(message: str, user_id: str) -> OrchestrationState:
-    """Execute the compiled LangGraph state machine for a single Merchant Inquiry."""
-    initial_state: OrchestrationState = {
-        "trace_id": f"trc-{uuid.uuid4().hex[:12]}",
-        "user_id": user_id,
-        "message": message,
-        "safety_tier": SafetyTier.GETNET_DOMAIN.value,
-        "primary_intent": PrimaryIntent.PRODUCT_KNOWLEDGE.value,
-        "routing_rationale": "",
-        "agent_sequence": [],
-        "tools_called": [],
-        "rag_sources": [],
-        "support_context": {},
-        "knowledge_context": "",
-        "needs_knowledge_enrichment": False,
-        "needs_human_handoff": False,
-        "handoff_ticket_id": None,
-        "final_answer": "",
-    }
-    result: OrchestrationState = orchestration_graph.invoke(initial_state)
-    return result
+    graph.add_edge("knowledge", "router")
+    graph.add_edge("support", "router")
+    graph.add_edge("escalation", "human_review")
+    graph.add_edge("human_review", "router")
+    graph.add_conditional_edges(
+        "critic", lambda s: "router" if s["next"] == "supervisor" else "finalize", ["router", "finalize"]
+    )
+    graph.add_edge("finalize", END)
+    return graph.compile(checkpointer=checkpointer)
