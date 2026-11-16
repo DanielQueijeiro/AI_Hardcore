@@ -216,6 +216,12 @@ def test_report_records_the_code_and_inputs_that_produced_it():
     assert all(re.fullmatch(r"[0-9a-f]{64}", h) for h in p["inputs_sha256"].values())
 
 
+def test_dirty_check_reads_porcelain_status_exactly():
+    status = " M eval/reports/openai/report.json\nM  src/agents/prompts.py\n?? eval/adjudications.jsonl\n M eval/judge.py"
+    assert ev.dirty_paths(status) == ["src/agents/prompts.py", "eval/judge.py"]
+    assert ev.dirty_paths("") == []
+
+
 def test_partial_runs_are_explicit_and_never_gated(tmp_path):
     assert [i["id"] for i in ev.select_golden(["g01", "s01"])] == ["g01", "s01"]
     assert {i["split"] for i in ev.select_golden(split="heldout")} == {"heldout"}

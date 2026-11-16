@@ -82,16 +82,20 @@ def _git(*args: str) -> str | None:
         out = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError):
         return None
-    return out.stdout.strip()
+    return out.stdout.strip("\n")  # not strip(): a porcelain status line starts with a meaningful space
+
+
+def dirty_paths(porcelain: str) -> list[str]:
+    """Changed paths from `git status --porcelain`, minus reports and adjudications: writing those cannot change a result."""
+    paths = [line[3:].strip('"') for line in porcelain.splitlines() if len(line) > 3]
+    return [p for p in paths if not p.startswith("eval/reports/") and p != "eval/adjudications.jsonl"]
 
 
 def provenance() -> dict[str, Any]:
     """What produced this report besides the datasets: the commit, whether the tree differed from it, and hashes of
-    the inputs that decide an answer or its grade. Reports and adjudications are excluded from the dirty check:
-    writing them cannot change a result."""
+    the inputs that decide an answer or its grade."""
     status = _git("status", "--porcelain", "--", "src", "eval", "data/corpus", "scripts", "pyproject.toml")
-    dirty = [line[3:] for line in (status or "").splitlines() if line[3:] and not line[3:].startswith("eval/reports/")]
-    dirty = [p for p in dirty if p != "eval/adjudications.jsonl"]
+    dirty = dirty_paths(status or "")
     return {
         "git_commit": _git("rev-parse", "HEAD"),
         "git_dirty": bool(dirty) if status is not None else None,
