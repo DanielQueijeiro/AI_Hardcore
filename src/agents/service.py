@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import threading
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -24,7 +26,15 @@ logger = logging.getLogger(__name__)
 _CONVERSATION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ANONYMOUS_CONVERSATION_ID = re.compile(r"^[0-9a-f]{32}$")
 RECURSION_LIMIT = 60
-STILL_WAITING = "Your case is still with a human specialist (ticket {ticket_id}). You will get the outcome in this conversation as soon as they respond."
+# What a streaming client is shown while a turn runs: which agent decided what, which tool ran, the review outcome.
+# Model reasoning ("thought"), tool results and token counts stay in the trace, which is access-controlled.
+STREAMED_SPANS = frozenset(
+    {"guardrail_input", "decision", "tool", "review", "ticket_opened", "human_decision", "guardrail_output", "memory_compacted"}
+)
+STREAMED_FIELDS = frozenset(
+    {"node", "kind", "action", "step", "tool", "error", "verdict", "outcome", "ticket_id", "status", "allowed", "category", "round"}
+)
+STILL_WAITING ="Your case is still with a human specialist (ticket {ticket_id}). You will get the outcome in this conversation as soon as they respond."
 
 
 class ConversationError(ValueError):
@@ -64,7 +74,41 @@ class ChatService:
 
     # --- turns ------------------------------------------------------------------------------------------
 
-    def handle_message(self, principal: Principal, message: str, conversation_id: str | None = None) -> dict[str, Any]:
+    def stream_message(self, principal: Principal, message: str, conversation_id: str | None = None) -> Iterator[dict[str, Any]]:
+        """Run a turn and yield progress as it happens: an `accepted` event, one `step` per routing decision, tool
+        call, review or human-review event, then `result` (the same result `handle_message` returns) or `error`.
+
+        The turn runs on its own thread and finishes even if the caller stops reading, so a dropped connection never
+        leaves a conversation half-written. The conversation id is validated before anything starts.
+        """
+        _, conversation_id = self.thread_key(principal, conversation_id)
+        events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        def work() -> None:
+            try:
+                events.put({"type": "result", "result": self.handle_message(principal, message, conversation_id, on_event=events.put)})
+            except Exception as exc:  # noqa: BLE001 - reported to the stream, not swallowed
+                logger.exception("stream_turn_failed", extra={"conversation_id": conversation_id})
+                events.put({"type": "error", "detail": type(exc).__name__})
+            finally:
+                events.put(None)
+
+        events.put({"type": "accepted", "conversation_id": conversation_id})
+        threading.Thread(target=work, name="chat-turn-stream", daemon=True).start()
+
+        def drain() -> Iterator[dict[str, Any]]:
+            while (item := events.get()) is not None:
+                yield item
+
+        return drain()
+
+    def handle_message(
+        self,
+        principal: Principal,
+        message: str,
+        conversation_id: str | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         thread_key, conversation_id = self.thread_key(principal, conversation_id)
         config = self._config(thread_key)
         with self._lock(thread_key):
@@ -78,14 +122,49 @@ class ChatService:
                 # decided or timed out while nobody was looking: finish that turn first, then take the new message
                 self._resume_locked(thread_key, conversation_id)
                 started = time.perf_counter()
-            output = self.graph.invoke(new_turn(message, principal.as_dict(), thread_key), config)
+            output = self._run(new_turn(message, principal.as_dict(), thread_key), config, on_event)
             return self._result(output, conversation_id, time.perf_counter() - started)
+
+    def _run(self, graph_input: Any, config: dict[str, Any], on_event: Callable[[dict[str, Any]], None] | None) -> dict[str, Any]:
+        """Invoke the graph; with `on_event`, stream it node by node and report each new span as it lands."""
+        if on_event is None:
+            return self.graph.invoke(graph_input, config)
+        reported = 0
+        for update in self.graph.stream(graph_input, config, stream_mode="updates"):
+            for node, values in update.items():
+                spans = (values or {}).get("events") if isinstance(values, dict) else None
+                if not spans:
+                    continue
+                for span in spans[reported:]:
+                    if span.get("kind") in STREAMED_SPANS:
+                        on_event({"type": "step", **{k: v for k, v in span.items() if k in STREAMED_FIELDS}})
+                reported = len(spans)
+                logger.debug("stream_node", extra={"node": node})
+        snapshot = self.graph.get_state(config)
+        output = dict(snapshot.values)
+        if snapshot.next:
+            output["__interrupt__"] = True  # paused on a human review, as `invoke` would report it
+        return output
 
     def resume(self, thread_key: str) -> dict[str, Any] | None:
         """Continue a paused turn after its ticket was resolved or timed out. Idempotent."""
         conversation_id = thread_key.split(":", 1)[1]
         with self._lock(thread_key):
             return self._resume_locked(thread_key, conversation_id)
+
+    def resume_in_background(self, thread_key: str) -> threading.Thread:
+        """Resume on a worker thread so the operator's request does not wait for the agents. If it fails, the
+        periodic sweep finds the decided ticket and resumes the conversation then."""
+
+        def work() -> None:
+            try:
+                self.resume(thread_key)
+            except Exception:  # noqa: BLE001
+                logger.exception("background_resume_failed", extra={"thread_key": thread_key})
+
+        worker = threading.Thread(target=work, name="hitl-resume", daemon=True)
+        worker.start()
+        return worker
 
     def _resume_locked(self, thread_key: str, conversation_id: str) -> dict[str, Any] | None:
         config = self._config(thread_key)
@@ -127,13 +206,39 @@ class ChatService:
                     logger.exception("timeout_resume_failed", extra={"ticket_id": ticket["ticket_id"]})
         return resumed
 
-    def conversation(self, principal: Principal, conversation_id: str | None) -> dict[str, Any]:
+    def conversation(
+        self, principal: Principal, conversation_id: str | None, wait_seconds: float = 0.0, poll_seconds: float = 0.5
+    ) -> dict[str, Any]:
+        """The stored conversation. With `wait_seconds`, a conversation that is waiting on a human is watched until
+        the decision lands (or the wait runs out), so a client learns the outcome without polling in a tight loop."""
         thread_key, conversation_id = self.thread_key(principal, conversation_id)
-        snapshot = self.graph.get_state(self._config(thread_key))
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        view = self._conversation_view(thread_key, conversation_id)
+        while view["status"] in ("awaiting_human", "in_progress") and time.monotonic() < deadline:
+            if view["status"] == "awaiting_human":
+                time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+            # a running turn (a resume, say) is waited out on its lock rather than read half-written
+            view = self._conversation_view(thread_key, conversation_id, lock_timeout=max(0.0, deadline - time.monotonic()))
+        return view
+
+    def _conversation_view(self, thread_key: str, conversation_id: str, lock_timeout: float = 0.0) -> dict[str, Any]:
+        """The conversation as stored. While a turn is running on it, its state is between checkpoints: that is
+        reported as `in_progress` instead of being read as if it were final."""
+        lock = self._lock(thread_key)
+        settled = lock.acquire(timeout=lock_timeout) if lock_timeout > 0 else lock.acquire(blocking=False)
+        try:
+            snapshot = self.graph.get_state(self._config(thread_key))
+        finally:
+            if settled:
+                lock.release()
         values = snapshot.values or {}
+        if not settled:
+            status = "in_progress"
+        else:
+            status = "awaiting_human" if snapshot.next else ("idle" if values else "empty")
         return {
             "conversation_id": conversation_id,
-            "status": "awaiting_human" if snapshot.next else ("idle" if values else "empty"),
+            "status": status,
             "pending_ticket_id": values.get("ticket_id") if snapshot.next else None,
             "summary": values.get("summary", ""),
             "turn_count": values.get("turn_count", 0),

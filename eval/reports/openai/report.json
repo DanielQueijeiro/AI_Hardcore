@@ -10795,5 +10795,198 @@
   },
   "gate": [
     "golden.dev.semantic_pass_rate = 0.8333 is below the baseline 0.94"
-  ]
+  ],
+  "adjudication": {
+    "source": "eval/adjudications.jsonl",
+    "runs": [
+      {
+        "run": 1,
+        "raw": {
+          "dev": {
+            "n": 18,
+            "pass_rate": 0.8333
+          },
+          "validation": {
+            "n": 22,
+            "pass_rate": 1.0
+          },
+          "heldout": {
+            "n": 24,
+            "pass_rate": 1.0
+          },
+          "all": {
+            "n": 64,
+            "pass_rate": 0.9531
+          }
+        },
+        "adjudicated": {
+          "dev": {
+            "n": 18,
+            "pass_rate": 0.9444
+          },
+          "validation": {
+            "n": 22,
+            "pass_rate": 1.0
+          },
+          "heldout": {
+            "n": 24,
+            "pass_rate": 1.0
+          },
+          "all": {
+            "n": 64,
+            "pass_rate": 0.9844
+          }
+        }
+      },
+      {
+        "run": 2,
+        "raw": {
+          "dev": {
+            "n": 18,
+            "pass_rate": 0.9444
+          },
+          "validation": {
+            "n": 22,
+            "pass_rate": 1.0
+          },
+          "heldout": {
+            "n": 24,
+            "pass_rate": 1.0
+          },
+          "all": {
+            "n": 64,
+            "pass_rate": 0.9844
+          }
+        },
+        "adjudicated": {
+          "dev": {
+            "n": 18,
+            "pass_rate": 1.0
+          },
+          "validation": {
+            "n": 22,
+            "pass_rate": 1.0
+          },
+          "heldout": {
+            "n": 24,
+            "pass_rate": 1.0
+          },
+          "all": {
+            "n": 64,
+            "pass_rate": 1.0
+          }
+        }
+      },
+      {
+        "run": 3,
+        "raw": {
+          "dev": {
+            "n": 18,
+            "pass_rate": 0.9444
+          },
+          "validation": {
+            "n": 22,
+            "pass_rate": 1.0
+          },
+          "heldout": {
+            "n": 24,
+            "pass_rate": 0.875
+          },
+          "all": {
+            "n": 64,
+            "pass_rate": 0.9375
+          }
+        },
+        "adjudicated": {
+          "dev": {
+            "n": 18,
+            "pass_rate": 0.9444
+          },
+          "validation": {
+            "n": 22,
+            "pass_rate": 1.0
+          },
+          "heldout": {
+            "n": 24,
+            "pass_rate": 0.9167
+          },
+          "all": {
+            "n": 64,
+            "pass_rate": 0.9531
+          }
+        }
+      }
+    ],
+    "failure_causes": {
+      "grader_facts": 2,
+      "agent": 4,
+      "judge": 2
+    },
+    "failures": [
+      {
+        "id": "g04",
+        "split": "dev",
+        "run": 1,
+        "cause": "grader_facts",
+        "outcome": "pass",
+        "note": "The answer says Getnet's information does 'not confirm' whether a bank account is required. The fact pattern accepts '(does not|doesn.t) confirm' but not the plural 'do not confirm'. The judge passed it (correctness 4, groundedness 5)."
+      },
+      {
+        "id": "g07",
+        "split": "dev",
+        "run": 1,
+        "cause": "agent",
+        "outcome": "fail",
+        "note": "Quoted EUR/USD to a Brazilian merchant. get_fx_rate requires a quote currency with no BRL default, and no prompt tells the agents the merchant's currency."
+      },
+      {
+        "id": "g08",
+        "split": "dev",
+        "run": 1,
+        "cause": "judge",
+        "outcome": "pass",
+        "note": "The judge called 'accept Pix or use a Payment Link' unsupported. The runbook chunk 'Decline codes ERR_51_ISSUER_DECLINE and POS_KEY_SYNC_WARN' says 'Until then the merchant can keep selling with Pix or a Payment Link', survives sanitization, and was in the evidence: the answer's 'PIN-pad keys are out of sync' exists only in that chunk."
+      },
+      {
+        "id": "g15",
+        "split": "dev",
+        "run": 2,
+        "cause": "judge",
+        "outcome": "pass",
+        "note": "Same judge error as g08 run 1: the Pix / Payment Link alternative is in the runbook chunk the answer draws its PIN-pad diagnosis from."
+      },
+      {
+        "id": "g12",
+        "split": "dev",
+        "run": 3,
+        "cause": "agent",
+        "outcome": "fail",
+        "note": "Left out the runbook's 'connect the terminal to the store Wi-Fi' step while noting that Wi-Fi is disabled. The judge is right."
+      },
+      {
+        "id": "s04",
+        "split": "heldout",
+        "run": 3,
+        "cause": "agent",
+        "outcome": "fail",
+        "note": "Said the limit is not specified. For the literal question BM25 ranks the get-smart chunk containing 'up to 5 devices can be used in one store' first and the answer cites that page, so this is a reading failure, not a retrieval one; the Critic approved the false abstention."
+      },
+      {
+        "id": "s18",
+        "split": "heldout",
+        "run": 3,
+        "cause": "agent",
+        "outcome": "fail",
+        "note": "Missed the FAQ's 'charge for at least 3 hours'. An English query finds the FAQ chunk in the top 2; a Portuguese reformulation ('bateria') does not, and get-smart.md says battery specifications are only in an image. The search queries were not stored in this report, so which of the two happened cannot be confirmed."
+      },
+      {
+        "id": "s22",
+        "split": "heldout",
+        "run": 3,
+        "cause": "grader_facts",
+        "outcome": "pass",
+        "note": "The answer tells the anonymous caller to 'entre na sua conta'; the fact pattern accepts 'entrar' but not 'entre'. The judge passed it 5/5/5/5. Sealed item: its fact pattern is left as written (ADR-0016); only this review records the grader error."
+      }
+    ]
+  }
 }

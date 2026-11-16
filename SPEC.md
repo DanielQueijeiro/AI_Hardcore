@@ -25,19 +25,20 @@ All bodies are JSON. Identity is `Authorization: Bearer <jwt>`; without it the c
 | Method and path | Auth | Purpose |
 |---|---|---|
 | `POST /chat`, `POST /api/v1/chat` | optional (required if `REQUIRE_CHAT_AUTH=true`) | Send a message. Body: `message` (1-2000 chars), optional `user_id`, optional `conversation_id` (`[A-Za-z0-9_-]{1,64}`) |
-| `GET /conversations/{conversation_id}` | optional (required if `REQUIRE_CHAT_AUTH=true`) | Stored memory and status of one of the caller's conversations |
+| `POST /chat/stream` | as `/chat` | Same body and admission checks as `/chat`; server-sent events `accepted`, `step` (routing decision, tool call, review, human-review event; no model reasoning or tool results), then `result` (the `/chat` response body) or `error`. The turn completes even if the client disconnects |
+| `GET /conversations/{conversation_id}?wait=` | optional (required if `REQUIRE_CHAT_AUTH=true`) | Stored memory and status (`empty`, `idle`, `awaiting_human`, `in_progress`) of one of the caller's conversations. With `wait` > 0, a conversation waiting on a human or running a turn is held up to `min(wait, MAX_CONVERSATION_WAIT_SECONDS)` until it settles |
 | `POST /auth/login` | none | `{user_id, password}` → `{access_token, expires_in, user_id, role}` |
 | `POST /auth/logout` | required | Revoke the presented token |
 | `GET /auth/me` | optional | The caller's principal |
 | `GET /operator/tickets?status=open` | operator | Human-review queue |
 | `GET /operator/tickets/{id}` | operator | One ticket |
 | `POST /operator/tickets/{id}/claim` | operator | Take a lease on a ticket |
-| `POST /operator/tickets/{id}/respond` | operator | `{decision: approve\|reject\|answer, message}`; resumes the conversation |
+| `POST /operator/tickets/{id}/respond?wait=` | operator | `{decision: approve\|reject\|answer, message}`. `wait=true` (default): resumes the conversation and returns the agent's answer, `resume: completed`. `wait=false`: records the decision, returns `202` with `resume: scheduled`, resumes in the background |
 | `GET /traces/{trace_id}` | owner or operator | Full trace of a turn |
 | `POST /feedback` | owner | `{trace_id, rating: 0\|1, comment}` |
 | `GET /health` | none | Liveness |
 | `GET /ready` | none | Readiness: database, migrations, knowledge index, model provider, breaker state. 503 when not ready |
-| `GET /metrics` | none | Prometheus text |
+| `GET /metrics` | `METRICS_TOKEN` bearer when set (required in production); open otherwise | Prometheus text, every series typed |
 
 `POST /chat` response:
 
@@ -49,7 +50,7 @@ All bodies are JSON. Identity is `Authorization: Bearer <jwt>`; without it the c
 | `status` | `completed`, `blocked` (input guardrail) or `awaiting_human` |
 | `orchestration` | `trace_id`, `agents` (order they acted), `tools_called`, `sources`, `plan_steps`, `critic_rounds`, `guardrail`, `escalated_to_human`, `ticket_id`, `usage` (`llm_calls`, tokens, `cost_usd`), `latency_ms`, `llm_provider`, `degraded` |
 
-Error contract: 401 invalid/expired/revoked token (or missing token when `REQUIRE_CHAT_AUTH=true`); 403 body `user_id` ≠ token subject, or missing role;
+Error contract: 401 invalid/expired/revoked token, wrong issuer or audience (or missing token when `REQUIRE_CHAT_AUTH=true`, or a missing/wrong metrics token); 403 body `user_id` ≠ token subject, or missing role;
 404 unknown ticket, or a trace the caller may not see; 409 ticket lease conflict or already decided;
 422 invalid body, invalid conversation id, or `approve` on a ticket with no action; 429 login or chat rate limit.
 
@@ -62,7 +63,9 @@ Error contract: 401 invalid/expired/revoked token (or missing token when `REQUIR
 - I5. Threads are keyed `(user_id | "anon", conversation_id)`. Traces are visible to their owner and operators.
 - I6. Operator endpoints require role `operator`.
 - I7. An anonymous caller continues a conversation only under the unguessable id the server issued; any other id starts a new one.
-- I8. `APP_ENV=production` refuses to start while demo users are seeded or `JWT_SECRET` is unset or shorter than 32 characters.
+- I8. `APP_ENV=production` refuses to start while demo users are seeded, `JWT_SECRET` is unset or shorter than 32 characters, or `METRICS_TOKEN` is unset or shorter than 24.
+- I9. Tokens carry and must present `iss = JWT_ISSUER` and `aud = JWT_AUDIENCE`; one signed with the right secret for another audience or issuer is refused.
+- I10. Rate limits key on the verified user, else on the client address; `X-Forwarded-For` is read (from the right, skipping trusted hops) only when the direct peer is in `TRUSTED_PROXIES`.
 
 ## 4. Agents
 
@@ -127,6 +130,7 @@ Receives two automatic findings: numbers absent from the evidence and URLs no to
 - M4. A blocked message is stored as a placeholder, not verbatim.
 - M5. One turn at a time per thread.
 - M6. A finished turn leaves one checkpoint per thread; a paused turn keeps what it needs to resume. Traces are deleted after `TRACE_RETENTION_DAYS`.
+- M7. While a turn or a resume runs on a thread, reading the conversation reports `in_progress` instead of state between checkpoints.
 
 ## 7. Human review
 
@@ -146,6 +150,7 @@ Ticket states: `OPEN → CLAIMED → APPROVED | REJECTED | ANSWERED`, or `OPEN |
 - H12. Escalation is the last resort: for approval only when the fix for the problem asked about needs it; self-service steps are answered first; an unrelated finding is mentioned, not escalated.
 - H13. The waiting message states what was found and why a human is involved, and passes the output guard.
 - H14. A paused turn is resumed only when the ticket it is waiting on is decided or has expired. An earlier, already resolved ticket of the same conversation never releases it.
+- H15. `respond?wait=false` records the decision durably and resumes on a worker; if that resume fails, the sweep of H11 performs it. The merchant reads the outcome with `GET /conversations/{id}?wait=`.
 
 ## 8. Guardrails
 
@@ -154,6 +159,8 @@ Ticket states: `OPEN → CLAIMED → APPROVED | REJECTED | ANSWERED`, or `OPEN |
 - G3. Output: prompt canary, other tenants' identifiers and credential-shaped strings are blocked or redacted; formatted CPF/CNPJ and card numbers (Luhn-valid) are redacted.
 - G4. A live tool that cannot reach its source returns `available: false`; no canned values exist.
 - G5. Ordinary merchant wording is not blocked: the benign control set is part of the adversarial suite and its false-positive rate is gated.
+- G6. Live sources are called through a short cache, one retry with backoff for transient failures (never a 4xx) and a circuit breaker per source.
+- G7. Tool arguments are validated against the declared schema (required, type, enum, length, range) before a handler runs; a violation is returned to the agent as `invalid_arguments`.
 
 ## 9. Knowledge base
 
@@ -179,7 +186,9 @@ thresholds: [eval/baseline.json](eval/baseline.json); runner: `python -m eval.ru
 | A4 | Retrieval Recall@4 and MRR do not regress, per mode | `retrieval.jsonl` |
 | A5 | No attack in the adversarial suite succeeds: no leak, no unauthorized write; benign controls are not blocked | `adversarial.jsonl` |
 | A6 | With a model: judge pass rate and judge-vs-label agreement meet the baseline, with zero false passes; agreement and Cohen's kappa are reported separately for calibration items that share no question with the golden set; a gated metric that was not produced fails the gate; no turn was answered by the degraded fallback; `--repeat N` reports the run-to-run range | `judge_calibration.jsonl`, `baseline.json` |
-| A7 | Rules I1-I8, B1-B10, M1-M6, H1-H14, G1-G5 each have at least one test | `tests/` |
+| A7 | Rules I1-I10, B1-B10, M1-M7, H1-H15, G1-G7 each have at least one test | `tests/` |
+| A11 | Every report records the git commit, whether the tree was dirty, and hashes of the source, prompts, judge, baseline and corpora; each golden item stores its tool calls and the judge's exact input, so it can be re-graded without re-running the agents | `provenance` in the report; `--regrade` |
+| A12 | Every failed golden answer of a published report is adjudicated (agent, judge, fact patterns or harness) against the exact answer; the report shows raw and adjudicated rates and the gate reads only the raw ones | `eval/adjudications.jsonl`; `tests/test_streaming_and_ops.py` |
 | A9 | Answers are written in the merchant's language | `golden.*.language_match_rate` |
 | A10 | The ten challenge payloads run end to end for a signed-in merchant with one command | `scripts/run_scenarios.py` |
 | A8 | The container runs as non-root on a read-only filesystem and serves the challenge payload | CI `docker` job |

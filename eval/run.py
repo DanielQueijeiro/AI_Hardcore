@@ -3,6 +3,9 @@
     python -m eval.run                      # every suite, model from the environment (offline policy if no key)
     python -m eval.run --mode offline --gate  # deterministic run used by CI as a regression gate
     python -m eval.run --suite retrieval
+    python -m eval.run --ids g07,s04 --out /tmp/check   # a few golden items only (never gated, never the report)
+    python -m eval.run --regrade eval/reports/openai/report.json --regrade-times 3   # re-judge stored answers
+    python -m eval.run --adjudicate eval/reports/openai/report.json   # attach eval/adjudications.jsonl to a report
 
 Suites
 - retrieval    Recall@k / Hit@k / MRR / nDCG@k for BM25 vs dense vs hybrid on labelled queries (EN/PT/ES).
@@ -23,6 +26,7 @@ import argparse
 import hashlib
 import json
 import secrets
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -33,7 +37,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from eval import metrics as m
-from eval.judge import calibrate, judge, load_jsonl
+from eval.judge import calibrate, fit_evidence, judge, load_jsonl
 from src.agents.checks import evidence_text
 from src.api.main import create_app
 from src.config import Settings
@@ -45,8 +49,10 @@ from src.runtime import build_embedder
 from src.tools.live import LiveData
 
 ROOT = Path(__file__).parent
+REPO = ROOT.parent
 DATASETS = ROOT / "datasets"
 REPORTS = ROOT / "reports"
+ADJUDICATIONS = ROOT / "adjudications.jsonl"
 RETRIEVAL_KS = (1, 3, 4)
 # dev: used while writing prompts. validation: written as held-out, but re-run between fixes, so no longer unseen.
 # heldout: sealed items, written after the last prompt change and run without any change in between.
@@ -55,7 +61,52 @@ SPLITS = ("dev", "validation", "heldout")
 
 def dataset_hashes() -> dict[str, str]:
     """SHA-256 of each dataset file as evaluated, so a report can be tied to the exact items it ran."""
-    return {p.name: hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest() for p in sorted(DATASETS.glob("*.jsonl"))}
+    return {p.name: _file_sha256(p) for p in sorted(DATASETS.glob("*.jsonl"))}
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _tree_sha256(root: Path, pattern: str, recursive: bool = True) -> str:
+    """One hash for a set of files: their relative paths and contents, in a fixed order, line endings normalised."""
+    digest = hashlib.sha256()
+    found = root.rglob(pattern) if recursive else root.glob(pattern)
+    for path in sorted(p for p in found if p.is_file() and "__pycache__" not in p.parts):
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0" + path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    return digest.hexdigest()
+
+
+def _git(*args: str) -> str | None:
+    try:
+        out = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip()
+
+
+def provenance() -> dict[str, Any]:
+    """What produced this report besides the datasets: the commit, whether the tree differed from it, and hashes of
+    the inputs that decide an answer or its grade. Reports and adjudications are excluded from the dirty check:
+    writing them cannot change a result."""
+    status = _git("status", "--porcelain", "--", "src", "eval", "data/corpus", "scripts", "pyproject.toml")
+    dirty = [line[3:] for line in (status or "").splitlines() if line[3:] and not line[3:].startswith("eval/reports/")]
+    dirty = [p for p in dirty if p != "eval/adjudications.jsonl"]
+    return {
+        "git_commit": _git("rev-parse", "HEAD"),
+        "git_dirty": bool(dirty) if status is not None else None,
+        "dirty_paths": dirty[:20],
+        "inputs_sha256": {
+            "src (all .py)": _tree_sha256(REPO / "src", "*.py"),
+            "src/agents/prompts.py": _file_sha256(REPO / "src" / "agents" / "prompts.py"),
+            "eval (all .py)": _tree_sha256(ROOT, "*.py"),
+            "eval/judge.py": _file_sha256(ROOT / "judge.py"),
+            "eval/baseline.json": _file_sha256(ROOT / "baseline.json"),
+            # top level only: data/corpus/raw/ is an optional, git-ignored scrape that is not indexed by default
+            "data/corpus": _tree_sha256(REPO / "data" / "corpus", "*.md", recursive=False),
+            "eval/datasets/poisoned_corpus": _tree_sha256(DATASETS / "poisoned_corpus", "*.md"),
+        },
+    }
 
 
 class PoisonedLive(LiveData):
@@ -200,10 +251,23 @@ def run_retrieval(settings: Settings) -> dict[str, Any]:
 # --- golden answers -------------------------------------------------------------------------------
 
 
-def run_golden(make_harness: Any, grader: LLMClient) -> dict[str, Any]:
+def select_golden(ids: list[str] | None = None, split: str | None = None) -> list[dict[str, Any]]:
+    """Golden items, optionally restricted to some ids or one split. Unknown ids are an error, not a silent skip."""
+    items = load_jsonl(DATASETS / "golden.jsonl")
+    if ids:
+        unknown = sorted(set(ids) - {i["id"] for i in items})
+        if unknown:
+            raise SystemExit(f"unknown golden item id(s): {', '.join(unknown)}")
+        items = [i for i in items if i["id"] in ids]
+    if split:
+        items = [i for i in items if i["split"] == split]
+    return items
+
+
+def run_golden(make_harness: Any, grader: LLMClient, items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Each item runs on its own fresh application and databases: an approved ticket or a service order left by
     one conversation must not change how the same merchant's next conversation is handled."""
-    items = load_jsonl(DATASETS / "golden.jsonl")
+    items = items if items is not None else load_jsonl(DATASETS / "golden.jsonl")
     rows: list[dict[str, Any]] = []
     for item in items:
         h = make_harness()
@@ -247,15 +311,21 @@ def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[st
             f"\nmerchant: {item['turns'][-1]}\nassistant (sent while a human operator reviewed the case): {waiting_message}"
             f"\n[the operator then decided: {item['operator']['decision']}; the ANSWER below is what the merchant received next]"
         )
-    grade = judge(
-        grader,
-        question=item["turns"][-1],
-        conversation=earlier_turns,
-        reference=item["reference"],
-        evidence=evidence_text(observations, *context),
-        answer=answer,
-    )
+    # Kept in the report so the answer can be re-graded later (`--regrade`) without running the agents again.
+    judge_input = {
+        "question": item["turns"][-1],
+        "conversation": earlier_turns,
+        "reference": item["reference"],
+        "evidence": fit_evidence(evidence_text(observations, *context)),
+    }
+    grade = judge(grader, answer=answer, **judge_input)
     deterministic_pass = coverage == 1.0 and not forbidden and grounded == 1.0 and cite == 1.0 and status_ok
+    tool_calls = [
+        {"node": e.get("node"), "tool": e.get("tool"), "arguments": e.get("arguments"), "error": e.get("error")}
+        for t in (*earlier, trace)
+        for e in t.get("events", [])
+        if e.get("kind") == "tool"
+    ]
     return (
         {
             "id": item["id"],
@@ -277,6 +347,7 @@ def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[st
             "expected_language": expected_language,
             "answer_language": answer_language,
             "judge": grade,
+            "deterministic_pass": deterministic_pass,
             "semantic_pass": deterministic_pass and (grade is None or grade["pass"]),
             "routing_ok": m.includes_all(trace.get("agents", []), item.get("expect_agents", []))
             and m.includes_all(trace.get("tools", []), item.get("expect_tools", [])),
@@ -287,7 +358,27 @@ def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[st
             "latency_ms": latency,
             "cost_usd": trace.get("usage", {}).get("cost_usd", 0.0),
             "degraded": trace.get("degraded", False),
+            "tool_calls": tool_calls,
+            "answer_sha256": answer_sha256(answer),
+            "judge_input": judge_input,
         }
+    )
+
+
+def answer_sha256(answer: str) -> str:
+    return hashlib.sha256(answer.encode("utf-8")).hexdigest()
+
+
+def deterministic_pass(row: dict[str, Any]) -> bool:
+    """The non-judge half of semantic pass. Recomputed from the row for reports written before it was stored."""
+    if "deterministic_pass" in row:
+        return bool(row["deterministic_pass"])
+    return (
+        row["fact_coverage"] == 1.0
+        and not row["forbidden_hits"]
+        and row["numeric_groundedness"] == 1.0
+        and row["citation_validity"] == 1.0
+        and row["status_ok"]
     )
 
 
@@ -397,6 +488,151 @@ def run_adversarial(settings: Settings) -> dict[str, Any]:
     }
 
 
+# --- re-grading and adjudication ------------------------------------------------------------------
+
+ADJUDICATION_CAUSES = ("agent", "judge", "grader_facts", "harness")
+
+
+def _golden_runs(report: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    return [report["golden"]["items"], *report.get("golden_repeat_items", [])] if "golden" in report else []
+
+
+def _rates(rows: list[tuple[str, bool]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for split in (*SPLITS, "all"):
+        subset = [passed for s, passed in rows if split in ("all", s)]
+        if subset:
+            out[split] = {"n": len(subset), "pass_rate": round(m.mean([float(p) for p in subset]), 4)}
+    return out
+
+
+def regrade(report: dict[str, Any], grader: LLMClient, times: int = 1) -> dict[str, Any]:
+    """Grade the stored answers of a report again, `times` times each, without running the agents.
+
+    Separates judge noise from agent noise: the answers and the evidence are fixed, only the grading varies.
+    With times > 1 the new verdict is the majority. The deterministic half of semantic pass is reused as stored.
+    """
+    rows: list[dict[str, Any]] = []
+    for run, items in enumerate(_golden_runs(report), start=1):
+        for row in items:
+            if "judge_input" not in row:
+                raise SystemExit("this report has no stored judge inputs; it was written before --regrade existed")
+            grades = [judge(grader, answer=row["answer"], **row["judge_input"]) for _ in range(max(1, times))]
+            if any(g is None for g in grades):
+                raise SystemExit("the judge is unavailable (no model configured, or a call failed)")
+            passes = [bool(g["pass"]) for g in grades]  # type: ignore[index]
+            new_pass = sum(passes) * 2 > len(passes)
+            det = deterministic_pass(row)
+            rows.append(
+                {
+                    "id": row["id"],
+                    "split": row["split"],
+                    "run": run,
+                    "deterministic_pass": det,
+                    "old_judge_pass": row["judge"]["pass"] if row.get("judge") else None,
+                    "new_judge_passes": passes,
+                    "new_judge_pass": new_pass,
+                    "unanimous": len(set(passes)) == 1,
+                    "old_semantic_pass": row["semantic_pass"],
+                    "new_semantic_pass": det and new_pass,
+                    "rationales": [g["rationale"] for g in grades],  # type: ignore[index]
+                }
+            )
+    runs = sorted({r["run"] for r in rows})
+    return {
+        "regraded_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "source_generated_at": report.get("generated_at"),
+        "judge_model": getattr(grader, "model", "none"),
+        "times": max(1, times),
+        "provenance": provenance(),
+        "runs": [
+            {
+                "run": n,
+                "old": _rates([(r["split"], r["old_semantic_pass"]) for r in rows if r["run"] == n]),
+                "new": _rates([(r["split"], r["new_semantic_pass"]) for r in rows if r["run"] == n]),
+            }
+            for n in runs
+        ],
+        "judge_flips": sum(r["old_judge_pass"] is not None and r["old_judge_pass"] != r["new_judge_pass"] for r in rows),
+        "not_unanimous": sum(not r["unanimous"] for r in rows),
+        "items": rows,
+    }
+
+
+def render_regrade(result: dict[str, Any]) -> str:
+    lines = [
+        "# Re-grade of stored answers",
+        "",
+        f"- Source report generated: {result['source_generated_at']}; re-graded: {result['regraded_at']}",
+        f"- Judge: `{result['judge_model']}`, {result['times']} grading(s) per answer (majority verdict)",
+        f"- Verdicts that changed: {result['judge_flips']}; answers whose gradings disagreed with each other: {result['not_unanimous']}",
+        "",
+        "| Run | Split | n | Semantic pass (stored) | Semantic pass (re-graded) |",
+        "|---|---|---|---|---|",
+    ]
+    for run in result["runs"]:
+        for split, new in run["new"].items():
+            lines.append(f"| {run['run']} | {split} | {new['n']} | {run['old'][split]['pass_rate']:.3f} | {new['pass_rate']:.3f} |")
+    changed = [r for r in result["items"] if r["old_semantic_pass"] != r["new_semantic_pass"] or not r["unanimous"]]
+    if changed:
+        lines += ["", "| Item | Run | Stored | Re-graded (each grading) | Rationale |", "|---|---|---|---|---|"]
+        for r in changed:
+            votes = ", ".join("pass" if p else "fail" for p in r["new_judge_passes"])
+            lines.append(
+                f"| {r['id']} | {r['run']} | {'pass' if r['old_semantic_pass'] else 'fail'} | {votes} | "
+                f"{r['rationales'][0].replace('|', '/')} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def load_adjudications(path: Path = ADJUDICATIONS) -> list[dict[str, Any]]:
+    """Human review of failed items. Keyed by the exact answer (SHA-256), so a verdict never carries over to a
+    different answer to the same question."""
+    if not path.exists():
+        return []
+    entries = load_jsonl(path)
+    for e in entries:
+        if e.get("cause") not in ADJUDICATION_CAUSES or e.get("outcome") not in ("pass", "fail"):
+            raise SystemExit(f"adjudication for {e.get('id')}: cause must be one of {ADJUDICATION_CAUSES}, outcome pass|fail")
+    return entries
+
+
+def adjudicate(report: dict[str, Any], entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Raw and adjudicated semantic pass per run. The gate always reads the raw numbers; this explains them."""
+    runs = _golden_runs(report)
+    if not runs:
+        return None
+    index = {(e["id"], e["answer_sha256"]): e for e in entries}
+    failures: list[dict[str, Any]] = []
+    per_run: list[dict[str, Any]] = []
+    for n, items in enumerate(runs, start=1):
+        raw: list[tuple[str, bool]] = []
+        adjusted: list[tuple[str, bool]] = []
+        for row in items:
+            passed = bool(row["semantic_pass"])
+            raw.append((row["split"], passed))
+            if not passed:
+                entry = index.get((row["id"], row.get("answer_sha256") or answer_sha256(row["answer"])))
+                failures.append(
+                    {
+                        "id": row["id"],
+                        "split": row["split"],
+                        "run": n,
+                        "cause": entry["cause"] if entry else None,
+                        "outcome": entry["outcome"] if entry else None,
+                        "note": entry.get("note", "") if entry else "",
+                    }
+                )
+                passed = bool(entry and entry["outcome"] == "pass")
+            adjusted.append((row["split"], passed))
+        per_run.append({"run": n, "raw": _rates(raw), "adjudicated": _rates(adjusted)})
+    causes: dict[str, int] = {}
+    for f in failures:
+        key = f["cause"] or "not adjudicated"
+        causes[key] = causes.get(key, 0) + 1
+    return {"source": "eval/adjudications.jsonl", "runs": per_run, "failure_causes": causes, "failures": failures}
+
+
 # --- report and gate ------------------------------------------------------------------------------
 
 
@@ -439,8 +675,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Generated: {report['generated_at']}",
         f"- Answering model: `{report['model']}`; judge: `{report['judge_model']}`",
         f"- Live web tools: {'on' if report['live_web'] else 'off (answers must say live data is unavailable)'}",
-        "",
     ]
+    if report.get("provenance"):
+        p = report["provenance"]
+        code = f"`{(p.get('git_commit') or 'unknown')[:12]}`"
+        if p.get("git_dirty"):
+            code += f" plus uncommitted changes in {', '.join(p['dirty_paths']) or 'the working tree'}"
+        lines.append(f"- Code: {code}; input hashes in `provenance` of the JSON report")
+    lines.append("")
     if report["mode"] == "offline":
         lines += [
             "> This run used the deterministic offline policy, not a language model. It is the CI regression gate: it",
@@ -509,6 +751,30 @@ def render_markdown(report: dict[str, Any]) -> str:
                 lines.append(f"| {split} | {', '.join(f'{v:.3f}' for v in sp['values'])} | {sp['mean']:.3f} | {judged} |")
             flaky = ", ".join(f"{item} ({n}/{rep['runs']})" for item, n in rep["items_failed_in_n_runs"].items()) or "none"
             lines += ["", f"Items that failed in at least one run (runs failed): {flaky}", ""]
+        if report.get("adjudication"):
+            adj = report["adjudication"]
+            lines += [
+                "### Adjudicated failures (human review; the gate reads the raw numbers)",
+                "",
+                f"Every failed answer is reviewed and attributed to the agent, the judge, the deterministic fact patterns "
+                f"(`grader_facts`) or the harness, from [{adj['source']}](../../adjudications.jsonl). An adjudication is keyed "
+                "to the exact answer text, so it never carries over to another run's answer. The adjudicated rate counts a "
+                "failure as a pass only when the review found the answer correct and the grader wrong.",
+                "",
+                "| Run | Split | n | Semantic pass (raw) | Semantic pass (adjudicated) |",
+                "|---|---|---|---|---|",
+            ]
+            for run in adj["runs"]:
+                for split, raw in run["raw"].items():
+                    lines.append(f"| {run['run']} | {split} | {raw['n']} | {raw['pass_rate']:.3f} | {run['adjudicated'][split]['pass_rate']:.3f} |")
+            causes = ", ".join(f"{cause} {n}" for cause, n in adj["failure_causes"].items()) or "none"
+            lines += ["", f"Failures by cause: {causes}.", "", "| Item | Run | Split | Cause | Outcome | Review note |", "|---|---|---|---|---|---|"]
+            for f in adj["failures"]:
+                lines.append(
+                    f"| {f['id']} | {f['run']} | {f['split']} | {f['cause'] or 'not adjudicated'} | {f['outcome'] or '-'} | "
+                    f"{(f['note'] or '').replace('|', '/')} |"
+                )
+            lines.append("")
         failed = [r for r in g["items"] if not r["semantic_pass"] or not r["language_ok"]]
         if failed:
             lines += ["### Items that did not pass", "", "| Item | Split | Why |", "|---|---|---|"]
@@ -582,7 +848,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gate", action="store_true", help="exit non-zero if a metric regresses below eval/baseline.json")
     parser.add_argument("--repeat", type=int, default=1, help="run the golden suite N times and report the run-to-run range (run 1 is gated)")
     parser.add_argument("--no-write", action="store_true")
+    parser.add_argument("--ids", help="comma-separated golden item ids to run (golden suite only; never gated, never the report)")
+    parser.add_argument("--split", choices=SPLITS, help="run only this golden split (golden suite only; never gated, never the report)")
+    parser.add_argument("--out", type=Path, help="write <OUT>.json and <OUT>.md here instead of eval/reports/<mode>/report.*")
+    parser.add_argument("--regrade", type=Path, metavar="REPORT_JSON", help="re-judge the stored answers of a report; runs no agent")
+    parser.add_argument("--regrade-times", type=int, default=1, help="gradings per answer with --regrade (majority verdict)")
+    parser.add_argument("--adjudicate", type=Path, metavar="REPORT_JSON", help="attach eval/adjudications.jsonl to an existing report")
     args = parser.parse_args(argv)
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+
+    if args.adjudicate:
+        return annotate_report(args.adjudicate, write=not args.no_write)
+    if args.regrade:
+        return regrade_report(args, write=not args.no_write)
+
+    ids = [i.strip() for i in args.ids.split(",") if i.strip()] if args.ids else None
+    partial = bool(ids or args.split)
+    if partial and (args.gate or args.suite not in ("all", "golden")):
+        parser.error("--ids/--split run part of the golden suite: they cannot be gated or combined with another suite")
+    suite = "golden" if partial else args.suite
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         probe = make_settings(args.mode, Path(tmp) / "probe", live=False)
@@ -596,8 +880,11 @@ def main(argv: list[str] | None = None) -> int:
             "live_web": live,
             "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "datasets_sha256": dataset_hashes(),
+            "provenance": provenance(),
         }
-        wanted = lambda suite: args.suite in ("all", suite)  # noqa: E731
+        if partial:
+            report["selection"] = {"ids": ids, "split": args.split}
+        wanted = lambda name: suite in ("all", name)  # noqa: E731
         if wanted("retrieval"):
             report["retrieval"] = run_retrieval(probe)
             if mode == "openai":
@@ -609,14 +896,16 @@ def main(argv: list[str] | None = None) -> int:
                     report["retrieval_hosted_error"] = repr(exc)[:200]
         if wanted("golden"):
             counter = iter(range(100_000))
+            items = select_golden(ids, args.split)
             runs = [
-                run_golden(lambda: Harness(make_settings(args.mode, Path(tmp) / f"golden-{next(counter)}", live)), grader)
+                run_golden(lambda: Harness(make_settings(args.mode, Path(tmp) / f"golden-{next(counter)}", live)), grader, items)
                 for _ in range(max(1, args.repeat))
             ]
             report["golden"] = runs[0]
             if len(runs) > 1:
                 report["golden_repeats"] = repeat_summary(runs)
                 report["golden_repeat_items"] = [run["items"] for run in runs[1:]]
+            report["adjudication"] = adjudicate(report, load_adjudications())
         if wanted("adversarial"):
             report["adversarial"] = run_adversarial(make_settings(args.mode, Path(tmp) / "adversarial", live=False))
         if wanted("calibration"):
@@ -629,14 +918,45 @@ def main(argv: list[str] | None = None) -> int:
         report["gate"] = failures
 
     markdown = render_markdown(report)
-    if not args.no_write:
-        out = REPORTS / mode
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-        (out / "report.md").write_text(markdown, encoding="utf-8")
-    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    if args.out:
+        write_report(report, markdown, args.out)
+    elif partial:
+        print("(partial run: not written; pass --out PATH to keep it)\n")
+    elif not args.no_write:
+        write_report(report, markdown, REPORTS / mode / "report")
     print(markdown)
     return 1 if failures else 0
+
+
+def write_report(report: dict[str, Any], markdown: str, stem: Path) -> None:
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    stem.with_suffix(".json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    stem.with_suffix(".md").write_text(markdown, encoding="utf-8")
+
+
+def annotate_report(path: Path, write: bool = True) -> int:
+    """Attach the current adjudications to an existing report and re-render it. Measured numbers are untouched."""
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["adjudication"] = adjudicate(report, load_adjudications())
+    markdown = render_markdown(report)
+    if write:
+        write_report(report, markdown, path.with_suffix(""))
+    print(markdown)
+    return 0
+
+
+def regrade_report(args: argparse.Namespace, write: bool = True) -> int:
+    report = json.loads(args.regrade.read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        grader = judge_client(make_settings("auto", Path(tmp), live=False))
+    if grader.name == "offline":
+        raise SystemExit("--regrade needs a judge model (set OPENAI_API_KEY)")
+    result = regrade(report, grader, args.regrade_times)
+    markdown = render_regrade(result)
+    if write and args.out:
+        write_report(result, markdown, args.out)
+    print(markdown)
+    return 0
 
 
 if __name__ == "__main__":

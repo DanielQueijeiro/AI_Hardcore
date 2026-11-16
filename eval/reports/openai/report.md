@@ -78,6 +78,38 @@ The table above is run 1. Each cell below lists every run, then the mean.
 
 Items that failed in at least one run (runs failed): g04 (1/3), g07 (1/3), g08 (1/3), g12 (1/3), g15 (1/3), s04 (1/3), s18 (1/3), s22 (1/3)
 
+### Adjudicated failures (human review; the gate reads the raw numbers)
+
+Every failed answer is reviewed and attributed to the agent, the judge, the deterministic fact patterns (`grader_facts`) or the harness, from [eval/adjudications.jsonl](../../adjudications.jsonl). An adjudication is keyed to the exact answer text, so it never carries over to another run's answer. The adjudicated rate counts a failure as a pass only when the review found the answer correct and the grader wrong.
+
+| Run | Split | n | Semantic pass (raw) | Semantic pass (adjudicated) |
+|---|---|---|---|---|
+| 1 | dev | 18 | 0.833 | 0.944 |
+| 1 | validation | 22 | 1.000 | 1.000 |
+| 1 | heldout | 24 | 1.000 | 1.000 |
+| 1 | all | 64 | 0.953 | 0.984 |
+| 2 | dev | 18 | 0.944 | 1.000 |
+| 2 | validation | 22 | 1.000 | 1.000 |
+| 2 | heldout | 24 | 1.000 | 1.000 |
+| 2 | all | 64 | 0.984 | 1.000 |
+| 3 | dev | 18 | 0.944 | 0.944 |
+| 3 | validation | 22 | 1.000 | 1.000 |
+| 3 | heldout | 24 | 0.875 | 0.917 |
+| 3 | all | 64 | 0.938 | 0.953 |
+
+Failures by cause: grader_facts 2, agent 4, judge 2.
+
+| Item | Run | Split | Cause | Outcome | Review note |
+|---|---|---|---|---|---|
+| g04 | 1 | dev | grader_facts | pass | The answer says Getnet's information does 'not confirm' whether a bank account is required. The fact pattern accepts '(does not/doesn.t) confirm' but not the plural 'do not confirm'. The judge passed it (correctness 4, groundedness 5). |
+| g07 | 1 | dev | agent | fail | Quoted EUR/USD to a Brazilian merchant. get_fx_rate requires a quote currency with no BRL default, and no prompt tells the agents the merchant's currency. |
+| g08 | 1 | dev | judge | pass | The judge called 'accept Pix or use a Payment Link' unsupported. The runbook chunk 'Decline codes ERR_51_ISSUER_DECLINE and POS_KEY_SYNC_WARN' says 'Until then the merchant can keep selling with Pix or a Payment Link', survives sanitization, and was in the evidence: the answer's 'PIN-pad keys are out of sync' exists only in that chunk. |
+| g15 | 2 | dev | judge | pass | Same judge error as g08 run 1: the Pix / Payment Link alternative is in the runbook chunk the answer draws its PIN-pad diagnosis from. |
+| g12 | 3 | dev | agent | fail | Left out the runbook's 'connect the terminal to the store Wi-Fi' step while noting that Wi-Fi is disabled. The judge is right. |
+| s04 | 3 | heldout | agent | fail | Said the limit is not specified. For the literal question BM25 ranks the get-smart chunk containing 'up to 5 devices can be used in one store' first and the answer cites that page, so this is a reading failure, not a retrieval one; the Critic approved the false abstention. |
+| s18 | 3 | heldout | agent | fail | Missed the FAQ's 'charge for at least 3 hours'. An English query finds the FAQ chunk in the top 2; a Portuguese reformulation ('bateria') does not, and get-smart.md says battery specifications are only in an image. The search queries were not stored in this report, so which of the two happened cannot be confirmed. |
+| s22 | 3 | heldout | grader_facts | pass | The answer tells the anonymous caller to 'entre na sua conta'; the fact pattern accepts 'entrar' but not 'entre'. The judge passed it 5/5/5/5. Sealed item: its fact pattern is left as written (ADR-0016); only this review records the grader error. |
+
 ### Items that did not pass
 
 | Item | Split | Why |

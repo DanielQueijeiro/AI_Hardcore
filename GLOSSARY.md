@@ -111,3 +111,17 @@ _Avoid_: Lock, assignment
 **Approved Action**:
 A change to a Merchant's account that code executes once, only for a Ticket an Operator approved.
 _Avoid_: Tool call, operation
+
+## Evaluation
+
+**Semantic pass**:
+A golden answer that carries every required fact, makes no forbidden claim, states only numbers found in the Evidence, cites only URLs a tool returned, ends in the expected status, and passes the judge.
+_Avoid_: Accuracy, success rate
+
+**Sealed split**:
+Golden items written after the last prompt change and run with nothing changed in between. It stops being sealed the moment something is changed because of it.
+_Avoid_: Test set, held-out (unqualified)
+
+**Adjudication**:
+A human review of one failed answer, tied to that exact answer, naming who was wrong: the agent, the judge, the fact patterns or the harness. It explains a failure; the gate never reads it.
+_Avoid_: Override, correction

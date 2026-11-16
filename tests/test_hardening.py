@@ -79,10 +79,17 @@ def test_production_mode_refuses_demo_users_and_a_missing_secret(settings):
     no_secret = settings.model_copy(update={"app_env": "production", "seed_demo_users": False, "jwt_secret": None})
     with pytest.raises(RuntimeError, match="JWT_SECRET"), TestClient(create_app(no_secret)):
         pass
-    safe = settings.model_copy(update={"app_env": "production", "seed_demo_users": False})
+    no_metrics_token = settings.model_copy(update={"app_env": "production", "seed_demo_users": False})
+    with pytest.raises(RuntimeError, match="METRICS_TOKEN"), TestClient(create_app(no_metrics_token)):
+        pass
+    metrics_token = "m" * 32
+    safe = settings.model_copy(update={"app_env": "production", "seed_demo_users": False, "metrics_token": metrics_token})
     with TestClient(create_app(safe)) as client:
         assert client.get("/ready").status_code == 200
         assert client.post("/auth/login", json={"user_id": "operador1", "password": "getnet-demo"}).status_code == 401
+        assert client.get("/metrics").status_code == 401
+        assert client.get("/metrics", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert client.get("/metrics", headers={"Authorization": f"Bearer {metrics_token}"}).status_code == 200
 
 
 def test_review_window_does_not_close_while_an_operator_holds_the_lease(make_client):
@@ -198,7 +205,7 @@ def test_critic_that_returns_nothing_does_not_wave_an_unsupported_number_through
 def test_tool_arguments_of_the_wrong_type_are_rejected(client):
     ctx = ToolContext(client.app.state.runtime, MERCHANT)
     result = run_tool(ctx, "search_getnet_knowledge", {"query": {"$ne": ""}}, KNOWLEDGE_TOOLS)
-    assert result["error"] == "invalid_arguments" and "must be strings" in result["detail"]
+    assert result["error"] == "invalid_arguments" and "'query' must be a string" in result["detail"]
 
 
 def test_classifier_block_needs_a_second_opinion_and_an_ordinary_question_survives_one_wrong_verdict():

@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # --- Auth ----------------------------------------------------------------
     jwt_secret: str | None = None
     jwt_expires_minutes: int = 60
+    jwt_issuer: str = "getnet-support-auth"
+    jwt_audience: str = "getnet-support-api"
     require_chat_auth: bool = False
     # Demo identities (cliente1988, cliente2026, operador1) so the challenge scenarios can sign in.
     # Set SEED_DEMO_USERS=false in any real deployment and provision users through your IdP.
@@ -68,6 +70,13 @@ class Settings(BaseSettings):
     # --- HTTP ------------------------------------------------------------------
     trace_retention_days: int = 30
     cors_origins: str = ""
+    # Comma-separated addresses of reverse proxies whose X-Forwarded-For is believed when rate limiting.
+    # Empty: the direct peer address is used, and the header is ignored.
+    trusted_proxies: str = ""
+    # Bearer token Prometheus presents on /metrics. Unset in demo mode: /metrics is open. Required in production.
+    metrics_token: str | None = None
+    # How long GET /conversations/{id}?wait= may hold a request open waiting for a human decision.
+    max_conversation_wait_seconds: float = 30.0
     log_level: str = "INFO"
 
     # --- Data ------------------------------------------------------------------
@@ -90,7 +99,12 @@ class Settings(BaseSettings):
             problems.append("SEED_DEMO_USERS must be false (demo merchants and a demo operator share a published password)")
         if not self.jwt_secret or len(self.jwt_secret) < 32:
             problems.append("JWT_SECRET must be set to at least 32 characters")
+        if not self.metrics_token or len(self.metrics_token) < 24:
+            problems.append("METRICS_TOKEN must be set to at least 24 characters (/metrics exposes operational data)")
         return problems
+
+    def trusted_proxy_set(self) -> frozenset[str]:
+        return frozenset(p.strip() for p in self.trusted_proxies.split(",") if p.strip())
 
     def effective_provider(self) -> str:
         return "openai" if self.llm_provider == "openai" and self.openai_api_key else "offline"

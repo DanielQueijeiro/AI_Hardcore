@@ -49,12 +49,14 @@ def build_runtime(
     ops = OpsStore(settings.sqlite_db_path)
     if settings.seed_demo_users:
         ops.seed_demo_users(settings.demo_password)
+    metrics = Metrics()
     runtime = Runtime(
         settings=settings,
         llm=llm or build_llm(settings),
         retriever=retriever or build_retriever(settings.corpus_dir, build_embedder(settings), settings.index_raw_pages),
         ops=ops,
-        live=live or LiveData(enabled=settings.enable_live_web, timeout=settings.web_timeout_seconds),
+        live=live or LiveData(enabled=settings.enable_live_web, timeout=settings.web_timeout_seconds, metrics=metrics),
+        metrics=metrics,
     )
     logger.info(
         "runtime_ready",

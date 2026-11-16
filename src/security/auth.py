@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -68,6 +69,8 @@ def issue_token(settings: Settings, user_id: str, role: str) -> tuple[str, int]:
     now = datetime.now(UTC)
     expires_in = settings.jwt_expires_minutes * 60
     payload = {
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
         "sub": user_id,
         "role": role,
         "iat": int(now.timestamp()),
@@ -78,51 +81,63 @@ def issue_token(settings: Settings, user_id: str, role: str) -> tuple[str, int]:
 
 
 def token_claims(settings: Settings, token: str) -> dict[str, object]:
-    """Verified claims (signature, expiry, required fields). Raises AuthError otherwise."""
+    """Verified claims: signature, expiry, issuer, audience and required fields. Raises AuthError otherwise.
+
+    This is the only token check in the service; revocation (`jti`) is checked by the caller against the store.
+    Issuer and audience stop a token minted for another service that happens to share the secret from being
+    accepted here.
+    """
     try:
         return jwt.decode(
             token,
             settings.resolved_jwt_secret(),
             algorithms=[ALGORITHM],
-            options={"require": ["sub", "exp", "role", "jti"]},
+            issuer=settings.jwt_issuer,
+            audience=settings.jwt_audience,
+            options={"require": ["iss", "aud", "sub", "exp", "role", "jti"]},
         )
     except jwt.PyJWTError as exc:
         raise AuthError(str(exc)) from exc
 
 
-def verify_token(settings: Settings, token: str) -> Principal:
-    try:
-        payload = jwt.decode(
-            token,
-            settings.resolved_jwt_secret(),
-            algorithms=[ALGORITHM],
-            options={"require": ["sub", "exp", "role"]},
-        )
-    except jwt.PyJWTError as exc:
-        raise AuthError(str(exc)) from exc
-    role = payload["role"]
-    if role not in ("merchant", "operator"):
-        raise AuthError("unknown role")
-    return Principal(user_id=str(payload["sub"]), role=role)
+def client_ip(peer: str | None, forwarded_for: str | None, trusted_proxies: frozenset[str]) -> str:
+    """The caller's address for rate limiting.
+
+    `X-Forwarded-For` is honoured only when the direct peer is a configured proxy, and then read from the right,
+    skipping trusted hops: the left-most entries are whatever the client chose to send.
+    """
+    address = peer or "unknown"
+    if address not in trusted_proxies or not forwarded_for:
+        return address
+    for hop in reversed([h.strip() for h in forwarded_for.split(",") if h.strip()]):
+        if hop not in trusted_proxies:
+            return hop
+    return address
 
 
 class SlidingWindowRateLimiter:
-    """Per-process login throttle. A shared store (Redis) is required before running several replicas."""
+    """Per-process throttle. A shared store (Redis) is required before running several replicas."""
 
     def __init__(self, attempts: int, window_seconds: int) -> None:
         self.attempts = attempts
         self.window_seconds = window_seconds
         self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()  # requests run on a thread pool
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
-        hits = self._hits[key]
-        while hits and now - hits[0] > self.window_seconds:
-            hits.popleft()
-        if len(hits) >= self.attempts:
-            return False
-        hits.append(now)
-        return True
+        with self._lock:
+            hits = self._hits[key]
+            while hits and now - hits[0] > self.window_seconds:
+                hits.popleft()
+            if len(hits) >= self.attempts:
+                return False
+            hits.append(now)
+            if len(self._hits) > 10_000:  # bound memory: forget keys whose window has fully passed
+                for stale in [k for k, v in self._hits.items() if not v or now - v[-1] > self.window_seconds]:
+                    del self._hits[stale]
+            return True
 
     def reset(self, key: str) -> None:
-        self._hits.pop(key, None)
+        with self._lock:
+            self._hits.pop(key, None)

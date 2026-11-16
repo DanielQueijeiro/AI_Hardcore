@@ -57,7 +57,16 @@ def test_body_user_id_that_disagrees_with_the_token_is_rejected(client):
 def test_bad_tokens_are_rejected_not_downgraded_to_anonymous(client, settings):
     def token(secret=settings.jwt_secret, **claims):
         now = datetime.now(UTC)
-        payload = {"sub": "cliente1988", "role": "merchant", "jti": "j", "exp": int((now + timedelta(minutes=5)).timestamp()), **claims}
+        payload = {
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
+            "sub": "cliente1988",
+            "role": "merchant",
+            "jti": "j",
+            "exp": int((now + timedelta(minutes=5)).timestamp()),
+            **claims,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
         return {"Authorization": f"Bearer {jwt.encode(payload, secret, algorithm='HS256')}"}
 
     body = {"message": "hi"}
@@ -65,6 +74,10 @@ def test_bad_tokens_are_rejected_not_downgraded_to_anonymous(client, settings):
     assert client.post("/chat", json=body, headers=token(secret="another-secret-" + "y" * 32)).status_code == 401
     assert client.post("/chat", json=body, headers=token(exp=int(datetime.now(UTC).timestamp()) - 10)).status_code == 401
     assert client.post("/chat", json=body, headers=token(role="admin")).status_code == 401
+    # a token signed with the right secret but minted for another service, or by another issuer
+    assert client.post("/chat", json=body, headers=token(aud="some-other-api")).status_code == 401
+    assert client.post("/chat", json=body, headers=token(iss="someone-else")).status_code == 401
+    assert client.post("/chat", json=body, headers=token(aud=None, iss=None)).status_code == 401
     assert client.post("/chat", json=body, headers=token()).status_code == 200
 
 

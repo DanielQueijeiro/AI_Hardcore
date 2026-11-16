@@ -70,7 +70,9 @@ class ChatResponse(BaseModel):
 
 class ConversationResponse(BaseModel):
     conversation_id: str
-    status: Literal["empty", "idle", "awaiting_human"]
+    status: Literal["empty", "idle", "awaiting_human", "in_progress"] = Field(
+        ..., description="in_progress: a turn (or the resume after a human decision) is running on this conversation right now."
+    )
     pending_ticket_id: str | None
     summary: str
     turn_count: int
@@ -106,6 +108,11 @@ class TicketResolution(BaseModel):
     conversation_resumed: bool
     agent_answer: str | None = Field(None, description="What the agent told the merchant after your decision.")
     trace_id: str | None = None
+    resume: Literal["completed", "scheduled", "not_needed"] = Field(
+        "completed",
+        description="completed: the conversation was resumed in this request. scheduled: it resumes in the background "
+        "(respond?wait=false); the merchant reads the outcome with GET /conversations/{id}?wait=. not_needed: nothing was paused.",
+    )
 
 
 class FeedbackRequest(BaseModel):

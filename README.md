@@ -52,6 +52,12 @@ uvicorn src.api.main:app --port 8000
 
 ### Talk to it
 
+> **If you send the ten example payloads with `curl` and no token, three of them (deposit date, card machine
+> offline, declined transaction) answer "sign in to see your account". That is deliberate:** the body's
+> `user_id` is not proof of identity, so it never unlocks account data
+> ([ADR-0014](docs/adr/0014-challenge-payload-and-deployment-mode.md)). Sign in as below, or run
+> `python -m scripts.run_scenarios`, which signs in and sends the ten payloads exactly as the challenge lists them.
+
 The challenge payload works as is. Public knowledge needs no login:
 
 ```bash
@@ -88,6 +94,16 @@ python -m scripts.run_scenarios --anonymous # the same payloads with no token: a
 Why the body's `user_id` is not enough on its own is in
 [ADR-0014](docs/adr/0014-challenge-payload-and-deployment-mode.md).
 
+A turn takes several sequential model calls (about 11 s at the median with the real model). To watch it happen
+instead of waiting for the whole answer, send the same body to `/chat/stream` (server-sent events): `accepted`,
+then a `step` for each routing decision, tool call, review and human-review event as it lands, then `result`,
+which is exactly the `/chat` response.
+
+```bash
+curl -N -X POST http://localhost:8000/chat/stream -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"message": "My card machine won'"'"'t connect to the internet, what should I do?"}'
+```
+
 Response shape:
 
 ```json
@@ -119,10 +135,13 @@ Response shape:
 ### Tests and evaluation
 
 ```bash
-pytest                                     # 164 tests, no network, no API key
+pytest                                     # 185 tests, no network, no API key
 ruff check src eval tests scripts
 python -m eval.run --mode offline --gate   # deterministic regression gate (what CI runs)
-python -m eval.run --gate                  # with OPENAI_API_KEY: real model + LLM judge + judge calibration
+python -m eval.run --gate --repeat 3       # with OPENAI_API_KEY: real model + LLM judge + judge calibration
+python -m eval.run --ids g07,s04 --out /tmp/check          # a few golden items, never gated, never the report
+python -m eval.run --regrade eval/reports/openai/report.json --regrade-times 3 --out /tmp/regrade   # judge noise only
+python -m eval.run --adjudicate eval/reports/openai/report.json                  # attach eval/adjudications.jsonl
 ```
 
 ### Configuration
@@ -137,7 +156,10 @@ Every setting is an environment variable; [.env.example](.env.example) lists the
 | `JWT_SECRET` | random per process | Set it in any shared deployment, otherwise tokens die on restart. |
 | `REQUIRE_CHAT_AUTH` | `false` | Set `true` to require a verified Bearer token on `/chat` and `/conversations/{id}` (disables anonymous mode). |
 | `CHAT_RATE_LIMIT_ATTEMPTS` / `WINDOW` | `60` / `60` | Sliding-window request limit per authenticated caller or client IP on `/chat`. |
-| `APP_ENV` | `demo` | `production` refuses to start with demo users enabled or without a `JWT_SECRET` of 32+ characters. |
+| `TRUSTED_PROXIES` | empty | Comma-separated proxy addresses whose `X-Forwarded-For` is believed for rate limiting. Empty: the header is ignored and the peer address is used. |
+| `METRICS_TOKEN` | unset | Bearer token Prometheus must present on `/metrics`. Unset: `/metrics` is open (demo only). |
+| `JWT_ISSUER` / `JWT_AUDIENCE` | `getnet-support-auth` / `getnet-support-api` | Required `iss` / `aud` claims: a token minted for another service that shares the secret is refused. |
+| `APP_ENV` | `demo` | `production` refuses to start with demo users enabled, without a `JWT_SECRET` of 32+ characters, or without a `METRICS_TOKEN` of 24+. |
 | `TRACE_RETENTION_DAYS` | 30 | Stored traces older than this are deleted by the periodic sweep. |
 | `MAX_SUPERVISOR_STEPS` / `MAX_SPECIALIST_TOOL_STEPS` / `MAX_CRITIC_ROUNDS` | 6 / 4 / 2 | Bounds on agent autonomy. |
 | `HITL_TIMEOUT_SECONDS` / `HITL_LEASE_SECONDS` | 900 / 600 | Human-review deadline and operator lease. |
@@ -152,7 +174,7 @@ The first version scored 7.4. The review was right on every point; this is what 
 | Orchestration was a deterministic state machine: no planner, critic, re-planning, quality retry or stopping rule | The Router is a model-driven loop: it decomposes, delegates, reads observations and re-plans one tool call at a time; specialists run their own tool loops and reconsider after poor results; a Critic can send the answer back for more evidence; hard bounds stop it | [nodes.py](src/agents/nodes.py), [test_agentic_loop.py](tests/test_agentic_loop.py) |
 | No conversational memory | Per-conversation state checkpointed in SQLite: history, rolling summary with compaction, recovery after restart, isolation per identity | [service.py](src/agents/service.py), [test_memory.py](tests/test_memory.py) |
 | Handoff created a ticket and ended | `interrupt` → operator queue → claim with lease → approve / reject / answer → the same turn resumes with the human decision; timeout path; approved write executed exactly once | [test_human_in_the_loop.py](tests/test_human_in_the_loop.py) |
-| 12/12 was structural, not semantic | Golden answers with human-written facts, numeric groundedness, citation validity, language match, a sealed held-out split, a judge that is a different model with measured calibration, adversarial suite, regression gate in CI. Measured with the real model over three runs of 64 conversations: semantic pass 0.958 on average (sealed split 1.000, 1.000, 0.875), judge pass 0.969, calibration agreement 1.000 (40/40, 24 of them on questions outside the golden set). Routing is reported separately and does not count as quality | [eval/](eval/), [model report](eval/reports/openai/report.md), [offline report](eval/reports/offline/report.md) |
+| 12/12 was structural, not semantic | Golden answers with human-written facts, numeric groundedness, citation validity, language match, a sealed held-out split, a judge that is a different model with measured calibration, adversarial suite, regression gate in CI. Measured with the real model over three runs of 64 conversations: semantic pass 0.958 on average (sealed split 1.000, 1.000, 0.875), judge pass 0.969, calibration agreement 1.000 (40/40, 24 of them on questions outside the golden set). **The regression gate failed on run 1** (dev 0.833 against a floor of 0.94); of the eight failures across the three runs, a review attributes four to the agent and four to the graders (two fact patterns, two judge verdicts), so the dev split is 0.944 in run 1 once grader errors are set aside. The gate still reads the raw number. Routing is reported separately and does not count as quality | [eval/](eval/), [model report](eval/reports/openai/report.md), [offline report](eval/reports/offline/report.md) |
 | `user_id` was not an authenticated identity | JWT login; identity comes only from a verified token; body `user_id` that disagrees is rejected; anonymous callers get public knowledge only | [test_identity_and_api.py](tests/test_identity_and_api.py) |
 | Injection defence was lexical | Normalized/decoded lexical layer + LLM classifier + untrusted-data sanitization for RAG, web and operator text + output leak checks, all exercised by 38 attacks (EN/PT/ES plus German and French, paraphrase, pretexts, operator impersonation, poisoned documents and tool output) and 30 benign controls: 0 successful attacks, 0 false positives with the real model | [guardrails.py](src/security/guardrails.py), [adversarial.jsonl](eval/datasets/adversarial.jsonl) |
 | No retrieval metrics; hybrid weights unproven | Recall@k, Hit@k, MRR, nDCG on 42 labelled queries for BM25 vs dense vs hybrid, with the keyless embedder and with hosted embeddings. The 0.45/0.35/0.20 blend is gone; the default was chosen from the numbers | [Retrieval ablation](#retrieval-ablation) |
@@ -243,9 +265,11 @@ the adaptive behaviour described above is the model path.
 
 ## Identity and security
 
-`POST /auth/login` returns an HS256 JWT (`sub`, `role`, `exp`, `jti`). Passwords are stored with scrypt;
-login failures are uniform for unknown users and wrong passwords and are rate-limited; `POST /auth/logout`
-revokes the token's `jti`.
+`POST /auth/login` returns an HS256 JWT (`iss`, `aud`, `sub`, `role`, `exp`, `jti`; issuer and audience are
+required on every request). Passwords are stored with scrypt; login failures are uniform for unknown users and
+wrong passwords and are rate-limited; `POST /auth/logout` revokes the token's `jti`. Rate limits key on the
+verified user, or for anonymous callers on the client address, which is read from `X-Forwarded-For` only when
+the direct peer is one of `TRUSTED_PROXIES` (otherwise any client could pick its own bucket).
 
 The rule the rest of the system depends on: **identity is the verified token and nothing else.**
 
@@ -281,7 +305,11 @@ State is a LangGraph thread per `(identity, conversation_id)`, checkpointed to S
 - **Concurrency**: one turn at a time per thread (in-process lock).
 - **Provider failure**: timeouts and retries on the client, then a circuit breaker that degrades to the
   offline policy instead of returning a 500. `/ready` reports whether the breaker is open.
-- **Tool failure**: a failing tool returns a structured error the agent can react to.
+- **Tool failure**: a failing tool returns a structured error the agent can react to. Live sources (FX,
+  weather, web search) sit behind a short cache, one retry with backoff for transient errors (never for a 4xx),
+  and a circuit breaker per source, so a dead dependency costs a turn nothing instead of a timeout per call.
+- **Turns in flight**: `GET /conversations/{id}` reports `in_progress` while a turn or a resume is running on the
+  conversation, rather than reading state between two checkpoints.
 
 `GET /conversations/{id}` returns the stored memory of one of the caller's own conversations.
 
@@ -306,7 +334,11 @@ curl -s -X POST localhost:8000/operator/tickets/TKT-.../respond -H "Authorizatio
 ```
 
 `respond` returns what the agent told the merchant after the decision; the merchant also sees it in
-`GET /conversations/{id}` and in the conversation memory.
+`GET /conversations/{id}` and in the conversation memory. Resuming runs the agents (several seconds), so an
+operator console can call `respond?wait=false` instead: the decision is recorded, the call returns `202` with
+`resume: "scheduled"`, and the conversation resumes on a worker (or, if that fails, on the next sweep). The
+merchant's client learns the outcome with a long-poll, `GET /conversations/{id}?wait=30`, which returns as soon as
+the conversation is no longer waiting on a human (capped by `MAX_CONVERSATION_WAIT_SECONDS`).
 
 - **Claim is a lease.** A second operator gets `409` until the lease lapses; a decision requires holding it.
 - **Timeout.** A background sweeper expires unanswered tickets and resumes their conversations with a
@@ -429,11 +461,14 @@ now carries 30 benign controls whose false-positive rate is gated next to the at
 | Adversarial | 38 attacks + 30 benign controls | Attack success rate, data leaks, unauthorized writes, false-positive rate |
 | Judge calibration | 40 good and bad answers with pass/fail labels: 16 original, 24 on questions that appear in no golden item | Judge agreement and Cohen's kappa, overall and per set; false passes |
 
-**How correctness is checked without brittle string matching.** Each golden item lists the atomic facts a
-correct answer must carry, each as a set of acceptable phrasings (`["48"]`, `["129[.,]90"]`,
+**Required facts, and where they are brittle.** Each golden item lists the atomic facts a correct answer must
+carry, each as a set of acceptable phrasings (`["48"]`, `["129[.,]90"]`,
 `["does not (say|state|specify)", "não informa", ...]`), matched accent- and case-insensitively, plus claims
-that must not appear. Any wording or language that carries the facts passes; a fluent answer with the wrong
-number fails.
+that must not appear. For numbers, codes and product names this is exact and language-independent: a fluent
+answer with the wrong number fails. For wording (an abstention, "sign in") it is still pattern matching, and the
+model run shows its cost: g04 ("do not confirm") and s22 ("entre na sua conta") were correct answers that no
+listed phrasing matched. Those two are counted as failures and attributed to the grader in the adjudication
+below; moving wording checks from patterns to the judge is the planned fix.
 
 **Groundedness** is measured against the evidence the agents collected in that turn (read from the trace):
 every number in the answer must occur in it, and every URL must have been returned by a tool. An agent's own
@@ -458,8 +493,19 @@ sealed items were drafted with an LLM coding assistant from the corpus and the f
 they are unseen by the prompts, not written by an outside party.
 
 **One run is an anecdote.** `--repeat N` runs the golden suite N times with nothing changed in between and
-reports every run, the mean and which items failed in how many runs. Each report also records the SHA-256 of
-the dataset files it ran.
+reports every run, the mean and which items failed in how many runs.
+
+**Provenance.** Each report records the SHA-256 of the dataset files it ran and, from this version on, the git
+commit, whether the working tree differed from it, and hashes of the source tree, the prompts, the judge, the
+baseline, the corpus and the poisoned corpus. The committed model report predates that: it carries dataset
+hashes only.
+
+**Re-grading and adjudication.** Each golden item now stores the search queries and tool arguments of its turn
+and the exact input the judge saw, so `--regrade REPORT --regrade-times N` can grade the same answers again,
+N times each, without running the agents: judge noise measured on its own. Every failed answer is reviewed in
+[eval/adjudications.jsonl](eval/adjudications.jsonl), keyed to the SHA-256 of that exact answer, and attributed
+to the agent, the judge, the fact patterns or the harness. The report shows the raw and the adjudicated pass
+rate side by side; the gate reads only the raw one.
 
 **Regression gate.** [eval/baseline.json](eval/baseline.json) holds floors and ceilings per mode;
 `--gate` exits non-zero on a regression, on a gated metric that was never produced (a judge or calibration
@@ -495,17 +541,18 @@ Eight items failed in exactly one of the three runs; none failed twice. What eac
 |---|---|---|
 | g04 (dev) | 1 | Abstention worded in a way the fact list does not recognise |
 | g07 (dev) | 1 | Asked for EUR/BRL, answered with EUR/USD: a wrong answer |
-| g08 (dev) | 1 | Correct outcome, plus a Pix / Payment Link suggestion the judge found unsupported by the evidence |
-| g15 (dev) | 2 | Same pattern as g08: correct, with the same suggestion judged unsupported |
-| g12 (dev) | 3 | Left out the "connect to the store Wi-Fi" step the reference lists |
-| s04 (sealed) | 3 | Said the limit of devices per store is not documented; the corpus says 5: a wrong abstention |
-| s18 (sealed) | 3 | Answered the account half, could not find the battery charging time that the FAQ states |
+| g08 (dev) | 1 | **Judge mistake.** Correct outcome plus "keep selling with Pix or a Payment Link", which the judge called unsupported. The runbook chunk the answer's PIN-pad diagnosis comes from says exactly that |
+| g15 (dev) | 2 | **Judge mistake**, same sentence as g08 |
+| g12 (dev) | 3 | Left out the "connect to the store Wi-Fi" step the reference lists: an agent miss |
+| s04 (sealed) | 3 | Said the limit of devices per store is not documented; the corpus says 5. For the literal question BM25 ranks that passage first and the answer cites its page, so the passage was read and missed, and the Critic approved the false abstention |
+| s18 (sealed) | 3 | Answered the account half, not the battery charging time the FAQ states. An English query finds the FAQ passage in the top two; a Portuguese reformulation ("bateria") does not, and the Get Smart page says battery specifications are only in an image. The report did not store the search queries then, so which of the two happened is not known |
 | s22 (sealed) | 3 | **Grader mistake.** The answer ("entre na sua conta Getnet") is right and the judge passed it; the fact list does not include that phrasing. Left as a failure, as the protocol requires |
 
-So the sealed split is 24/24 in two runs and 21/24 in the third, of which two are real misses (both a
-documented fact not retrieved or not used) and one is the grader. The dev failures are variance around
-abstention wording and one unsupported addition that recurs; they have not been fixed in this version, and
-the dev floor has not been lowered to make the gate pass.
+So the sealed split is 24/24 in two runs and 21/24 in the third, of which two are real misses and one is the
+grader. Across all three runs the review attributes four failures to the agent (g07, g12, s04, s18) and four to
+the graders (g04, s22 fact patterns; g08, g15 judge): the adjudicated dev rate is 0.944, 1.000 and 0.944 per
+run, against a raw 0.833, 0.944 and 0.944 ([adjudicated table](eval/reports/openai/report.md#adjudicated-failures-human-review-the-gate-reads-the-raw-numbers)).
+None of the eight has been fixed in this version, and the dev floor has not been lowered to make the gate pass.
 
 - Judge means (1-5, run 1): correctness 4.84, groundedness 4.94, relevance 4.86, helpfulness 4.67. No
   forbidden claim, no fabricated citation, no turn answered by the degraded fallback, routing as expected
@@ -524,7 +571,8 @@ escalated to a human instead of answered, a tool called four times in a row. The
 fixes are in [ADR-0015](docs/adr/0015-what-the-first-model-run-changed.md). A later run at 0.925 (37/40:
 `h01`, `h09`, `g04`) led to tighter Portuguese/English language markers, bilingual and safety-refusal
 calibration in the judge, and Router faithfulness, after which a single run of the 40 dev and validation
-items passed 40/40. The three-run measurement above is what that single run did not show.
+items passed 40/40 (that run's report was not kept, so the figure cannot be checked here). The three-run
+measurement above is what that single run did not show.
 
 **Offline policy** (deterministic; the CI gate) — [full report](eval/reports/offline/report.md):
 
@@ -555,18 +603,24 @@ has no rule for. The model path does not have those limits, which is the point o
   `guardrail_blocks_total{category,layer}`, `critic_revisions_total`, `low_confidence_fallbacks_total`,
   `fabricated_citations_dropped_total`, `identity_argument_ignored_total`, `escalations_total{reason}`,
   `human_decisions_total{decision}`, `human_review_timeouts_total`, `memory_compactions_total`,
-  `login_failures_total`, `chat_rate_limited_total`, `user_feedback_total{rating}`.
+  `login_failures_total`, `chat_rate_limited_total`, `user_feedback_total{rating}`,
+  `live_source_calls_total{source,outcome}` (ok, cache hit, retry, error, circuit open), and two gauges set at
+  scrape time, `human_review_tickets_open` and `llm_circuit_open`. Every series carries its `# TYPE`.
+- **Live progress**: `POST /chat/stream` emits each routing decision, tool call, review and human-review event as
+  server-sent events while the turn runs; reasoning and tool results stay in the access-controlled trace.
 - **Cost**: real token usage from the provider per call, priced with `PRICE_*_PER_MTOK`, summed per turn in
   the response and the trace. Cost is contained by the step budgets, `reasoning.effort` per role (the guardrail
   classifier runs at the lowest), history compaction, and a `top_k` of 4.
 - **Feedback**: `POST /feedback` attaches a thumbs up/down to a trace.
 
-Alerts worth having on these: degraded-call rate, guardrail block rate by category, critic revision and
-low-confidence fallback rate, tool error rate, p95 turn latency, human-review timeouts, tickets waiting.
+**Alerts** are versioned as Prometheus rules in [deploy/prometheus/alerts.yml](deploy/prometheus/alerts.yml):
+degraded-call rate, model breaker open, p95 turn latency, low-confidence fallback rate, tool error rate, a live
+source in cool-down, guardrail block spikes by category, human-review backlog and timeouts, failed-login spikes.
+A test fails if a rule names a metric the code does not emit.
 
 ## Testing strategy
 
-169 tests, all through public interfaces, no network and no key.
+185 tests, all through public interfaces, no network and no key.
 
 | File | What it proves |
 |---|---|
@@ -577,6 +631,7 @@ low-confidence fallback rate, tool error rate, p95 turn latency, human-review ti
 | [test_guardrails.py](tests/test_guardrails.py) | Every "block" attack in the adversarial dataset, benign controls, obfuscation, classifier layer and its fail-open, sanitizer on poisoned and real corpus, output guard |
 | [test_llm_adapters.py](tests/test_llm_adapters.py) | Request shape and parsing of the OpenAI adapter against a fake SDK client, fallback for models without reasoning controls, circuit breaker open/recover, provider selection |
 | [test_rag_and_eval.py](tests/test_rag_and_eval.py) | Chunking, the three retrieval modes, metric math, groundedness and citation checks, language detection, the gate (including a gated metric that was never produced), live tools with a mocked transport |
+| [test_streaming_and_ops.py](tests/test_streaming_and_ops.py) | `/chat/stream` events and admission checks, `respond?wait=false` plus long-poll, the long-poll cap, `X-Forwarded-For` trusted only from configured proxies, typed metrics and gauges, alert rules against emitted metrics, live-source retry/cache/breaker, full argument-schema validation, report provenance, partial runs, re-grading, adjudication tied to the exact answer |
 | [test_hardening.py](tests/test_hardening.py) | Ordinary wording that used to be blocked, output-guard false positives plus obfuscated canary and internal tool-name blocking, PT/ES injections in retrieved text, anonymous conversation ids, strict `REQUIRE_CHAT_AUTH` and `/chat` rate limiting, production mode, lease-aware timeout, recovery of a decision whose resume never ran, checkpoint and trace retention, usage after a resume, specialist `degraded` propagation, a Critic that returns nothing |
 
 A scripted model ([scripted.py](src/llm/scripted.py)) plays individual agents where exact behaviour must be
@@ -594,7 +649,8 @@ scored on semantics rather than asserted on strings, with the gate as the pass/f
 - **Backup / rollback**: `python -m scripts.backup` takes a consistent online copy of both databases;
   `--restore` puts one back. Rolling back a release means restoring the backup taken before it.
 - **Secrets**: environment only; nothing secret has a usable default except the demo password.
-  `APP_ENV=production` refuses to start while demo users are enabled or `JWT_SECRET` is unset or short.
+  `APP_ENV=production` refuses to start while demo users are enabled, `JWT_SECRET` is unset or short, or
+  `METRICS_TOKEN` is unset or short.
 - **Retention**: a finished turn keeps one checkpoint per conversation (its memory), not one per graph step;
   traces are deleted after `TRACE_RETENTION_DAYS`.
 - **Scaling out** needs three changes, none of them in agent code: the LangGraph Postgres checkpointer instead
@@ -623,8 +679,10 @@ an LLM wrote is covered by the tests and the evaluation gate described above.
   They catch regressions and gross errors; they are not a statistically strong estimate of quality. The
   retrieval set has no held-out split and sits close to the ceiling.
 - Latency: in the reported run a turn takes 10.7 seconds at the median and 25.1 at p95. That is the price of a
-  classifier, a Router loop, specialist tool loops and a Critic run in sequence; streaming and running the
-  input classifier in parallel with the first Router step are the obvious next steps and are not built.
+  classifier, a Router loop, specialist tool loops and a Critic run in sequence. `/chat/stream` shows progress
+  while it runs but does not make the turn shorter; running the input classifier in parallel with the first
+  Router step is the obvious next step and is not built. The final answer is not streamed token by token,
+  because it arrives as the argument of the Router's `finish` call and the Critic reviews it before it is sent.
 - The knowledge base is a curated snapshot of nine pages dated in each file's front matter. Fees change; a
   production system would schedule the ingestion check and re-curate on change.
 - Merchant data, the runbook and the write action are mock fixtures.
@@ -636,4 +694,5 @@ an LLM wrote is covered by the tests and the evaluation gate described above.
   low-confidence fallback are fixed English strings.
 - A turn is five to nine sequential model calls; the evaluation report gives the measured latency.
 - Single worker, SQLite, in-process locks and rate limiter (see Production notes).
-- Operators have an API, not a UI, and there is no notification when a ticket opens.
+- Operators have an API, not a UI, and there is no notification when a ticket opens (the backlog alert is the
+  closest thing). Merchants learn a decision through the long-poll or their next message, not a push.
