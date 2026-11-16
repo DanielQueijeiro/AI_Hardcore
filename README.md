@@ -694,9 +694,25 @@ an LLM wrote is covered by the tests and the evaluation gate described above.
   reformulations of a search miss English-only passages (s04); the FX tool does not default to BRL; the Router
   sometimes appends troubleshooting nobody asked for after a human decision; fact patterns miss correct
   phrasings ("US$", "não está publicado", "no decline code").
+- The s04 miss starts in the system, not only in the model. The search tool's description and the Knowledge
+  Agent's instructions tell it to reformulate with the Portuguese product term
+  ([src/tools/registry.py](src/tools/registry.py), [src/agents/prompts.py](src/agents/prompts.py)), and in s04
+  the very first search was already in Portuguese although the question was in English. The corpus is restated
+  in English and BM25 is lexical, so those searches could not reach the "up to 5 devices" passage.
+- The Critic is asked whether a draft is complete, but in practice it does not catch omissions. It approved g12
+  in both model reports without the runbook's "connect to the store Wi-Fi" step, and in the 2026-11-16 answer
+  the draft also said that step was not documented.
 - The golden, adversarial and retrieval datasets are small (64, 68 and 42 items) and written by one person.
   They catch regressions and gross errors; they are not a statistically strong estimate of quality. The
   retrieval set has no held-out split and sits close to the ceiling.
+- Retrieval leans on a hand-written synonym glossary (`GLOSSARY` in [src/rag/index.py](src/rag/index.py)) that
+  maps Portuguese and Spanish terms onto the English corpus. It was written alongside the 42 retrieval queries,
+  so the reported recall (0.988 at 4 for BM25) is optimistic for wording the glossary does not list; it has no
+  entry for "dispositivos", "loja" or "quantidade", the words of the s04 searches.
+- Judge calibration is 1.000 agreement (kappa 1.000) on both sets, yet the same report holds a judge error
+  (g15, run 1: a sentence called unsupported that is in the judge's own input). The calibration pairs are
+  clear-cut by design: they show the judge separates plainly good from plainly bad answers, not that it is
+  reliable on borderline ones.
 - Latency: in the reported run a turn takes 11.9 seconds at the median and 26.4 at p95 (35.6 s at p95 on the dev
   split, where the human-review items are). That is the price of a
   classifier, a Router loop, specialist tool loops and a Critic run in sequence. `/chat/stream` shows progress
@@ -714,5 +730,8 @@ an LLM wrote is covered by the tests and the evaluation gate described above.
   low-confidence fallback are fixed English strings.
 - A turn is five to nine sequential model calls; the evaluation report gives the measured latency.
 - Single worker, SQLite, in-process locks and rate limiter (see Production notes).
+- The alert rules in [deploy/prometheus/alerts.yml](deploy/prometheus/alerts.yml) are versioned and tested
+  against the metrics the code emits, but `docker-compose.yml` runs no Prometheus: the rules take effect only
+  where a Prometheus loads them.
 - Operators have an API, not a UI, and there is no notification when a ticket opens (the backlog alert is the
   closest thing). Merchants learn a decision through the long-poll or their next message, not a push.
