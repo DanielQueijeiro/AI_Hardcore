@@ -300,10 +300,11 @@ def test_adjudication_is_tied_to_the_exact_answer_and_never_changes_the_gate():
     assert failures == ["golden.dev.semantic_pass_rate = 0.3333 is below the baseline 0.6"], "the gate reads the raw rate"
 
 
-def test_the_committed_adjudications_match_answers_in_the_published_report():
-    report = json.loads(Path("eval/reports/openai/report.json").read_text(encoding="utf-8"))
-    entries = ev.load_adjudications()
+@pytest.mark.parametrize("path", sorted(str(p) for p in Path("eval/reports/openai").glob("report*.json")))
+def test_every_failure_of_a_committed_model_report_is_adjudicated(path):
+    report = json.loads(Path(path).read_text(encoding="utf-8"))
+    entries = [e for e in ev.load_adjudications() if e.get("report") == report["generated_at"]]
     adj = ev.adjudicate(report, entries)
-    assert adj["failure_causes"].get("not adjudicated", 0) == 0, "every failure of the published report is reviewed"
-    assert len(entries) == len(adj["failures"]), "no adjudication points at an answer the report does not contain"
-    assert report["gate"], "the published gate result is reported as measured, adjudication or not"
+    assert adj["failure_causes"].get("not adjudicated", 0) == 0, "every failure of a committed model report is reviewed"
+    assert len(entries) == len(adj["failures"]), "no adjudication points at an answer that report does not contain"
+    assert report.get("adjudication") == adj, "the committed report carries its current adjudication"

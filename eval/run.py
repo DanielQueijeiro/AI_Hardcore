@@ -905,7 +905,10 @@ def main(argv: list[str] | None = None) -> int:
             if len(runs) > 1:
                 report["golden_repeats"] = repeat_summary(runs)
                 report["golden_repeat_items"] = [run["items"] for run in runs[1:]]
-            report["adjudication"] = adjudicate(report, load_adjudications())
+            if mode == "openai":
+                # Model runs only: offline failures are the rule policy's known limits (language, decomposition),
+                # described in the offline report itself, not answers to review one by one.
+                report["adjudication"] = adjudicate(report, load_adjudications())
         if wanted("adversarial"):
             report["adversarial"] = run_adversarial(make_settings(args.mode, Path(tmp) / "adversarial", live=False))
         if wanted("calibration"):
