@@ -1,8 +1,9 @@
 # Evaluation report (offline)
 
-- Generated: 2026-11-14T05:39:31+00:00
+- Generated: 2026-11-16T08:50:42+00:00
 - Answering model: `offline-rule-policy`; judge: `none`
 - Live web tools: off (answers must say live data is unavailable)
+- Code: `6202c2b9f68f`; input hashes in `provenance` of the JSON report
 
 > This run used the deterministic offline policy, not a language model. It is the CI regression gate: it
 > proves the pipeline, tools, guardrails, memory and human-review flow work and that answers stay grounded.
@@ -37,10 +38,10 @@ Queries with no relevant chunk in the top 4 (bm25): none
 
 | Split | n | Semantic pass | Fact coverage | Forbidden claims | Numeric groundedness | Citation validity | Language match | Gold source cited | Judge pass | Routing as expected | p50 ms | p95 ms | Mean cost USD |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| dev | 18 | 1.000 | 1.000 | 0.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 29 | 87 | 0.00000 |
-| validation | 22 | 0.682 | 0.682 | 0.000 | 1.000 | 1.000 | 0.727 | 0.684 | n/a | 0.773 | 22 | 35 | 0.00000 |
-| heldout | 24 | 0.750 | 0.771 | 0.000 | 1.000 | 1.000 | 0.667 | 0.722 | n/a | 1.000 | 22 | 39 | 0.00000 |
-| all | 64 | 0.797 | 0.805 | 0.000 | 1.000 | 1.000 | 0.781 | 0.756 | n/a | 0.922 | 23 | 67 | 0.00000 |
+| dev | 18 | 1.000 | 1.000 | 0.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 438 | 1483 | 0.00000 |
+| validation | 22 | 0.682 | 0.682 | 0.000 | 1.000 | 1.000 | 0.727 | 0.684 | n/a | 0.773 | 35 | 94 | 0.00000 |
+| heldout | 24 | 0.750 | 0.771 | 0.000 | 1.000 | 1.000 | 0.667 | 0.722 | n/a | 1.000 | 41 | 65 | 0.00000 |
+| all | 64 | 0.797 | 0.805 | 0.000 | 1.000 | 1.000 | 0.781 | 0.756 | n/a | 0.922 | 52 | 716 | 0.00000 |
 
 Semantic pass = every required fact present, no forbidden claim, every number in the answer found in the collected evidence, no fabricated citation, expected status, and the judge's pass when a judge ran. Routing is reported but does not count. Language match (answer written in the merchant's language) is reported and gated on its own.
 

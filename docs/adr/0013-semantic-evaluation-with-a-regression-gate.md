@@ -5,7 +5,7 @@ Status: accepted
 The first version reported 12/12 from a check of route, tools and non-empty answer. A wrong answer on the right route passed. The evaluation now separates three questions and never mixes them:
 
 - Did retrieval find the right passage? Recall@k, Hit@k, MRR, nDCG on labelled queries, per mode and language.
-- Is the answer right, grounded and safe? End-to-end through the HTTP API: required facts as sets of acceptable phrasings (correctness without string matching), forbidden claims, numeric groundedness against the evidence in the turn's trace, citation validity, and an LLM judge with a rubric and a human-written reference.
+- Is the answer right, grounded and safe? End-to-end through the HTTP API: required facts as sets of acceptable phrasings (exact for numbers and codes in any language; for wording still pattern matching, whose cost the model run measured, see [0017](0017-evaluation-provenance-regrading-and-adjudication.md)), forbidden claims, numeric groundedness against the evidence in the turn's trace, citation validity, and an LLM judge with a rubric and a human-written reference.
 - Did it take a sensible path? Reported as "routing as expected" and excluded from the quality score.
 
 The judge is a separate call, optionally a different model, and its pass rule is computed in code from its scores. It is calibrated against human pass/fail labels on hand-written good and bad answers; false passes are the figure that matters.

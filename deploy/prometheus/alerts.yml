@@ -1,0 +1,76 @@
+# Prometheus alerting rules for the support service. Every metric used here is exported by GET /metrics
+# (see src/observability.py); tests/test_streaming_and_ops.py fails if a rule names a metric the code never emits.
+# Thresholds are starting points for a low-volume deployment: tune them on real traffic.
+groups:
+  - name: getnet-support
+    rules:
+      - alert: ModelDegraded
+        # The circuit breaker answers with the offline policy when the model fails: answers get worse, not errors.
+        expr: sum(rate(llm_degraded_calls_total[10m])) / clamp_min(sum(rate(llm_calls_total[10m])), 1e-9) > 0.05
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 5% of model calls are served by the offline fallback"
+
+      - alert: ModelCircuitOpen
+        expr: max(llm_circuit_open) == 1
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "The model circuit breaker is open: every turn is answered by the offline policy"
+
+      - alert: TurnLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(chat_turn_seconds_bucket[15m]))) > 45
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "p95 chat turn latency above 45 s (measured p95 in the evaluation report: about 26 s)"
+
+      - alert: LowConfidenceFallbacksHigh
+        # The Critic refused to send an ungrounded answer, or the Router ran out of steps.
+        expr: sum(rate(low_confidence_fallbacks_total[1h])) / clamp_min(sum(rate(chat_turns_total[1h])), 1e-9) > 0.10
+        for: 30m
+        labels: {severity: ticket}
+        annotations:
+          summary: "More than 10% of turns end in the low-confidence fallback"
+
+      - alert: ToolErrorRateHigh
+        expr: sum(rate(tool_calls_total{outcome=~"error|exception"}[15m])) / clamp_min(sum(rate(tool_calls_total[15m])), 1e-9) > 0.20
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "More than 20% of tool calls fail"
+
+      - alert: LiveSourceCircuitOpen
+        expr: sum by (source) (increase(live_source_calls_total{outcome="circuit_open"}[10m])) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "A live data source (FX, weather or web search) is in its circuit-breaker cool-down"
+
+      - alert: GuardrailBlockSpike
+        # Either an attack or a regression that blocks ordinary merchants (false positives): look at the category.
+        expr: sum by (category) (rate(guardrail_blocks_total[30m])) / scalar(clamp_min(sum(rate(chat_turns_total[30m])), 1e-9)) > 0.15
+        for: 30m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Guardrail blocks above 15% of turns for one category"
+
+      - alert: HumanReviewBacklog
+        expr: max(human_review_tickets_open) > 10
+        for: 15m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 10 conversations are paused waiting for a human operator"
+
+      - alert: HumanReviewTimeouts
+        expr: increase(human_review_timeouts_total[1h]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "A human review expired unanswered; the merchant was told nothing was executed"
+
+      - alert: LoginFailureSpike
+        expr: sum(rate(login_failures_total[5m])) > 1
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Sustained failed logins (credential stuffing?)"

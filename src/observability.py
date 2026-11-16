@@ -47,6 +47,7 @@ class Metrics:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = defaultdict(float)
+        self._gauges: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
         self._buckets: dict[float, int] = dict.fromkeys(LATENCY_BUCKETS, 0)
         self._latency_sum = 0.0
         self._latency_count = 0
@@ -67,12 +68,29 @@ class Metrics:
         with self._lock:
             return self._counters.get((name, tuple(sorted(labels.items()))), 0.0)
 
+    def set_gauge(self, name: str, value: float, **labels: str) -> None:
+        """A point-in-time value (tickets waiting, a breaker's state), refreshed just before each scrape."""
+        with self._lock:
+            self._gauges[(name, tuple(sorted(labels.items())))] = value
+
+    @staticmethod
+    def _series(kind: str, values: dict[tuple[str, tuple[tuple[str, str], ...]], float]) -> list[str]:
+        lines: list[str] = []
+        typed: set[str] = set()
+        for (name, labels), value in sorted(values.items()):
+            if name not in typed:
+                lines.append(f"# TYPE {name} {kind}")
+                typed.add(name)
+            label_text = ",".join(f'{k}="{v}"' for k, v in labels)
+            lines.append(f"{name}{{{label_text}}} {value:g}" if label_text else f"{name} {value:g}")
+        return lines
+
     def render(self) -> str:
         lines: list[str] = []
         with self._lock:
-            for (name, labels), value in sorted(self._counters.items()):
-                label_text = ",".join(f'{k}="{v}"' for k, v in labels)
-                lines.append(f"{name}{{{label_text}}} {value:g}" if label_text else f"{name} {value:g}")
+            lines += self._series("counter", self._counters)
+            lines += self._series("gauge", self._gauges)
+            lines.append("# TYPE chat_turn_seconds histogram")
             for bound in LATENCY_BUCKETS:
                 lines.append(f'chat_turn_seconds_bucket{{le="{bound:g}"}} {self._buckets[bound]}')
             lines.append(f'chat_turn_seconds_bucket{{le="+Inf"}} {self._latency_count}')

@@ -262,6 +262,43 @@ def tool_specs(names: tuple[str, ...]) -> list[dict[str, Any]]:
     return [TOOLS[n].spec() for n in names]
 
 
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list,),
+    "object": (dict,),
+}
+
+
+def validate_arguments(tool: Tool, arguments: dict[str, Any]) -> list[str]:
+    """Check arguments against the declared JSON schema subset: required, type, enum, length and range.
+
+    Models do send `{"$ne": ""}` where a string belongs, or 7 where "7" was declared; such a call is refused with
+    a message the model can act on rather than reaching a handler.
+    """
+    problems = [f"missing required argument(s): {k}" for k in tool.required if not str(arguments.get(k, "")).strip()]
+    for key, value in arguments.items():
+        spec = tool.properties[key]
+        declared = spec.get("type")
+        expected = _JSON_TYPES.get(declared or "", ())
+        # bool is an int in Python; JSON keeps them apart
+        if expected and (not isinstance(value, expected) or (declared in ("integer", "number") and isinstance(value, bool))):
+            problems.append(f"argument '{key}' must be {'an' if declared in ('integer', 'array', 'object') else 'a'} {declared}")
+            continue
+        if "enum" in spec and value not in spec["enum"]:
+            problems.append(f"argument '{key}' must be one of {spec['enum']}")
+        if isinstance(value, str) and len(value) > spec.get("maxLength", MAX_STRING_ARG):
+            problems.append(f"argument '{key}' is longer than {spec.get('maxLength', MAX_STRING_ARG)} characters")
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            if "minimum" in spec and value < spec["minimum"]:
+                problems.append(f"argument '{key}' must be >= {spec['minimum']}")
+            if "maximum" in spec and value > spec["maximum"]:
+                problems.append(f"argument '{key}' must be <= {spec['maximum']}")
+    return problems
+
+
 def run_tool(ctx: ToolContext, name: str, arguments: dict[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
     """Validate, authorize and execute one tool call. Never raises."""
     metrics = ctx.runtime.metrics
@@ -284,12 +321,10 @@ def run_tool(ctx: ToolContext, name: str, arguments: dict[str, Any], allowed: tu
             ignored.append(key)
             continue
         clean[key] = value[:MAX_STRING_ARG] if isinstance(value, str) else value
-    missing = [k for k in tool.required if not str(clean.get(k, "")).strip()]
-    mistyped = [k for k, v in clean.items() if tool.properties[k].get("type") == "string" and not isinstance(v, str)]
-    if missing or mistyped:
+    problems = validate_arguments(tool, clean)
+    if problems:
         metrics.inc("tool_calls_total", tool=name, outcome="invalid")
-        detail = f"missing required argument(s): {', '.join(missing)}" if missing else f"argument(s) must be strings: {', '.join(mistyped)}"
-        return {"error": "invalid_arguments", "detail": detail}
+        return {"error": "invalid_arguments", "detail": "; ".join(problems)}
     if any(k in IDENTITY_ARGUMENTS for k in ignored):
         metrics.inc("identity_argument_ignored_total", tool=name)
         logger.warning("identity_argument_ignored", extra={"tool": name, "arguments": ignored, "principal": ctx.principal.user_id})

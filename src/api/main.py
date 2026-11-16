@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import hmac
+import json
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.agents.graph import open_checkpointer
@@ -40,6 +42,7 @@ from src.security.auth import (
     AuthError,
     Principal,
     SlidingWindowRateLimiter,
+    client_ip,
     issue_token,
     token_claims,
     verify_password,
@@ -119,6 +122,11 @@ def create_app(
 
     # --- dependencies -----------------------------------------------------------------------------------
 
+    trusted_proxies = settings.trusted_proxy_set()
+
+    def caller_address(request: Request) -> str:
+        return client_ip(request.client.host if request.client else None, request.headers.get("x-forwarded-for"), trusted_proxies)
+
     def rt(request: Request) -> Runtime:
         return request.app.state.runtime
 
@@ -173,15 +181,23 @@ def create_app(
         return ReadyResponse(status="ready" if ok else "not_ready", checks=checks)
 
     @app.get("/metrics", response_class=PlainTextResponse, tags=["ops"])
-    def metrics(request: Request) -> str:
-        return rt(request).metrics.render()
+    def metrics(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> str:
+        """Prometheus scrape. With METRICS_TOKEN set (required in production) the scraper must present it."""
+        if settings.metrics_token and (
+            credentials is None or not hmac.compare_digest(credentials.credentials.encode(), settings.metrics_token.encode())
+        ):
+            raise HTTPException(401, "metrics token required", headers={"WWW-Authenticate": "Bearer"})
+        runtime = rt(request)
+        runtime.metrics.set_gauge("human_review_tickets_open", len(runtime.ops.list_tickets("open")))
+        runtime.metrics.set_gauge("llm_circuit_open", float(bool(getattr(runtime.llm, "breaker_open", False))))
+        return runtime.metrics.render()
 
     # --- auth -------------------------------------------------------------------------------------------
 
     @app.post("/auth/login", response_model=TokenResponse, tags=["auth"])
     def login(body: LoginRequest, request: Request) -> TokenResponse:
         limiter: SlidingWindowRateLimiter = request.app.state.login_limiter
-        key = f"{request.client.host if request.client else 'unknown'}:{body.user_id}"
+        key = f"{caller_address(request)}:{body.user_id}"
         if not limiter.allow(key):
             raise HTTPException(429, "too many login attempts", headers={"Retry-After": str(settings.login_rate_limit_window_seconds)})
         user = rt(request).ops.get_user(body.user_id)
@@ -208,14 +224,15 @@ def create_app(
 
     # --- chat -------------------------------------------------------------------------------------------
 
-    def chat(body: ChatRequest, request: Request, principal: Principal = Depends(current_principal)) -> ChatResponse:
+    def admit(body: ChatRequest, request: Request, principal: Principal) -> None:
+        """Checks every chat request passes before any agent runs: auth policy, identity agreement, rate limit."""
         if settings.require_chat_auth and principal.user_id is None:
             raise HTTPException(401, "authentication required", headers={"WWW-Authenticate": "Bearer"})
         if principal.user_id is not None and body.user_id and body.user_id != principal.user_id:
             rt(request).metrics.inc("identity_mismatch_rejected_total")
             raise HTTPException(403, "user_id does not match the authenticated user")
         limiter: SlidingWindowRateLimiter = request.app.state.chat_limiter
-        limiter_key = principal.user_id or (request.client.host if request.client else "unknown")
+        limiter_key = principal.user_id or caller_address(request)
         if not limiter.allow(limiter_key):
             rt(request).metrics.inc("chat_rate_limited_total")
             raise HTTPException(
@@ -223,10 +240,16 @@ def create_app(
                 "too many chat requests",
                 headers={"Retry-After": str(settings.chat_rate_limit_window_seconds)},
             )
+
+    def chat(body: ChatRequest, request: Request, principal: Principal = Depends(current_principal)) -> ChatResponse:
+        admit(body, request, principal)
         try:
             result = svc(request).handle_message(principal, body.message, body.conversation_id)
         except ConversationError as exc:
             raise HTTPException(422, str(exc)) from exc
+        return chat_response(result, body, principal, request)
+
+    def chat_response(result: dict[str, Any], body: ChatRequest, principal: Principal, request: Request) -> ChatResponse:
         return ChatResponse(
             user_id=principal.user_id,
             authenticated=principal.user_id is not None,
@@ -254,15 +277,47 @@ def create_app(
     app.post("/chat", response_model=ChatResponse, tags=["chat"], summary="Send a message (challenge contract)")(chat)
     app.post("/api/v1/chat", response_model=ChatResponse, tags=["chat"], summary="Send a message (versioned alias)")(chat)
 
+    @app.post(
+        "/chat/stream",
+        tags=["chat"],
+        summary="Send a message and follow the turn as server-sent events",
+        response_class=StreamingResponse,
+        responses={200: {"content": {"text/event-stream": {}}}},
+    )
+    def chat_stream(body: ChatRequest, request: Request, principal: Principal = Depends(current_principal)) -> StreamingResponse:
+        """Same request and checks as /chat. Events: `accepted`, then one `step` per routing decision, tool call,
+        review and human-review event as it happens, then `result` (the /chat response body) or `error`."""
+        admit(body, request, principal)
+        try:
+            events = svc(request).stream_message(principal, body.message, body.conversation_id)
+        except ConversationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        def sse() -> Iterator[str]:
+            for event in events:
+                if event["type"] == "result":
+                    data = chat_response(event["result"], body, principal, request).model_dump_json()
+                else:
+                    data = json.dumps(event, ensure_ascii=False, default=str)
+                yield f"event: {event['type']}\ndata: {data}\n\n"
+
+        return StreamingResponse(sse(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     @app.get("/conversations/{conversation_id}", response_model=ConversationResponse, tags=["chat"])
-    def conversation(conversation_id: str, request: Request, principal: Principal = Depends(current_principal)) -> ConversationResponse:
+    def conversation(
+        conversation_id: str,
+        request: Request,
+        wait: float = Query(0.0, ge=0.0, description="While the conversation waits on a human, hold the request up to this many seconds for the decision."),
+        principal: Principal = Depends(current_principal),
+    ) -> ConversationResponse:
         """Stored memory of one of the caller's own conversations, including whether it is waiting on a human."""
         if settings.require_chat_auth and principal.user_id is None:
             raise HTTPException(401, "authentication required", headers={"WWW-Authenticate": "Bearer"})
         try:
-            return ConversationResponse(**svc(request).conversation(principal, conversation_id))
+            view = svc(request).conversation(principal, conversation_id, wait_seconds=min(wait, settings.max_conversation_wait_seconds))
         except ConversationError as exc:
             raise HTTPException(422, str(exc)) from exc
+        return ConversationResponse(**view)
 
     @app.get("/traces/{trace_id}", tags=["ops"])
     def trace(trace_id: str, request: Request, principal: Principal = Depends(current_principal)) -> dict[str, Any]:
@@ -306,7 +361,12 @@ def create_app(
 
     @app.post("/operator/tickets/{ticket_id}/respond", response_model=TicketResolution, tags=["operator"])
     def respond_ticket(
-        ticket_id: str, body: TicketDecision, request: Request, principal: Principal = Depends(operator)
+        ticket_id: str,
+        body: TicketDecision,
+        request: Request,
+        response: Response,
+        wait: bool = Query(True, description="true: resume the conversation now and return the agent's answer. false: record the decision, return 202 and resume in the background."),
+        principal: Principal = Depends(operator),
     ) -> TicketResolution:
         """Record the human decision and resume the paused conversation with it."""
         runtime = rt(request)
@@ -318,12 +378,18 @@ def create_app(
             raise HTTPException(409, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        if not wait:
+            # The decision is durable; the merchant's conversation picks it up on the worker (or, failing that, the sweep).
+            svc(request).resume_in_background(ticket["thread_key"])
+            response.status_code = 202
+            return TicketResolution(ticket=TicketResponse(**ticket), conversation_resumed=False, resume="scheduled")
         result = svc(request).resume(ticket["thread_key"])
         return TicketResolution(
             ticket=TicketResponse(**(runtime.ops.get_ticket(ticket_id) or ticket)),
             conversation_resumed=result is not None,
             agent_answer=result["answer"] if result else None,
             trace_id=result["trace_id"] if result else None,
+            resume="completed" if result is not None else "not_needed",
         )
 
     return app
