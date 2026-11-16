@@ -94,7 +94,7 @@ python -m scripts.run_scenarios --anonymous # the same payloads with no token: a
 Why the body's `user_id` is not enough on its own is in
 [ADR-0014](docs/adr/0014-challenge-payload-and-deployment-mode.md).
 
-A turn takes several sequential model calls (about 11 s at the median with the real model). To watch it happen
+A turn takes several sequential model calls (about 12 s at the median with the real model). To watch it happen
 instead of waiting for the whole answer, send the same body to `/chat/stream` (server-sent events): `accepted`,
 then a `step` for each routing decision, tool call, review and human-review event as it lands, then `result`,
 which is exactly the `/chat` response.
@@ -135,7 +135,7 @@ Response shape:
 ### Tests and evaluation
 
 ```bash
-pytest                                     # 185 tests, no network, no API key
+pytest                                     # 187 tests, no network, no API key
 ruff check src eval tests scripts
 python -m eval.run --mode offline --gate   # deterministic regression gate (what CI runs)
 python -m eval.run --gate --repeat 3       # with OPENAI_API_KEY: real model + LLM judge + judge calibration
@@ -174,7 +174,7 @@ The first version scored 7.4. The review was right on every point; this is what 
 | Orchestration was a deterministic state machine: no planner, critic, re-planning, quality retry or stopping rule | The Router is a model-driven loop: it decomposes, delegates, reads observations and re-plans one tool call at a time; specialists run their own tool loops and reconsider after poor results; a Critic can send the answer back for more evidence; hard bounds stop it | [nodes.py](src/agents/nodes.py), [test_agentic_loop.py](tests/test_agentic_loop.py) |
 | No conversational memory | Per-conversation state checkpointed in SQLite: history, rolling summary with compaction, recovery after restart, isolation per identity | [service.py](src/agents/service.py), [test_memory.py](tests/test_memory.py) |
 | Handoff created a ticket and ended | `interrupt` → operator queue → claim with lease → approve / reject / answer → the same turn resumes with the human decision; timeout path; approved write executed exactly once | [test_human_in_the_loop.py](tests/test_human_in_the_loop.py) |
-| 12/12 was structural, not semantic | Golden answers with human-written facts, numeric groundedness, citation validity, language match, a sealed held-out split, a judge that is a different model with measured calibration, adversarial suite, regression gate in CI. Measured with the real model over three runs of 64 conversations: semantic pass 0.958 on average (sealed split 1.000, 1.000, 0.875), judge pass 0.969, calibration agreement 1.000 (40/40, 24 of them on questions outside the golden set). **The regression gate failed on run 1** (dev 0.833 against a floor of 0.94); of the eight failures across the three runs, a review attributes four to the agent and four to the graders (two fact patterns, two judge verdicts), so the dev split is 0.944 in run 1 once grader errors are set aside. The gate still reads the raw number. Routing is reported separately and does not count as quality | [eval/](eval/), [model report](eval/reports/openai/report.md), [offline report](eval/reports/offline/report.md) |
+| 12/12 was structural, not semantic | Golden answers with human-written facts, numeric groundedness, citation validity, language match, a sealed held-out split, a judge that is a different model with measured calibration, adversarial suite, regression gate in CI. Measured with the real model on 2026-11-16 over three runs of 64 conversations: semantic pass 0.932 on average (sealed split 0.958, 0.917, 0.917), judge pass 0.969, calibration agreement 1.000 (40/40, 24 of them on questions outside the golden set), 0 of 38 attacks. **The regression gate failed on run 1** (dev 0.833 against a floor of 0.94). Every failed answer is adjudicated against the stored evidence: of thirteen, seven are the system's, one the judge's and five the fact patterns'; the sealed split is 0.958 in every run once grader errors are set aside. The gate still reads the raw number. Routing is reported separately and does not count as quality | [eval/](eval/), [model report](eval/reports/openai/report.md), [offline report](eval/reports/offline/report.md) |
 | `user_id` was not an authenticated identity | JWT login; identity comes only from a verified token; body `user_id` that disagrees is rejected; anonymous callers get public knowledge only | [test_identity_and_api.py](tests/test_identity_and_api.py) |
 | Injection defence was lexical | Normalized/decoded lexical layer + LLM classifier + untrusted-data sanitization for RAG, web and operator text + output leak checks, all exercised by 38 attacks (EN/PT/ES plus German and French, paraphrase, pretexts, operator impersonation, poisoned documents and tool output) and 30 benign controls: 0 successful attacks, 0 false positives with the real model | [guardrails.py](src/security/guardrails.py), [adversarial.jsonl](eval/datasets/adversarial.jsonl) |
 | No retrieval metrics; hybrid weights unproven | Recall@k, Hit@k, MRR, nDCG on 42 labelled queries for BM25 vs dense vs hybrid, with the keyless embedder and with hosted embeddings. The 0.45/0.35/0.20 blend is gone; the default was chosen from the numbers | [Retrieval ablation](#retrieval-ablation) |
@@ -497,8 +497,8 @@ reports every run, the mean and which items failed in how many runs.
 
 **Provenance.** Each report records the SHA-256 of the dataset files it ran and, from this version on, the git
 commit, whether the working tree differed from it, and hashes of the source tree, the prompts, the judge, the
-baseline, the corpus and the poisoned corpus. The committed model report predates that: it carries dataset
-hashes only.
+baseline, the corpus and the poisoned corpus. The current model report has all of it; the archived 2026-11-14
+report predates it and carries dataset hashes only.
 
 **Re-grading and adjudication.** Each golden item now stores the search queries and tool arguments of its turn
 and the exact input the judge saw, so `--regrade REPORT --regrade-times N` can grade the same answers again,
@@ -514,49 +514,61 @@ gate on every push.
 
 ### Results
 
-**Real model** (`gpt-6-luna` answering, `gpt-5.4-mini` judging, live web tools on, 2026-11-14) —
-[full report](eval/reports/openai/report.md). Three runs of the golden suite with nothing changed between
-them; the table is run 1, the one the gate reads. **The gate failed on this run**: dev semantic pass 0.833
-against a floor of 0.94. Every other gated metric passed, including the sealed split.
+**Real model** (`gpt-6-luna` answering, `gpt-5.4-mini` judging, live web tools on, 2026-11-16, code at
+commit `6202c2b` with a clean tree) — [full report](eval/reports/openai/report.md). Three runs of the golden
+suite with nothing changed between them; the table is run 1, the one the gate reads. **The gate failed on this
+run**: dev semantic pass 0.833 against a floor of 0.94. Every other gated metric passed, including the sealed
+split.
 
 | Split | n | Semantic pass | Fact coverage | Numeric groundedness | Citation validity | Gold source cited | Language match | Judge pass | p50 | p95 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| dev | 18 | 0.833 | 0.972 | 1.000 | 1.000 | 1.000 | 1.000 | 0.889 | 12.2 s | 25.1 s |
-| validation | 22 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 10.7 s | 16.0 s |
-| heldout (sealed) | 24 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 9.8 s | 27.1 s |
-| all | 64 | 0.953 | 0.992 | 1.000 | 1.000 | 1.000 | 1.000 | 0.969 | 10.7 s | 25.1 s |
+| dev | 18 | 0.833 | 0.963 | 1.000 | 1.000 | 1.000 | 1.000 | 0.889 | 16.0 s | 35.6 s |
+| validation | 22 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 11.8 s | 31.6 s |
+| heldout (sealed) | 24 | 0.958 | 0.958 | 1.000 | 1.000 | 1.000 | 1.000 | 0.958 | 10.9 s | 24.1 s |
+| all | 64 | 0.938 | 0.974 | 1.000 | 1.000 | 1.000 | 1.000 | 0.953 | 11.9 s | 26.4 s |
 
-Run-to-run variation (semantic pass per run, then the mean):
+Run-to-run variation (semantic pass per run, then the mean), raw and after adjudication:
 
-| Split | Run 1 | Run 2 | Run 3 | Mean |
-|---|---|---|---|---|
-| dev | 0.833 | 0.944 | 0.944 | 0.907 |
-| validation | 1.000 | 1.000 | 1.000 | 1.000 |
-| heldout (sealed) | 1.000 | 1.000 | 0.875 | 0.958 |
-| all | 0.953 | 0.984 | 0.938 | 0.958 |
+| Split | Run 1 | Run 2 | Run 3 | Mean | Adjudicated per run |
+|---|---|---|---|---|---|
+| dev | 0.833 | 0.889 | 0.889 | 0.870 | 0.889, 1.000, 0.944 |
+| validation | 1.000 | 1.000 | 0.955 | 0.985 | 1.000, 1.000, 0.955 |
+| heldout (sealed) | 0.958 | 0.917 | 0.917 | 0.931 | 0.958, 0.958, 0.958 |
+| all | 0.938 | 0.938 | 0.922 | 0.932 | 0.953, 0.984, 0.953 |
 
-Eight items failed in exactly one of the three runs; none failed twice. What each one was:
+Thirteen answers failed across the three runs. Each is reviewed in
+[eval/adjudications.jsonl](eval/adjudications.jsonl) against the stored evidence and tool calls, which this
+report is the first to keep:
 
-| Item | Run | What happened |
-|---|---|---|
-| g04 (dev) | 1 | Abstention worded in a way the fact list does not recognise |
-| g07 (dev) | 1 | Asked for EUR/BRL, answered with EUR/USD: a wrong answer |
-| g08 (dev) | 1 | **Judge mistake.** Correct outcome plus "keep selling with Pix or a Payment Link", which the judge called unsupported. The runbook chunk the answer's PIN-pad diagnosis comes from says exactly that |
-| g15 (dev) | 2 | **Judge mistake**, same sentence as g08 |
-| g12 (dev) | 3 | Left out the "connect to the store Wi-Fi" step the reference lists: an agent miss |
-| s04 (sealed) | 3 | Said the limit of devices per store is not documented; the corpus says 5. For the literal question BM25 ranks that passage first and the answer cites its page, so the passage was read and missed, and the Critic approved the false abstention |
-| s18 (sealed) | 3 | Answered the account half, not the battery charging time the FAQ states. An English query finds the FAQ passage in the top two; a Portuguese reformulation ("bateria") does not, and the Get Smart page says battery specifications are only in an image. The report did not store the search queries then, so which of the two happened is not known |
-| s22 (sealed) | 3 | **Grader mistake.** The answer ("entre na sua conta Getnet") is right and the judge passed it; the fact list does not include that phrasing. Left as a failure, as the protocol requires |
+| Item | Run | Cause | What happened |
+|---|---|---|---|
+| g01 (dev) | 1 | agent | Compared features but left out the rental prices (R$ 79.90 vs R$ 129.90); the judge passed it, the fact check did not |
+| g12 (dev) | 1 | agent | Left out the "connect to the store Wi-Fi" step again (it did in the 2026-11-14 report too) |
+| g15 (dev) | 1 | judge | Called "Pix or a Payment Link" unsupported; the stored judge evidence contains the runbook sentence that says it |
+| s04 (sealed) | 1 | agent | "No limit is published." Every search was a Portuguese reformulation, BM25 over the English corpus never returned the "up to 5 devices" passage, and it is absent from the evidence: a cross-lingual retrieval miss |
+| g08 (dev) | 2 | fact pattern | Says the re-key "has been scheduled under service order SO-…"; the pattern wants the word "approved" |
+| g18 (dev) | 2, 3 | fact pattern | "Telemetry did not return a decline code"; the pattern wants "no recent" |
+| s21 (sealed) | 2 | agent (output guard) | **System defect.** The output guard rewrote the official WhatsApp number +55 11 97694-6815 as "[redacted card number]": its 13 digits pass the Luhn check |
+| s23 (sealed) | 2 | fact pattern | "US$1 = R$5.6637"; the pattern wants the string "usd" |
+| g15 (dev) | 3 | agent | Never said the re-key was not approved, and appended connectivity troubleshooting nobody asked for |
+| h14 (validation) | 3 | agent | Gave R$ 10,000 as the waiver threshold without the caveat that another Getnet page says R$ 20,000 |
+| s21 (sealed) | 3 | agent | Relayed the operator's answer, then said "I can't connect you to a person" right after a person answered |
+| s24 (sealed) | 3 | fact pattern | Portuguese abstention ("não está publicado") against an English-only pattern |
 
-So the sealed split is 24/24 in two runs and 21/24 in the third, of which two are real misses and one is the
-grader. Across all three runs the review attributes four failures to the agent (g07, g12, s04, s18) and four to
-the graders (g04, s22 fact patterns; g08, g15 judge): the adjudicated dev rate is 0.944, 1.000 and 0.944 per
-run, against a raw 0.833, 0.944 and 0.944 ([adjudicated table](eval/reports/openai/report.md#adjudicated-failures-human-review-the-gate-reads-the-raw-numbers)).
-None of the eight has been fixed in this version, and the dev floor has not been lowered to make the gate pass.
+Seven are the system's (six model behaviours and one output-guard bug), one is the judge and five are fact
+patterns that missed a correct phrasing. The sealed split is 23/24 in every run once grader errors are set aside;
+its real misses are s04 (retrieval across languages) and s21 (the guard bug, then a misleading sentence). Dev
+stays below its floor even adjudicated in run 1 (0.889). None of the thirteen has been fixed, the dev floor has
+not been lowered, and sealed fact patterns are left as written.
 
-- Judge means (1-5, run 1): correctness 4.84, groundedness 4.94, relevance 4.86, helpfulness 4.67. No
+The previous measurement (2026-11-14, same prompts, before the harness kept evidence) is kept as
+[report-2026-11-14.md](eval/reports/openai/report-2026-11-14.md): raw dev 0.833 / 0.944 / 0.944, sealed
+1.000 / 1.000 / 0.875, eight failures (four agent, four grader). Two items recur across both measurements: g12
+(the Wi-Fi step) and s04 (the device limit).
+
+- Judge means (1-5, run 1): correctness 4.81, groundedness 4.97, relevance 4.92, helpfulness 4.67. No
   forbidden claim, no fabricated citation, no turn answered by the degraded fallback, routing as expected
-  1.000. Mean cost per turn USD 0.00175 at the configured prices (`PRICE_*_PER_MTOK`; set them to your
+  1.000. Mean cost per turn USD 0.00184 at the configured prices (`PRICE_*_PER_MTOK`; set them to your
   price list).
 - Judge calibration: 40 of 40 in agreement with the reference labels, Cohen's kappa 1.000, 0 false passes,
   0 false fails; per set, 16 of 16 on `original` and 24 of 24 on `independent` (questions that appear in no
@@ -620,7 +632,7 @@ A test fails if a rule names a metric the code does not emit.
 
 ## Testing strategy
 
-185 tests, all through public interfaces, no network and no key.
+187 tests, all through public interfaces, no network and no key.
 
 | File | What it proves |
 |---|---|
@@ -672,13 +684,21 @@ an LLM wrote is covered by the tests and the evaluation gate described above.
 
 ## Limitations
 
-- The committed model report (`2026-11-14`) is three runs of the golden suite and its gate failed on the dev
-  split in run 1 (0.833 against 0.94). Dev varied between 0.833 and 0.944 across the runs, so that floor,
-  set from an earlier single run, is tighter than the system's measured variance.
+- The committed model report (2026-11-16) fails its gate on the dev split in run 1 (0.833 against 0.94), and so did
+  the previous one (2026-11-14). Dev varies between 0.833 and 0.944 across six runs, and even adjudicated it is
+  0.889 in one run, so that floor, set from an earlier single run, is tighter than the system's measured variance.
+  It has not been lowered.
+- Known defects found by the 2026-11-16 run and not fixed in this version (fixing them changes answers, so it
+  waits for a new sealed split, see [ADR-0016](docs/adr/0016-sealed-held-out-and-independent-judge-calibration.md)):
+  the output guard's card-number check fires on a 13-digit phone number that happens to pass Luhn; Portuguese
+  reformulations of a search miss English-only passages (s04); the FX tool does not default to BRL; the Router
+  sometimes appends troubleshooting nobody asked for after a human decision; fact patterns miss correct
+  phrasings ("US$", "não está publicado", "no decline code").
 - The golden, adversarial and retrieval datasets are small (64, 68 and 42 items) and written by one person.
   They catch regressions and gross errors; they are not a statistically strong estimate of quality. The
   retrieval set has no held-out split and sits close to the ceiling.
-- Latency: in the reported run a turn takes 10.7 seconds at the median and 25.1 at p95. That is the price of a
+- Latency: in the reported run a turn takes 11.9 seconds at the median and 26.4 at p95 (35.6 s at p95 on the dev
+  split, where the human-review items are). That is the price of a
   classifier, a Router loop, specialist tool loops and a Critic run in sequence. `/chat/stream` shows progress
   while it runs but does not make the turn shorter; running the input classifier in parallel with the first
   Router step is the obvious next step and is not built. The final answer is not streamed token by token,
