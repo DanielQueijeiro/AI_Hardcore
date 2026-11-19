@@ -1,17 +1,17 @@
 {
-  "_comment": "Regression floors/ceilings enforced by `python -m eval.run --gate`. A gated metric missing from a suite that ran fails the gate. Splits: dev (g01-g18, used while writing prompts), validation (h01-h22 and s01-s24, former held-out splits that drove fixes per ADR-0016), heldout (s25-s48, sealed-2: authored blind after the v3 code freeze at 17ec60d, ADR-0022). Offline values are the measured results of the deterministic policy (CI gate; it is extractive and answers in English, so non-English items fail language match). The openai floors for dev, validation and the judge come from the measured model runs, a little below them because a model run varies by one or two items. The openai floors for heldout (0.80) and critic.by_set.heldout (recall >= 0.85, false_revise_rate <= 0.25) were fixed before either split was ever run against the model and are not adjusted afterwards. Golden metrics are gated over every run of --repeat N (ADR-0019): floor met by the mean and no run more than one item below it; ceilings met by every run. Retrieval heldout (rh01-rh36): written after the glossary, which was not edited for them; its floors are the measured values (ADR-0020).",
+  "_comment": "Regression floors/ceilings enforced by `python -m eval.run --gate`. A gated metric missing from a suite that ran fails the gate. Splits: dev (g01-g18, used while writing prompts), validation (h01-h22 and s01-s48, former held-out splits that drove fixes per ADR-0016, ADR-0022 and ADR-0023), heldout (s49-s72, sealed-3: authored blind after the 26be3c3 code freeze, ADR-0023). Offline values are the measured results of the deterministic policy (CI gate; it is extractive and answers in English, so non-English items fail language match). The openai floors for dev, validation and the judge come from the measured model runs, a little below them because a model run varies by one or two items. The openai floors for heldout (0.80), critic.by_set.heldout (recall >= 0.85, false_revise_rate <= 0.25) and calibration.by_set.borderline (agreement >= 0.75) were fixed before those splits were ever run against the model and are not adjusted afterwards. Golden metrics are gated over every run of --repeat N (ADR-0019): floor met by the mean and no run more than one item below it; ceilings met by every run. Retrieval heldout (rh01-rh36): written after the glossary, which was not edited for them; its floors are the measured values (ADR-0020).",
   "offline": {
     "min": {
       "retrieval.modes.bm25.mrr": 0.93,
       "retrieval.modes.bm25.recall@4": 0.97,
       "retrieval.modes.hybrid.recall@4": 0.95,
       "golden.all.citation_validity": 1.0,
-      "golden.all.language_match_rate": 0.69,
+      "golden.all.language_match_rate": 0.62,
       "golden.all.numeric_groundedness": 1.0,
       "golden.all.routing_ok_rate": 0.87,
       "golden.dev.semantic_pass_rate": 1.0,
-      "golden.heldout.semantic_pass_rate": 0.66,
-      "golden.validation.semantic_pass_rate": 0.71,
+      "golden.heldout.semantic_pass_rate": 0.54,
+      "golden.validation.semantic_pass_rate": 0.7,
       "critic.recall": 0.12,
       "critic.by_set.heldout.recall": 0.12,
       "retrieval.heldout.modes.bm25.recall@4": 0.7
