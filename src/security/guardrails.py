@@ -92,7 +92,11 @@ _SECRET_PATTERNS = (
 # official WhatsApp number +55 11 97694-6815 (13 digits) was redacted as a card in the 2026-11-16 run.
 _CPF = re.compile(r"(?<!\d)\d{3}\.\d{3}\.\d{3}-\d{2}(?!\d)")
 _CNPJ = re.compile(r"(?<!\d)\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}(?!\d)")
-_CARD_CANDIDATE = re.compile(r"(?<![\d.,])\d(?:[ -]?\d){12,18}(?![\d.,])")
+# Digit groups joined by single spaces or dashes. A '.' or ',' ends the run only when it is punctuation: next to a
+# digit it continues a decimal amount ("1.067,00"), so such a run is not a candidate. A sentence-final "4111 1111
+# 1111 1111." escaped redaction while this lookahead also refused a '.' or ',' followed by a space.
+_DIGIT_RUN = re.compile(r"(?<!\d)(?<!\d[.,])\d+(?:[ -]\d+)*(?!\d)(?![.,]\d)")
+_DIGIT_GROUP = re.compile(r"\d+")
 # Country code, area code, then a 4-5 digit block and a 4 digit block joined by a dash: 55 11 97694-6815.
 _PHONE_LAYOUT = re.compile(r"^(?:\d{1,3} )?\d{2} \d{4,5}-\d{4}$")
 
@@ -129,18 +133,34 @@ def _luhn_valid(digits: str) -> bool:
 def redact_personal_identifiers(text: str) -> str:
     text = _CNPJ.sub("[redacted CNPJ]", _CPF.sub("[redacted CPF]", text))
 
-    def card(match: re.Match[str]) -> str:
-        raw = match.group(0)
+    def is_card(start: int, raw: str) -> bool:
         digits = re.sub(r"\D", "", raw)
-        is_card = (
+        return (
             13 <= len(digits) <= 19
             and _luhn_valid(digits)
             and _issuer_allows(digits)
-            and not _written_as_phone(match.string, match.start(), raw, digits)
+            and not _written_as_phone(text, start, raw, digits)
         )
-        return "[redacted card number]" if is_card else raw
 
-    return _CARD_CANDIDATE.sub(card, text)
+    def cards_in(run: re.Match[str]) -> list[tuple[int, int]]:
+        """Spans of card numbers inside one run of digit groups. A card can share the run with digits around it
+        ("ID 7 4111 1111 1111 1111"), so every window of whole groups is tried, longest first from each start."""
+        groups = list(_DIGIT_GROUP.finditer(run.group(0)))
+        spans, i = [], 0
+        while i < len(groups):
+            for j in range(len(groups) - 1, i - 1, -1):
+                start, end = run.start() + groups[i].start(), run.start() + groups[j].end()
+                if is_card(start, text[start:end]):
+                    spans.append((start, end))
+                    i = j
+                    break
+            i += 1
+        return spans
+
+    spans = [span for run in _DIGIT_RUN.finditer(text) for span in cards_in(run)]
+    for start, end in reversed(spans):
+        text = text[:start] + "[redacted card number]" + text[end:]
+    return text
 
 
 _ORCHESTRATION_TOOL_PATTERN = re.compile(

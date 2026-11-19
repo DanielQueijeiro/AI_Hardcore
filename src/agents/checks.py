@@ -242,7 +242,7 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
         if observation.get("proposed_action") and observation.get("decision") == "approve":
             items += _decline_code_items(draft, observations)
             # g08: the approved re-key answer went on to offline troubleshooting the merchant had not asked about.
-            if _CONNECTIVITY.search(draft) and not _CONNECTIVITY.search(message + " " + note) and not re.search(
+            if _mentions_connectivity(draft) and not _mentions_connectivity(message + " " + note) and not re.search(
                 r"internet|connect|conex|conect|sinal|signal|rede|network|red\b", message, re.I
             ):
                 items.append(
@@ -343,7 +343,17 @@ _HANDOFF_OFFER = re.compile(
     r"|human (?:specialist|agent|operator)|especialista humano|atendente humano|agente humano|operador humano)\b",
     re.I,
 )
-_CONNECTIVITY = re.compile(r"\b(?:wi-?fi|sim|chip|communication test|teste de comunica\w*|prueba de comunica\w*|offline)\b", re.I)
+_CONNECTIVITY_WORDS = re.compile(
+    r"\b(?:wi-?fi|sim\s*(?:card|chip|[12])|(?:chip|cart[aã]o|tarjeta)\s+sim|chip|communication test|teste de comunica\w*"
+    r"|prueba de comunica\w*|offline)\b",
+    re.I,
+)
+# "SIM" alone only in capitals: Portuguese "sim" (yes) opens many answers ("Sim, o re-key foi aprovado").
+_SIM = re.compile(r"\bSIM\b")
+
+
+def _mentions_connectivity(text: str) -> bool:
+    return bool(_CONNECTIVITY_WORDS.search(text) or _SIM.search(text))
 
 
 def _nothing_to_escalate_items(message: str, draft: str, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:

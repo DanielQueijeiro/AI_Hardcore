@@ -282,6 +282,59 @@ def test_output_guard_does_not_take_a_luhn_valid_phone_number_for_a_card():
     assert not tool_verdict.allowed and tool_verdict.category == "prompt_leak"
 
 
+def _luhn_complete(body: str) -> str:
+    """Append the check digit that makes `body` Luhn-valid."""
+    from src.security.guardrails import _luhn_valid
+
+    return next(body + d for d in "0123456789" if _luhn_valid(body + d))
+
+
+def _layouts(pan: str) -> list[str]:
+    four = " ".join(pan[i : i + 4] for i in range(0, len(pan), 4))
+    layouts = [pan, four, four.replace(" ", "-")]
+    if len(pan) == 15:  # Amex is printed 4-6-5
+        layouts.append(f"{pan[:4]} {pan[4:10]} {pan[10:]}")
+    return layouts
+
+
+def test_output_guard_redacts_every_card_layout_whatever_surrounds_it():
+    # Property-style: every scheme length x every printed layout x every prefix and closing punctuation. A sentence-final
+    # "4111 1111 1111 1111." and "ID 7 4111 1111 1111 1111" both escaped redaction before (follow-up review, 2026-11-19).
+    import random
+
+    rng = random.Random(20261119)
+    schemes = [("4", 16), ("4", 13), ("51", 16), ("55", 16), ("2221", 16), ("34", 15), ("37", 15), ("36", 14), ("6062", 16), ("6011", 19)]
+    pans = [_luhn_complete(p + "".join(rng.choice("0123456789") for _ in range(n - len(p) - 1))) for p, n in schemes for _ in range(3)]
+    befores = ["", "card ", "Card: ", "(", "nº ", "#", "ID 7 ", "cartão ", "tarjeta: ", "'", "\n"]
+    afters = ["", ".", ",", ";", ":", ")", "!", "?", "'", " ", "\n", ". Next sentence.", ", expiring 12/29."]
+    for pan in pans:
+        for layout in _layouts(pan):
+            for before in befores:
+                for after in afters:
+                    sentence = f"Your {before}{layout}{after}"
+                    answer, verdict = check_output(sentence, MERCHANT)
+                    assert verdict.category == "redacted_pii" and pan not in answer.replace(" ", "").replace("-", ""), sentence
+
+
+def test_output_guard_leaves_numbers_that_are_not_cards_alone_whatever_surrounds_them():
+    import random
+
+    rng = random.Random(7)
+    not_cards = [
+        "R$ 1.067,00", "R$ 2,524.60", "R$ 4.111.111.111.111,11", "4111 1111 1111 1112", "0800 648 8000", "4002-4000",
+        "+55 11 97694-6815", "55 11 97694-6815", "TX-88410", "POS-GS-99812", "2026-11-19", "12/29", "60,000", "3.79%",
+    ]
+    # Luhn-invalid neighbours of real card numbers are not cards either.
+    for _ in range(40):
+        pan = _luhn_complete("4" + "".join(rng.choice("0123456789") for _ in range(14)))
+        not_cards.append(pan[:-1] + str((int(pan[-1]) + rng.randint(1, 9)) % 10))
+    for number in not_cards:
+        for after in ("", ".", ",", ")", ". More text."):
+            sentence = f"Reference {number}{after}"
+            answer, verdict = check_output(sentence, MERCHANT)
+            assert answer == sentence and verdict.category == "safe", sentence
+
+
 def test_specialist_degraded_flag_propagates_and_prevents_language_rewrite_loop(make_client):
     from src.llm.offline import OfflinePolicyLLM
     from src.llm.resilient import ResilientLLM

@@ -466,6 +466,11 @@ def test_checklist_flags_a_handoff_offer_when_there_is_nothing_to_escalate():
     wandering = focused + " The terminal is also offline: reconnect it to Wi-Fi and run the communication test."
     assert "Leave out connectivity troubleshooting" in evidence_checklist(message, wandering, decided)[-1]["item"]
     assert len(evidence_checklist("My machine won't connect and shows a decline error.", wandering, decided)) == 1
+    # Portuguese "Sim" (yes) is not the SIM card (follow-up review, 2026-11-19).
+    sim_yes = "Sim, o re-key foi aprovado para o código A / B e a ordem de serviço SO-1 foi criada."
+    assert len(evidence_checklist("Minha maquininha mostra um erro de recusa.", sim_yes, decided)) == 1, "only the decision item"
+    reseat = focused + " Then reseat the SIM and reboot."
+    assert "Leave out connectivity troubleshooting" in evidence_checklist(message, reseat, decided)[-1]["item"]
 
 
 def test_fx_quote_defaults_to_reais(monkeypatch, client):
