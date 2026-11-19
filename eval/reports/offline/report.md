@@ -1,9 +1,9 @@
 # Evaluation report (offline)
 
-- Generated: 2026-11-19T04:11:45+00:00
+- Generated: 2026-11-19T06:01:21+00:00
 - Answering model: `offline-rule-policy`; judge: `none`
 - Live web tools: off (answers must say live data is unavailable)
-- Code: `1b489cf2d046`; input hashes in `provenance` of the JSON report
+- Code: `7d2fd22c258c`; input hashes in `provenance` of the JSON report
 
 > This run used the deterministic offline policy, not a language model. It is the CI regression gate: it
 > proves the pipeline, tools, guardrails, memory and human-review flow work and that answers stay grounded.
@@ -76,10 +76,10 @@ Held-out queries with no relevant chunk in the top 4 (bm25): rh07, rh18, rh25, r
 
 | Split | n | Semantic pass | Fact coverage | Forbidden claims | Numeric groundedness | Citation validity | Language match | Gold source cited | Judge pass | Routing as expected | p50 ms | p95 ms | Mean cost USD |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| dev | 18 | 1.000 | 1.000 | 0.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 18 | 27 | 0.00000 |
-| validation | 46 | 0.717 | 0.728 | 0.000 | 1.000 | 1.000 | 0.696 | 0.703 | n/a | 0.891 | 18 | 27 | 0.00000 |
-| heldout | 24 | 0.667 | 0.790 | 0.000 | 1.000 | 1.000 | 0.458 | 0.812 | n/a | 0.833 | 19 | 32 | 0.00000 |
-| all | 88 | 0.761 | 0.801 | 0.000 | 1.000 | 1.000 | 0.693 | 0.770 | n/a | 0.898 | 19 | 27 | 0.00000 |
+| dev | 18 | 1.000 | 1.000 | 0.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 18 | 28 | 0.00000 |
+| validation | 70 | 0.700 | 0.750 | 0.000 | 1.000 | 1.000 | 0.614 | 0.736 | n/a | 0.871 | 20 | 27 | 0.00000 |
+| heldout | 24 | 0.542 | 0.745 | 0.000 | 1.000 | 1.000 | 0.375 | 0.750 | n/a | 0.792 | 19 | 30 | 0.00000 |
+| all | 112 | 0.714 | 0.789 | 0.000 | 1.000 | 1.000 | 0.625 | 0.766 | n/a | 0.875 | 19 | 30 | 0.00000 |
 
 Semantic pass = every required fact present, no forbidden claim, every number in the answer found in the collected evidence, no fabricated citation, expected status, and the judge's pass when a judge ran. Routing is reported but does not count. Language match (answer written in the merchant's language) is reported and gated on its own.
 
@@ -109,20 +109,38 @@ Semantic pass = every required fact present, no forbidden claim, every number in
 | s22 | validation | answered in en, asked in pt |
 | s23 | validation | missing facts: usd |
 | s24 | validation | missing facts: does not (publish/list/state/specify/mention/say/give/provide/show); answered in en, asked in pt |
-| s26 | heldout | missing facts: \b30\s*dias?; answered in en, asked in pt |
-| s27 | heldout | missing facts: aproximaci[oó]n/aproxima[cç][aã]o/contactless/sin\s*contacto/acercamiento, biometr[ií]a/biom[eé]tric, get\s*tap, qr, e-?commerce/comercio\s*electr[oó]nico/tef; answered in en, asked in es |
-| s32 | heldout | missing facts: \brne\b, shipping/frete, multiple/several/same\s*cart/one\s*cart/cart |
-| s34 | heldout | missing facts: compra/pre[cç]o/aquis/purchase/price; answered in en, asked in pt |
-| s35 | heldout | answered in en, asked in es |
-| s37 | heldout | missing facts: padaria.*ga[uú]cho/padaria, porto\s*alegre; answered in en, asked in pt |
-| s38 | heldout | answered in en, asked in es |
-| s40 | heldout | missing facts: \b4\s*vezes/quatro\s*vezes/\b4\b; answered in en, asked in pt |
-| s41 | heldout | missing facts: habilitad/activ/s[ií]\b/sim\b/enabled/true, 4003[-\s]?5025, cualquier\s*d[ií]a/todos\s*los\s*d[ií]as/24/cualquier\s*hora/todo\s*horario/qualquer\s*dia/cualquier\s*momento/any\s*day; answered in en, asked in es |
-| s43 | heldout | answered in en, asked in pt |
-| s44 | heldout | answered in en, asked in es |
-| s46 | heldout | answered in en, asked in es |
-| s47 | heldout | answered in en, asked in es |
-| s48 | heldout | missing facts: rio\s*de\s*janeiro; answered in en, asked in pt |
+| s26 | validation | missing facts: \b30\s*dias?; answered in en, asked in pt |
+| s27 | validation | missing facts: aproximaci[oó]n/aproxima[cç][aã]o/contactless/sin\s*contacto/acercamiento, biometr[ií]a/biom[eé]tric, get\s*tap, qr, e-?commerce/comercio\s*electr[oó]nico/tef; answered in en, asked in es |
+| s32 | validation | missing facts: \brne\b, shipping/frete, multiple/several/same\s*cart/one\s*cart/cart |
+| s34 | validation | missing facts: compra/pre[cç]o/aquis/purchase/price; answered in en, asked in pt |
+| s35 | validation | answered in en, asked in es |
+| s37 | validation | missing facts: padaria.*ga[uú]cho/padaria, porto\s*alegre; answered in en, asked in pt |
+| s38 | validation | answered in en, asked in es |
+| s40 | validation | missing facts: \b4\s*vezes/quatro\s*vezes/\b4\b; answered in en, asked in pt |
+| s41 | validation | missing facts: habilitad/activ/s[ií]\b/sim\b/enabled/true, 4003[-\s]?5025, cualquier\s*d[ií]a/todos\s*los\s*d[ií]as/24/cualquier\s*hora/todo\s*horario/qualquer\s*dia/cualquier\s*momento/any\s*day; answered in en, asked in es |
+| s43 | validation | answered in en, asked in pt |
+| s44 | validation | answered in en, asked in es |
+| s46 | validation | answered in en, asked in es |
+| s47 | validation | answered in en, asked in es |
+| s48 | validation | missing facts: rio\s*de\s*janeiro; answered in en, asked in pt |
+| s50 | heldout | answered in en, asked in pt |
+| s51 | heldout | missing facts: no (?:se )?puede combin/no puede (?:combinarse/ser combinad)/no (?:se )?combina/no (?:es )?combinable/no (?:es )?acumulable/cannot be combined/can't be combined/not combinable/n[aã]o (?:pode ser combinad/cumulativ/acumul[aá]vel); answered in en, asked in es |
+| s52 | heldout | answered in en, asked in pt |
+| s53 | heldout | missing facts: product'?s? image/image of (?:the/your) product/imagem do produto/with an? image/personaliz.*image/photo/foto |
+| s54 | heldout | missing facts: emisor/emissor/issuer, simulaci[oó]n/simula[cç][aã]o/simulation/simular; answered in en, asked in es |
+| s56 | heldout | missing facts: \bcpf\b, \bcnpj\b; answered in en, asked in pt |
+| s58 | heldout | answered in en, asked in es |
+| s59 | heldout | answered in en, asked in pt |
+| s60 | heldout | missing facts: bistr[oô]\s+moinhos\s+de\s+vento, porto\s+alegre, \bnot\s+(?:currently\s+)?(?:active/enabled)\b/\binactive\b/\bdisabled\b/receivables advance\s+is\s+(?:not/off/inactive/disabled)/\bno\b.{0,25}receivables advance |
+| s61 | heldout | answered in en, asked in pt |
+| s62 | heldout | missing facts: no (?:tiene/hay/registra/presenta/se registran/constan).{0,35}(?:rechaz/declin)/sin rechazos/ning[uú]n rechazo/no recent.{0,25}declin/no.{0,25}declined transactions/\bnone\b/nenhum; answered in en, asked in es |
+| s63 | heldout | missing facts: pos-gs-99812, d[eé]bit |
+| s64 | heldout | missing facts: bistr[oô]\s+moinhos\s+de\s+vento, ita[uú], \b341\b, 104-?2/04-?2; answered in en, asked in pt |
+| s65 | heldout | missing facts: 150, cashback/giftback/stock/inventario/estoque/gesti[oó]n/gest[aã]o/management; answered in en, asked in es |
+| s67 | heldout | answered in en, asked in pt |
+| s68 | heldout | missing facts: (?:1/un/um/one)\s*(?:d[ií]a\s*(?:corrido/calendario/natural)/calendar\s*day), \b5\b/cinco, \b20\b/veinte; answered in en, asked in es |
+| s69 | heldout | answered in en, asked in pt |
+| s72 | heldout | missing facts: \bgbp\b/libra/pound/£, \bbrl\b/real/reais/r\$, \b\d+[.,]\d{2,4}\b/no (?:est[aá] disponible/puedo consultar/pude obtener/fue posible)/indispon[ií]vel/unavailable/could not (?:fetch/retrieve/get)/offline/disabled/desactivad/desabilitad/error; answered in en, asked in es |
 
 ## Adversarial
 
