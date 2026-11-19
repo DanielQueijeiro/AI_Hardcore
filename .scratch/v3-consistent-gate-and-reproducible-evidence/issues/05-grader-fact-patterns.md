@@ -7,9 +7,9 @@ published.
 
 **Blocked by:** none
 
-**Status:** dev part resolved; s23/s24 moved to 11
+**Status:** resolved
 
 - [x] g08 accepts "scheduled" (and PT/ES forms) as the approval fact.
 - [x] g18 accepts "no decline code" and "did not return ... decline".
-- [ ] s23 accepts "US$"; s24 accepts the Portuguese abstention. **Moved to 11**: while s01-s24 are labelled `heldout`, ADR-0016 says their patterns stay as written. They are corrected in the same change that relabels them `validation`.
+- [x] s22 ("entre na sua conta"), s23 ("US$") and s24 (Portuguese abstention "não está publicado") corrected in the same change that relabels s01-s24 to `validation` (issue 11, ADR-0022).
 - [x] The fact check over every stored answer of the 2026-11-16 report (3 runs x 64) changes exactly three verdicts, all adjudicated as "fact pattern": g08 run 2, g18 runs 2 and 3. No pass became a fail. (Done with `eval.metrics.fact_coverage` directly; `--regrade` would also re-run the judge, which needs the key.)

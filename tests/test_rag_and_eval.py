@@ -451,3 +451,14 @@ def test_markdown_report_renders_heldout_retrieval_glossary_ablation_borderline_
     assert "### Held-out queries, glossary off" in md
     assert "Human agreement | Human kappa" in md and "0.850 | 0.700" in md
     assert "Cassette (replay): `eval/reports/openai/cassette.json.gz`" in md
+
+
+def test_critic_calibration_reports_dev_and_heldout_separately(settings):
+    from eval.run import render_markdown, run_critic
+
+    result = run_critic(settings)
+    assert set(result["by_set"]) == {"dev", "heldout"}
+    assert result["by_set"]["dev"]["n"] == 32 and result["by_set"]["heldout"]["n"] == 16
+    assert result["by_set"]["heldout"]["recall"] == 0.125 and result["by_set"]["heldout"]["false_revise_rate"] == 0.0
+    md = render_markdown({"mode": "offline", "model": "m", "judge_model": "none", "live_web": False, "generated_at": "now", "critic": result})
+    assert "| Set | n | Recall | False revise |" in md and "| heldout | 16 | 0.125 | 0.000 |" in md

@@ -561,6 +561,7 @@ def run_critic(settings: Settings) -> dict[str, Any]:
             rows.append(
                 {
                     "id": item["id"],
+                    "set": item.get("set", "dev"),
                     "defect": item["defect"],
                     "expect": item["expect"],
                     "verdict": review["verdict"],
@@ -571,17 +572,23 @@ def run_critic(settings: Settings) -> dict[str, Any]:
             )
     finally:
         h.close()
-    defective = [r for r in rows if r["expect"] == "revise"]
-    clean = [r for r in rows if r["expect"] == "approve"]
+    def _critic_stats(subset: list[dict[str, Any]]) -> dict[str, Any]:
+        defective = [r for r in subset if r["expect"] == "revise"]
+        clean = [r for r in subset if r["expect"] == "approve"]
+        return {
+            "n": len(subset),
+            "recall": round(m.mean([float(r["verdict"] == "revise") for r in defective]), 4) if defective else None,
+            "false_revise_rate": round(m.mean([float(r["verdict"] == "revise") for r in clean]), 4) if clean else None,
+            "by_defect": {
+                d: {"n": len(group), "caught": sum(r["verdict"] == "revise" for r in group)}
+                for d in sorted({r["defect"] for r in defective})
+                for group in [[r for r in defective if r["defect"] == d]]
+            },
+        }
+
     return {
-        "n": len(rows),
-        "recall": round(m.mean([float(r["verdict"] == "revise") for r in defective]), 4) if defective else None,
-        "false_revise_rate": round(m.mean([float(r["verdict"] == "revise") for r in clean]), 4) if clean else None,
-        "by_defect": {
-            d: {"n": len(group), "caught": sum(r["verdict"] == "revise" for r in group)}
-            for d in sorted({r["defect"] for r in defective})
-            for group in [[r for r in defective if r["defect"] == d]]
-        },
+        **_critic_stats(rows),
+        "by_set": {name: _critic_stats([r for r in rows if r["set"] == name]) for name in sorted({r["set"] for r in rows})},
         "rows": rows,
     }
 
@@ -1041,9 +1048,18 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines += [
             "## Critic calibration",
             "",
-            f"{c['n']} fixed drafts (development set). Recall on drafts with a planted defect: **{c['recall']:.3f}**; "
+            f"{c['n']} fixed drafts. Recall on drafts with a planted defect: **{c['recall']:.3f}**; "
             f"clean drafts sent back (false revise): **{c['false_revise_rate']:.3f}**.",
             "",
+        ]
+        if c.get("by_set") and len(c["by_set"]) > 1:
+            lines += ["| Set | n | Recall | False revise |", "|---|---|---|---|"]
+            for name, s in c["by_set"].items():
+                rec = f"{s['recall']:.3f}" if s["recall"] is not None else "n/a"
+                fr = f"{s['false_revise_rate']:.3f}" if s["false_revise_rate"] is not None else "n/a"
+                lines.append(f"| {name} | {s['n']} | {rec} | {fr} |")
+            lines.append("")
+        lines += [
             "| Defect | n | Caught |",
             "|---|---|---|",
             *(f"| {d} | {v['n']} | {v['caught']} |" for d, v in c["by_defect"].items()),

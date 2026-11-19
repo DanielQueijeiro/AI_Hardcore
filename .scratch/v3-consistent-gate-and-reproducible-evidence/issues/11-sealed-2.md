@@ -6,9 +6,9 @@ s01-s24 is relabelled `validation` (ADR-0016's own rule: a split that drove a fi
 
 **Blocked by:** 01-07 (freeze first)
 
-**Status:** needs-info (author: an outside person, or a different model family declared as such)
+**Status:** resolved ([ADR-0022](../../../docs/adr/0022-sealed-2-and-critic-heldout-after-v3-freeze.md))
 
-- [ ] s01-s24 relabelled `validation` (baseline floors moved accordingly, the README says when and why); in the same change correct s23 ("US$") and s24 (Portuguese abstention), from issue 05.
-- [ ] 24+ items covering the same categories as s01-s24, including compound, HITL and cross-lingual cases.
-- [ ] Authorship and date recorded; dataset hash in the first report.
-- [ ] No prompt or code change after the first sealed-2 run without relabelling it.
+- [x] s01-s24 relabelled `validation` (offline floors updated to measured offline policy; openai floors untouched); in the same change corrected s22 ("entre na sua conta"), s23 ("US$") and s24 (Portuguese abstention), from issue 05.
+- [x] 24 new items (`s25`-`s48`) covering product, abstention, conflict, account, compound, multi-turn memory, HITL (answer/reject in PT/ES), anonymous identity (ES) and live weather (PT), plus 16 held-out Critic calibration items (`k33`-`k48`, 8 defects + 8 clean, `set: "heldout"`), authored blind after the `17ec60d` freeze by an isolated Gemini subagent given only `data/corpus/*.md` and `support_store.py`.
+- [x] Authorship, freeze commit SHA (`17ec60d0cce6`), date and dataset SHA-256 hashes recorded in [ADR-0022](../../../docs/adr/0022-sealed-2-and-critic-heldout-after-v3-freeze.md); model floors locked in `eval/baseline.json` before running the model.
+- [x] No prompt or answer-shaping code change after `17ec60d`.

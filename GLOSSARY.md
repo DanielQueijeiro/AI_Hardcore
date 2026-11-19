@@ -125,3 +125,11 @@ _Avoid_: Test set, held-out (unqualified)
 **Adjudication**:
 A human review of one failed answer, tied to that exact answer, naming who was wrong: the agent, the judge, the fact patterns or the harness. It explains a failure; the gate never reads it.
 _Avoid_: Override, correction
+
+**Cassette**:
+A compressed recording (`.json.gz`) of every non-deterministic exchange in a model evaluation (agent/Critic/judge completions, live tool outputs, hosted embeddings) plus its frozen date and settings, allowing anyone to replay the full evaluation offline without an API key and verify exact reproduction (`eval.compare`).
+_Avoid_: Mock, stub, fixture
+
+**Evidence checklist**:
+Deterministic items extracted in code from a Turn's raw Evidence (human decisions, numbered procedure steps, unambiguous product prices) that the Critic must rule on individually (`in_draft`, `not_applicable`, or `must_add`).
+_Avoid_: Prompt hint, heuristic list

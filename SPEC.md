@@ -1,10 +1,12 @@
-# System Specification v2 — Getnet Multi-Agent Support System
+# System Specification v3 — Getnet Multi-Agent Support System
 
 > Methodology: Spec-Driven Development. This document is the contract the code and the tests are written against.
 > Vocabulary: [GLOSSARY.md](./GLOSSARY.md) · Decisions: [docs/adr/](./docs/adr/) · Work items: [.scratch/](./.scratch/)
 >
-> v2 replaces the v1 specification after the first review (7.4/10). v1 specified deterministic routing by state
-> flags, body-supplied identity, a ticket-only handoff and a structural benchmark. Each is reversed here.
+> v2 replaced v1 after the first review (7.4/10). v3 addresses the second review (9.3/10): parallel orchestration
+> (`speculative_router`, `delegate_parallel`), evidence-anchored Critic completeness checks + calibration, hosted
+> dense retrieval chosen on a held-out query split (ADR-0020), repeated-run gating (ADR-0019), and replayable
+> model evaluations via cassettes (ADR-0021).
 
 ## 1. Scope
 
@@ -79,17 +81,22 @@ Owns the conversation. Each step reads memory, the message and all observations,
 |---|---|
 | `delegate_knowledge` | `thought`, `task`, `remaining_plan` |
 | `delegate_support` | `thought`, `task`, `remaining_plan` |
+| `delegate_parallel` | `thought`, `tasks` (2–3 independent `{agent, task}` subtasks run concurrently), `remaining_plan` |
 | `escalate_to_human` | `thought`, `reason` (`approval_required`, `customer_request`, `unresolved`), `question`, `proposed_action` (`none`, `terminal_rekey_or_swap`), `remaining_plan` |
 | `finish` | `answer`, `confidence` |
 
-Required behaviour: decompose compound messages; write self-contained tasks (specialists do not see the
-conversation); re-plan after each observation; stop when the question is covered; answer only from
-observations and earlier turns; cite the sources the Knowledge Agent reported; answer in the merchant's language.
+Required behaviour: decompose compound messages (independent subtasks concurrently via `delegate_parallel`,
+dependent subtasks sequentially); write self-contained tasks (specialists do not see the conversation); re-plan
+after each observation; stop when the question is covered; answer only from observations and earlier turns; cite
+the sources the Knowledge Agent reported; answer in the merchant's language. Router and specialist prompts carry
+today's date (Brasília time, frozen during cassette replay).
 
 ### 4.2 Knowledge Agent
 
-Tools: `search_getnet_knowledge`, `get_fx_rate`, `get_weather_forecast`, `web_search`. Runs a tool loop, must
-reconsider after a `poor` relevance rating (reformulate or switch tool), and ends with
+Tools: `search_getnet_knowledge(query, query_en?)`, `get_fx_rate(base, quote="BRL")`, `get_weather_forecast(city)`,
+`web_search(query)`. `search_getnet_knowledge` keeps the primary query's top-k and also searches `query_en` and
+the merchant's original message (up to 2 interleaved extra passages, embeddings batched in one call). Runs a tool
+loop, must reconsider after a `poor` relevance rating (reformulate or switch tool), and ends with
 `report(answer, sources, confidence, gaps)`. Sources not returned by a tool are removed by code.
 
 ### 4.3 Customer Support Agent
@@ -104,8 +111,12 @@ graph interrupts. On resume the human decision is returned to the Router as an o
 
 ### 4.5 Critic
 
-Reviews the draft against the evidence with `review(verdict, grounded, complete, issues, needs_more_evidence)`.
-Receives two automatic findings: numbers absent from the evidence and URLs no tool returned.
+Reviews the draft against the evidence with `review(verdict, grounded, complete, parts, checklist, issues, needs_more_evidence)`.
+Receives three automatic checks extracted in code: numbers absent from the evidence, URLs no tool returned, and
+an `evidence_checklist` (human decisions this turn, numbered procedure steps, and unambiguous product prices).
+Any unanswered question part or `must_add` checklist item forces `revise` in code regardless of the model's
+overall verdict; a grounded `revise` naming no issue, missing part, `must_add` item or research need is treated
+as an approval.
 
 ## 5. Bounds (enforced in code)
 
@@ -120,7 +131,8 @@ Receives two automatic findings: numbers absent from the evidence and URLs no to
 | B7 | Graph recursion | 60 | Hard stop |
 | B8 | Draft in a language other than the merchant's (EN/PT/ES, detected in code) | — | Revision forced regardless of the Critic's verdict (model-written drafts) |
 | B9 | Critic returns no review | — | The deterministic checks decide: an unsupported number or unreturned URL forces a revision |
-| B10 | Tool calls per model step | 1 | Parallel tool calls are disabled |
+| B10 | Tool calls per model step | 1 | Parallel tool calls are disabled (`delegate_parallel` caps concurrent branches at `MAX_PARALLEL_TASKS=3` and counts as one Router step) |
+| B11 | Speculative first Router step | on (`SPECULATIVE_ROUTER=true`) | Runs only after the deterministic input screen passes, concurrently with the LLM classifier; discarded without waiting if the classifier blocks, never reaching side-effect tools |
 
 ## 6. Memory
 
@@ -156,7 +168,7 @@ Ticket states: `OPEN → CLAIMED → APPROVED | REJECTED | ANSWERED`, or `OPEN |
 
 - G1. Input: deterministic screen on normalized/decoded views, then an LLM classifier that fails open to it.
 - G2. Retrieved passages, web results and operator notes are sanitized and presented as tagged data.
-- G3. Output: prompt canary, other tenants' identifiers and credential-shaped strings are blocked or redacted; formatted CPF/CNPJ and card numbers (Luhn-valid) are redacted.
+- G3. Output: prompt canary, internal orchestration symbols (including `delegate_parallel`), other tenants' identifiers and credential-shaped strings are blocked or redacted; formatted CPF/CNPJ and issuer/length-validated Luhn card numbers (excluding phone layouts and E.164 `+` numbers up to 15 digits) are redacted.
 - G4. A live tool that cannot reach its source returns `available: false`; no canned values exist.
 - G5. Ordinary merchant wording is not blocked: the benign control set is part of the adversarial suite and its false-positive rate is gated.
 - G6. Live sources are called through a short cache, one retry with backoff for transient failures (never a 4xx) and a circuit breaker per source.
@@ -164,9 +176,11 @@ Ticket states: `OPEN → CLAIMED → APPROVED | REJECTED | ANSWERED`, or `OPEN |
 
 ## 9. Knowledge base
 
-Curated Markdown per source page with `source_url`, `origin`, `retrieved_at`; chunked by section; retrieval
-modes `bm25`, `dense`, `hybrid`; each hit carries a coverage score. The default mode is whichever the retrieval
-evaluation supports (currently `bm25`).
+Curated Markdown per source page with `source_url`, `origin`, `retrieved_at` (with explicit `Curation note:`
+cross-references wherever two Getnet pages contradict each other); chunked by section; retrieval modes `bm25`,
+`dense`, `hybrid`; each hit carries a coverage score. `RETRIEVAL_MODE` and `EMBEDDING_PROVIDER` default to `auto`
+(ADR-0020): hosted `text-embedding-3-small` + `dense` when `OPENAI_API_KEY` is set (degrading to `bm25` on an
+embeddings outage), and the keyless hashing embedder + `bm25` otherwise.
 
 Fixture data (SQLite): merchants `cliente1988` (Get Smart `POS-GS-99812`, offline with `OFFLINE_GPRS_TIMEOUT`,
 last decline `TX-88410` with `ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN` requiring an approved re-key or swap;
@@ -182,13 +196,15 @@ thresholds: [eval/baseline.json](eval/baseline.json); runner: `python -m eval.ru
 |---|---|---|
 | A1 | The ten challenge scenarios produce answers containing the required facts, no forbidden claim, only numbers present in the evidence, and no fabricated citation | `golden.jsonl` g01-g10 |
 | A2 | Scenario 8 (transaction decline) pauses for a human, resumes on the decision, and executes the action only on approval | g08, g15; `test_human_in_the_loop.py` |
-| A3 | Three splits are scored separately. `dev` (g01-g18) was used while writing prompts. `validation` (h01-h22) was written as held-out but was re-run between fixes, so it is no longer unseen. `heldout` (s01-s24: PT, ES, abstention, account, compound, multi-turn, human review, anonymous) is sealed: written after the last prompt change and run against the model with nothing changed in between; its result is published as measured and its floor was fixed before the run. Every report records the SHA-256 of the dataset files it ran | `golden.jsonl`, `datasets_sha256` in the report |
-| A4 | Retrieval Recall@4 and MRR do not regress, per mode | `retrieval.jsonl` |
+| A3 | Three splits are scored separately. `dev` (g01-g18) was used while writing prompts. `validation` (h01-h22 and s01-s24: former held-out splits that motivated fixes, per ADR-0016). `heldout` (s25-s48, "sealed-2": PT, ES, EN, abstention, conflict, account, compound, multi-turn, human review, anonymous, live) is sealed: written after the v3 code/prompt freeze by a separate model family blind to `prompts.py`, `checks.py` and `GLOSSARY` (ADR-0022), with its floor fixed before the first model run. Every report records the SHA-256 of the dataset files it ran | `golden.jsonl`, `datasets_sha256` in the report |
+| A4 | Retrieval Recall@4 and MRR do not regress, per mode, across both `dev` (42 queries) and `heldout` (36 post-glossary queries), with glossary-off ablation reported | `retrieval.jsonl`, ADR-0020 |
 | A5 | No attack in the adversarial suite succeeds: no leak, no unauthorized write; benign controls are not blocked | `adversarial.jsonl` |
-| A6 | With a model: judge pass rate and judge-vs-label agreement meet the baseline, with zero false passes; agreement and Cohen's kappa are reported separately for calibration items that share no question with the golden set; a gated metric that was not produced fails the gate; no turn was answered by the degraded fallback; `--repeat N` reports the run-to-run range | `judge_calibration.jsonl`, `baseline.json` |
-| A7 | Rules I1-I10, B1-B10, M1-M7, H1-H15, G1-G7 each have at least one test | `tests/` |
+| A6 | With a model: golden metrics are gated over every run of `--repeat N` (ADR-0019: mean meets floor, no run > 1 item below, ceilings in every run); judge pass rate and judge-vs-label agreement meet the baseline with zero false passes; `independent` and human-labelled `borderline` sets are reported separately; a gated metric that was not produced fails the gate; no turn was answered by the degraded fallback | `judge_calibration.jsonl`, `judge_borderline.jsonl`, `baseline.json` |
+| A7 | Rules I1-I10, B1-B11, M1-M7, H1-H15, G1-G7 each have at least one test | `tests/` |
 | A11 | Every report records the git commit, whether the tree was dirty, and hashes of the source, prompts, judge, baseline and corpora; each golden item stores its tool calls and the judge's exact input, so it can be re-graded without re-running the agents | `provenance` in the report; `--regrade` |
 | A12 | Every failed golden answer of a published report is adjudicated (agent, judge, fact patterns or harness) against the exact answer; the report shows raw and adjudicated rates and the gate reads only the raw ones | `eval/adjudications.jsonl`; `tests/test_streaming_and_ops.py` |
+| A13 | The Critic is measured directly as a classifier (recall on 8 planted defect classes and false-revise rate on clean drafts), split into `dev` and `heldout` | `critic_calibration.jsonl`; `--suite critic` |
+| A14 | Every model evaluation can be recorded to a compressed cassette (`--record`) and replayed offline without an API key (`--replay`), reproducing every answer SHA-256 and metric with zero differences and zero unused calls; verified in CI on every push | `src/cassette.py`, `eval/compare.py`, CI `model-eval-replay`, ADR-0021 |
 | A9 | Answers are written in the merchant's language | `golden.*.language_match_rate` |
 | A10 | The ten challenge payloads run end to end for a signed-in merchant with one command | `scripts/run_scenarios.py` |
 | A8 | The container runs as non-root on a read-only filesystem and serves the challenge payload | CI `docker` job |
