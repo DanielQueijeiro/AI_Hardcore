@@ -10,8 +10,9 @@ The `model-eval` CI job took 2–3 hours. Almost all of it is the golden suite: 
 
 - `eval.run --workers N` evaluates golden conversations N at a time, all runs of `--repeat` in one pool. Each conversation already ran on its own app and databases; it now also gets its own judge client.
 - Each conversation records under its own cassette scope (`golden/<run>/<item>`, `Settings.cassette_scope`), which prefixes its keys. Without it, identical requests from two conversations (g08 and g15 open with the same message; the three runs send identical prompts) would share one FIFO list in whatever order the threads reached the model, and a replay could hand one conversation's answer to the other. Scoped, the pairing is fixed whatever the thread order. Cassette format 3.
+- `eval.run --degraded-retries N`: a golden conversation in which a model API call failed and a turn was answered by the offline fallback (`degraded`) measures the outage, not the agent. Three earlier CI runs failed on exactly that (degraded turns, a Critic recall collapse, a missing calibration), and more parallel requests make an API error likelier. Such a conversation is run again from scratch on a new app and cassette scope (`golden/<run>/<item>/retry<k>`), at most N times. The row records `discarded_degraded_attempts` and the report lists them; a conversation still degraded after the last attempt is kept and fails the `degraded_turns` gate as before. Answers the model actually gave are never re-run, whatever their grade.
 - `eval.run --gate --fail-fast` checks the gate after the golden suite and, if it already fails, skips the remaining suites. The report says it stopped early; a replay restores `workers` and `fail_fast` from the recording and stops at the same point.
-- CI: `model-eval` runs `--workers ${{ inputs.eval_workers }}` (default 4) `--fail-fast`, with a 180-minute timeout.
+- CI: `model-eval` runs `--workers ${{ inputs.eval_workers }}` (default 4) `--degraded-retries 2 --fail-fast`, with a 180-minute timeout.
 
 ## Consequences
 

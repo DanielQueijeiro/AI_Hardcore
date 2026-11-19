@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import date
 
 import pytest
@@ -237,8 +238,9 @@ def test_parallel_golden_runs_match_sequential_ones(tmp_path):
 
     items = ev.select_golden(["g01", "g08", "g15", "g17"])
 
-    def harness(run, item):
-        return ev.Harness(ev.make_settings("offline", tmp_path / f"w{id(item)}-{run}-{item['id']}", live=False, scope=f"golden/{run + 1}/{item['id']}"))
+    def harness(run, item, attempt=0):
+        workdir = tmp_path / uuid.uuid4().hex
+        return ev.Harness(ev.make_settings("offline", workdir, live=False, scope=f"golden/{run + 1}/{item['id']}"))
 
     def strip(summary):
         # Ticket and service-order ids are minted at random per conversation, sequential or not.
@@ -249,3 +251,37 @@ def test_parallel_golden_runs_match_sequential_ones(tmp_path):
     parallel = ev.run_golden(harness, ev.judge_client, items, repeat=2, workers=4)
     assert [strip(s) for s in parallel] == [strip(s) for s in sequential]
     assert [row["id"] for row in parallel[1]["items"]] == ["g01", "g08", "g15", "g17"]
+
+
+def test_a_conversation_degraded_by_an_api_failure_is_rerun_on_a_fresh_scope(monkeypatch, tmp_path):
+    from eval import run as ev
+
+    attempts = []
+
+    class FakeHarness:
+        def __init__(self, scope):
+            self.settings, self.scope = None, scope
+
+        def close(self):
+            pass
+
+    def harness(run, item, attempt=0):
+        return FakeHarness(f"golden/{run + 1}/{item['id']}" + (f"/retry{attempt}" if attempt else ""))
+
+    def fake_item(h, grader, item):
+        attempts.append(h.scope)
+        outage = item["id"] == "g01" and len([a for a in attempts if "g01" in a]) < 2  # g01's first attempt hits an outage
+        always = item["id"] == "g02"
+        return {"id": item["id"], "split": "dev", "degraded": outage or always, "_any_turn_degraded": outage or always}
+
+    monkeypatch.setattr(ev, "_golden_item", fake_item)
+    monkeypatch.setattr(ev, "_golden_summary", lambda rows: {"items": rows})
+    items = [{"id": "g01"}, {"id": "g02"}, {"id": "g03"}]
+    (run,) = ev.run_golden(harness, lambda settings: None, items, degraded_retries=2)
+    rows = {r["id"]: r for r in run["items"]}
+    assert attempts.count("golden/1/g01") == 1 and "golden/1/g01/retry1" in attempts
+    assert rows["g01"] == {"id": "g01", "split": "dev", "degraded": False, "discarded_degraded_attempts": 1}
+    assert rows["g02"]["degraded"] and rows["g02"]["discarded_degraded_attempts"] == 2, "still degraded: kept, counts against the gate"
+    assert "discarded_degraded_attempts" not in rows["g03"]
+    (plain,) = ev.run_golden(harness, lambda settings: None, items[1:2])
+    assert plain["items"][0]["degraded"] and "discarded_degraded_attempts" not in plain["items"][0], "no retries unless asked"

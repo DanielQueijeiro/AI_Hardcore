@@ -43,6 +43,7 @@ from eval import metrics as m
 from eval.judge import calibrate, fit_evidence, judge, load_jsonl
 from src import clock
 from src.agents.checks import evidence_text
+from src.agents.nodes import today_line
 from src.api.main import create_app
 from src.cassette import CassetteMiss, RecordingLLM, ReplayLLM, close_cassettes, open_cassette
 from src.config import Settings
@@ -334,7 +335,13 @@ def select_golden(ids: list[str] | None = None, split: str | None = None) -> lis
 
 
 def run_golden(
-    make_harness: Any, make_grader: Any, items: list[dict[str, Any]] | None = None, *, repeat: int = 1, workers: int = 1
+    make_harness: Any,
+    make_grader: Any,
+    items: list[dict[str, Any]] | None = None,
+    *,
+    repeat: int = 1,
+    workers: int = 1,
+    degraded_retries: int = 0,
 ) -> list[dict[str, Any]]:
     """Run the golden items `repeat` times and return one summary per run.
 
@@ -343,17 +350,31 @@ def run_golden(
     what lets `workers` conversations run at once: `make_harness(run, item)` and `make_grader(settings)` build a
     scoped app and judge per conversation, so its cassette keys are its own (src/cassette.py), and the rows come back
     in item order whatever order the threads finished in.
+
+    A conversation in which the model API failed (a turn answered by the offline fallback, `degraded`) measures the
+    outage, not the agent. With `degraded_retries` it is run again from scratch on a new app and cassette scope
+    (`make_harness(run, item, attempt)`), at most that many times; the row records how many attempts were discarded,
+    and a conversation still degraded after the last attempt is kept as it is and counts against the gate.
     """
     items = items if items is not None else load_jsonl(DATASETS / "golden.jsonl")
     repeat = max(1, repeat)
     tasks = [(run, item) for run in range(repeat) for item in items]
 
     def one(task: tuple[int, dict[str, Any]]) -> dict[str, Any]:
-        h = make_harness(*task)
-        try:
-            return _golden_item(h, make_grader(h.settings), task[1])
-        finally:
-            h.close()
+        run, item = task
+        attempt = 0
+        while True:
+            h = make_harness(run, item, attempt)
+            try:
+                row = _golden_item(h, make_grader(h.settings), item)
+            finally:
+                h.close()
+            if not row.pop("_any_turn_degraded") or attempt >= degraded_retries:
+                break
+            attempt += 1
+        if attempt:
+            row["discarded_degraded_attempts"] = attempt
+        return row
 
     if workers <= 1:
         rows = [one(t) for t in tasks]
@@ -384,7 +405,8 @@ def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[st
 
     coverage, missing = m.fact_coverage(answer, item["facts"])
     forbidden = m.forbidden_hits(answer, item.get("forbidden", []))
-    grounded, unsupported = m.numeric_groundedness(answer, observations, *context)
+    # The agents' prompts state today's date (src/agents/nodes.py today_line), so a date taken from it is grounded.
+    grounded, unsupported = m.numeric_groundedness(answer, observations, *context, today_line())
     cite, fabricated = m.citation_validity(answer, observations, *context)
     # An item with no operator in the script is expected to be answered, not parked on a human.
     status_ok = first_status == item.get("expect_status", "awaiting_human" if item.get("operator") else "completed")
@@ -446,6 +468,7 @@ def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[st
             "latency_ms": latency,
             "cost_usd": trace.get("usage", {}).get("cost_usd", 0.0),
             "degraded": trace.get("degraded", False),
+            "_any_turn_degraded": any(t.get("degraded", False) for t in (*earlier, trace)),
             "tool_calls": tool_calls,
             "answer_sha256": answer_sha256(answer),
             "judge_input": judge_input,
@@ -927,6 +950,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(detail)
     if report.get("golden_workers"):
         lines.append(f"- Golden conversations evaluated {report['golden_workers']} at a time, each on its own app")
+    retried = [
+        f"{row['id']} (run {n})"
+        for n, rows in enumerate([report.get("golden", {}).get("items", []), *report.get("golden_repeat_items", [])], start=1)
+        for row in rows
+        if row.get("discarded_degraded_attempts")
+    ]
+    if retried:
+        lines.append(f"- Re-run after a model API failure degraded the conversation: {', '.join(retried)}")
     if report.get("stopped_early"):
         lines.append(f"- **Stopped early:** {report['stopped_early']}; the adversarial, Critic and judge suites did not run")
     lines.append("")
@@ -1154,6 +1185,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gate", action="store_true", help="exit non-zero if a metric regresses below eval/baseline.json")
     parser.add_argument("--repeat", type=int, default=1, help="run the golden suite N times; the gate reads every run (ADR-0019)")
     parser.add_argument("--workers", type=int, default=1, help="golden conversations evaluated at once, each on its own app")
+    parser.add_argument(
+        "--degraded-retries", type=int, default=0, help="re-run a golden conversation that hit a model API failure, at most N times"
+    )
     parser.add_argument("--fail-fast", action="store_true", help="with --gate: skip the other suites if the golden suite already fails the gate")
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--ids", help="comma-separated golden item ids to run (golden suite only; never gated, never the report)")
@@ -1171,7 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.replay:
         # A replay reproduces the recorded run: same suites, repetitions, selection and gate.
         recorded_args = open_cassette(args.replay, "replay").meta.get("args", {})
-        for name in ("suite", "repeat", "ids", "split", "live", "gate", "mode", "workers", "fail_fast"):
+        for name in ("suite", "repeat", "ids", "split", "live", "gate", "mode", "workers", "fail_fast", "degraded_retries"):
             if name in recorded_args:
                 setattr(args, name, recorded_args[name])
     if args.adjudicate:
@@ -1236,11 +1270,13 @@ def main(argv: list[str] | None = None) -> int:
             if wanted("golden"):
                 items = select_golden(ids, args.split)
 
-                def golden_harness(run: int, item: dict[str, Any]) -> Harness:
-                    scope = f"golden/{run + 1}/{item['id']}"
+                def golden_harness(run: int, item: dict[str, Any], attempt: int = 0) -> Harness:
+                    scope = f"golden/{run + 1}/{item['id']}" + (f"/retry{attempt}" if attempt else "")
                     return Harness(make_settings(args.mode, Path(tmp) / scope, live, scope=scope))
 
-                runs = run_golden(golden_harness, judge_client, items, repeat=args.repeat, workers=args.workers)
+                runs = run_golden(
+                    golden_harness, judge_client, items, repeat=args.repeat, workers=args.workers, degraded_retries=args.degraded_retries
+                )
                 report["golden"] = runs[0]
                 if args.workers > 1:
                     report["golden_workers"] = args.workers

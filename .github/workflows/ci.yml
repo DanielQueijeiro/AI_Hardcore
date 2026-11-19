@@ -76,7 +76,8 @@ jobs:
   model-eval:
     # Semantic evaluation with the real model and the LLM judge, three runs, recorded to a cassette so anyone can
     # replay it without a key (job below). Manual, because it costs tokens.
-    # --workers runs golden conversations in parallel; --fail-fast skips the other suites once golden fails the gate.
+    # --workers runs golden conversations in parallel; --degraded-retries re-runs a conversation the API failed;
+    # --fail-fast skips the other suites once golden fails the gate (ADR-0025).
     if: github.event_name == 'workflow_dispatch' && inputs.run_model_eval
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -87,7 +88,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e .
-      - run: python -m eval.run --gate --repeat 3 --workers "${{ inputs.eval_workers }}" --fail-fast --record eval/reports/openai/cassette.json.gz
+      - run: python -m eval.run --gate --repeat 3 --workers "${{ inputs.eval_workers }}" --degraded-retries 2 --fail-fast --record eval/reports/openai/cassette.json.gz
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           JUDGE_MODEL: ${{ inputs.judge_model }}

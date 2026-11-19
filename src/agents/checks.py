@@ -228,7 +228,8 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
         executed = bool((observation.get("action_result") or {}).get("executed"))
         decision = {
             "reject": "The human operator did NOT approve the proposed action; nothing was changed. The draft must say so "
-            "plainly in its first sentence, then give the operator's note, and stay on the problem the merchant asked about.",
+            "plainly in its first sentence, then give the operator's note as the next step, and stop: no re-explaining the "
+            "error code (the merchant got the diagnosis while the operator reviewed) and no workarounds the operator did not give.",
             "answer": "A human specialist answered in this conversation. The draft must relay their answer and must not "
             "say that a person cannot be reached or that it cannot connect the merchant to one.",
             "approve": "The human operator approved the action. "
@@ -240,8 +241,20 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
         # and the operator's note; the code was already in the message sent while the operator reviewed.
         if observation.get("proposed_action") and observation.get("decision") == "approve":
             items += _decline_code_items(draft, observations)
+            # g08: the approved re-key answer went on to offline troubleshooting the merchant had not asked about.
+            if _CONNECTIVITY.search(draft) and not _CONNECTIVITY.search(message + " " + note) and not re.search(
+                r"internet|connect|conex|conect|sinal|signal|rede|network|red\b", message, re.I
+            ):
+                items.append(
+                    {
+                        "item": "Leave out connectivity troubleshooting (Wi-Fi, SIM, communication test, offline status): the "
+                        "merchant asked about the decline, and the operator's decision is about that.",
+                        "found_in_draft": False,
+                    }
+                )
 
     items += _settlement_amount_items(draft, observations)
+    items += _nothing_to_escalate_items(message, draft, observations)
 
     for passage in passages:
         for steps in procedure_steps(str(passage["text"])):
@@ -320,6 +333,42 @@ def _decline_code_items(draft: str, observations: list[dict[str, Any]]) -> list[
                 }
             )
     return list({i["item"]: i for i in items}.values())
+
+
+# The merchant asking for a person (broad), and the draft offering to pass the case to one (narrow: "contact Getnet
+# support" is a channel, not a handoff, and must not send the draft back).
+_ASKS_FOR_PERSON = re.compile(r"\b(?:human|person|people|specialist|agent|especialista|atendente|humano|pessoa|persona)\b", re.I)
+_HANDOFF_OFFER = re.compile(
+    r"\b(?:hand (?:it|this|the case|you)(?: off| over)? to|transfer you|connect you (?:with|to)|escalate (?:it|this|the case)"
+    r"|human (?:specialist|agent|operator)|especialista humano|atendente humano|agente humano|operador humano)\b",
+    re.I,
+)
+_CONNECTIVITY = re.compile(r"\b(?:wi-?fi|sim|chip|communication test|teste de comunica\w*|prueba de comunica\w*|offline)\b", re.I)
+
+
+def _nothing_to_escalate_items(message: str, draft: str, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Diagnostics show the terminal online with no recorded decline: there is nothing to escalate, so offering to
+    hand the case to a person contradicts the diagnosis (g18). Not applied when the merchant asked for a person."""
+    if _ASKS_FOR_PERSON.search(message) or not _HANDOFF_OFFER.search(draft):
+        return []
+    for observation in observations:
+        if observation.get("agent") != "support":
+            continue
+        for call in observation.get("evidence") or []:
+            result = call.get("result") or {}
+            if call.get("tool") != "get_pos_diagnostics" or not result.get("found", True):
+                continue
+            status = str(result.get("connectivity_status") or "")
+            if result.get("last_transaction_decline") is None and status.upper().startswith("ONLINE"):
+                return [
+                    {
+                        "item": f"The diagnostics show the terminal online ({status}) with no recorded decline or error, so there "
+                        "is nothing to escalate. Say so, ask for the exact on-screen message or point the merchant to Getnet "
+                        "support, and do not offer to hand the case to a human specialist.",
+                        "found_in_draft": False,
+                    }
+                ]
+    return []
 
 
 def _settlement_amount_items(draft: str, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:

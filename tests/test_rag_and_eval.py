@@ -436,6 +436,38 @@ def test_checklist_keeps_the_decline_code_settlement_amounts_and_compared_rates(
     assert evidence_checklist("Does the Get Smart print?", "Yes.", obs(lineup)) == [], "one product: no comparison"
 
 
+def test_checklist_flags_a_handoff_offer_when_there_is_nothing_to_escalate():
+    from src.agents.checks import evidence_checklist
+
+    def diagnostics(status, decline=None):
+        result = {"found": True, "model": "Get Clássica", "connectivity_status": status, "last_transaction_decline": decline}
+        return [{"agent": "support", "evidence": [{"tool": "get_pos_diagnostics", "result": result}]}]
+
+    message = "My card machine is showing a transaction decline error."
+    offer = "No decline is recorded. If it continues, I can hand this to a human specialist."
+    plain = "Your Get Clássica is online and no decline is recorded, so there is nothing to escalate. What does the screen show?"
+    items = evidence_checklist(message, offer, diagnostics("ONLINE_4G_OK"))
+    assert len(items) == 1 and "nothing to escalate" in items[0]["item"] and items[0]["found_in_draft"] is False
+    assert evidence_checklist(message, plain, diagnostics("ONLINE_4G_OK")) == []
+    assert evidence_checklist(message, offer, diagnostics("OFFLINE_GPRS_TIMEOUT")) == [], "offline: a swap may need a person"
+    decline = {"transaction_id": "TX-1", "decline_code": "X", "requires_human_approved_action": True}
+    assert evidence_checklist(message, offer, diagnostics("ONLINE_4G_OK", decline)) == [], "a recorded decline may need a person"
+    assert evidence_checklist("I want to talk to a human about this decline.", offer, diagnostics("ONLINE_4G_OK")) == []
+    channel = "Nothing is recorded, so there is nothing to escalate; a Getnet support agent can help at 4002-4000."
+    assert evidence_checklist(message, channel, diagnostics("ONLINE_4G_OK")) == [], "naming a support channel is not a handoff"
+
+    # g08: after an approved re-key, offline troubleshooting the merchant did not ask about.
+    decided = [
+        {"agent": "support", "evidence": [{"tool": "get_pos_diagnostics", "result": {"last_transaction_decline": {"decline_code": "A / B"}}}]},
+        {"agent": "escalation", "decision": "approve", "proposed_action": "terminal_rekey_or_swap", "operator_message": "ok"},
+    ]
+    focused = "The re-key was approved for decline A / B; service order SO-1 was created."
+    assert len(evidence_checklist(message, focused, decided)) == 1, "only the decision item"
+    wandering = focused + " The terminal is also offline: reconnect it to Wi-Fi and run the communication test."
+    assert "Leave out connectivity troubleshooting" in evidence_checklist(message, wandering, decided)[-1]["item"]
+    assert len(evidence_checklist("My machine won't connect and shows a decline error.", wandering, decided)) == 1
+
+
 def test_fx_quote_defaults_to_reais(monkeypatch, client):
     from src.security.auth import Principal
     from src.tools.registry import KNOWLEDGE_TOOLS, TOOLS, ToolContext, run_tool
@@ -445,6 +477,35 @@ def test_fx_quote_defaults_to_reais(monkeypatch, client):
     monkeypatch.setattr(runtime.live, "fx_rate", lambda base, quote: asked.append((base, quote)) or {"available": True, "rate": 5.6})
     run_tool(ToolContext(runtime, Principal("cliente1988", "merchant")), "get_fx_rate", {"base": "USD"}, KNOWLEDGE_TOOLS)
     assert asked == [("USD", "BRL")] and TOOLS["get_fx_rate"].required == ("base",)
+
+    # g07: the model asked for EUR/USD although the merchant named only the euro.
+    def fx(message, base, quote):
+        asked.clear()
+        ctx = ToolContext(runtime, Principal("cliente1988", "merchant"), merchant_message=message)
+        run_tool(ctx, "get_fx_rate", {"base": base, "quote": quote}, KNOWLEDGE_TOOLS)
+        return asked[0]
+
+    assert fx("What's the euro exchange rate today?", "EUR", "USD") == ("EUR", "BRL")
+    assert fx("Qual a cotação do euro em dólares?", "EUR", "USD") == ("EUR", "USD"), "the merchant named the quote currency"
+    assert fx("How many USD is one euro?", "EUR", "usd") == ("EUR", "USD")
+    assert fx("¿Cuál es el tipo de cambio de la libra esterlina?", "GBP", "BRL") == ("GBP", "BRL")
+
+
+def test_a_date_taken_from_todays_date_line_is_grounded():
+    from datetime import date
+
+    from eval import metrics as m
+    from src import clock
+    from src.agents.nodes import today_line
+
+    clock.freeze(date(2026, 11, 19))
+    try:
+        answer = "Debit card proceeds are scheduled for today, November 19, by 14:00."
+        observations = [{"agent": "support", "evidence": [{"result": {"scheduled_window": "Today (D+1) by 14:00 BRT"}}]}]
+        assert m.numeric_groundedness(answer, observations)[1] == ["19"]
+        assert m.numeric_groundedness(answer, observations, today_line()) == (1.0, [])
+    finally:
+        clock.freeze(None)
 
 
 def _golden_run(passes: int, n: int = 18, degraded: int = 0) -> list[dict]:

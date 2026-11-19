@@ -572,7 +572,7 @@ class Nodes:
         observations = state.get("observations") or []
         rounds = state.get("critic_rounds", 0)
         memory = render_memory(state)
-        evidence = evidence_text(observations, state["message"], memory)
+        evidence = evidence_text(observations, state["message"], memory, today_line())  # the agents were given the date
         suspicious_numbers = unsupported_numbers(draft, evidence)
         invented_urls = fabricated_urls(draft, observations, state["message"], memory)
         expected_language = _language(state)

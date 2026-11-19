@@ -12,6 +12,7 @@ Rules enforced here, in code, regardless of what a model asks for:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -115,8 +116,30 @@ def _search_getnet_knowledge(ctx: ToolContext, query: str, query_en: str = "") -
     return out
 
 
+_CURRENCY_NAMES = {
+    "USD": ("dollar", "dolar", "us$"),
+    "EUR": ("euro", "\u20ac"),
+    "GBP": ("pound", "sterling", "libra", "esterlina", "\u00a3"),
+    "ARS": ("peso argentino", "argentine peso"),
+    "JPY": ("yen", "iene"),
+    "CNY": ("yuan", "renminbi"),
+}
+
+
+def _names_currency(message: str, code: str) -> bool:
+    import unicodedata
+
+    folded = "".join(c for c in unicodedata.normalize("NFKD", message.lower()) if not unicodedata.combining(c))
+    return bool(re.search(rf"\b{re.escape(code.lower())}\b", folded)) or any(n in folded for n in _CURRENCY_NAMES.get(code, ()))
+
+
 def _get_fx_rate(ctx: ToolContext, base: str, quote: str = "BRL") -> dict[str, Any]:
-    return ctx.runtime.live.fx_rate(base, quote or "BRL")
+    quote = (quote or "BRL").upper()
+    if quote != "BRL" and ctx.merchant_message and not _names_currency(ctx.merchant_message, quote):
+        # Getnet merchants operate in Brazil: a rate is quoted in reais unless the merchant named the other currency
+        # (g07: "What's the euro exchange rate today?" was once quoted as EUR/USD).
+        quote = "BRL"
+    return ctx.runtime.live.fx_rate(base, quote)
 
 
 def _get_weather_forecast(ctx: ToolContext, city: str) -> dict[str, Any]:
