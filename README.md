@@ -8,6 +8,26 @@ decides, then resumes it). A Critic reviews every answer before it is sent.
 Python 3.12 · FastAPI · LangGraph (SQLite checkpointer) · OpenAI Responses API behind a provider port ·
 no vector database, no external services required to run or test.
 
+## Reproduce the published evaluation (about 2 minutes, no API key)
+
+```bash
+pip install -e .
+python -m eval.run --replay eval/reports/openai/cassette.json.gz --out /tmp/replayed
+python -m eval.compare eval/reports/openai/report.json /tmp/replayed.json
+# REPRODUCED: 408 answers and every metric compared (0 differences)
+```
+
+The replay re-executes the whole system offline — API, LangGraph orchestration, retrieval, tools, guardrails, the
+Critic's checks, every metric and the regression gate — with the model's side of each exchange served from the
+cassette recorded in [GitHub Actions run 44622842628](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44622842628)
+(`gpt-6-luna` answering, `gpt-5.4-mini` judging). `eval.compare` checks every answer's SHA-256 across the three
+runs of all 136 golden conversations, every metric of every suite, the gate verdict, and that no recorded call went
+unused; a request the recording does not contain fails loudly (`CassetteMiss`). CI runs the same check on every push
+(`model-eval-replay`). What it reproduces: the **regression gate PASSED on all 29 gated metrics**, `dev` `1.000` on all
+three runs, `validation` `0.972`, sealed held-out `0.875` raw / `1.000` judge pass, `0` degraded turns
+([Results](#results), [ADR-0021](docs/adr/0021-recorded-model-runs-replayable-without-a-key.md)).
+
+- [Reproduce the published evaluation](#reproduce-the-published-evaluation-about-2-minutes-no-api-key)
 - [Quickstart](#quickstart)
 - [What changed in v3 (9.3 → resubmission)](#what-changed-in-v3-93--resubmission)
 - [What changed since the first submission (7.4 → 9.3)](#what-changed-since-the-first-submission-74--93)
