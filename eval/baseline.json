@@ -35,6 +35,7 @@
       "retrieval_hosted.modes.hybrid.recall@4": 0.97,
       "calibration.agreement": 0.9,
       "calibration.by_set.independent.agreement": 0.85,
+      "calibration.by_set.borderline.agreement": 0.75,
       "golden.all.citation_validity": 1.0,
       "golden.all.gold_source_hit_rate": 0.9,
       "golden.all.judge.pass_rate": 0.92,

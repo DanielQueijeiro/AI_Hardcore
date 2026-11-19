@@ -1077,7 +1077,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"Judge vs reference pass/fail labels on {c['n']} clear-cut hand-written answers: agreement **{c['agreement']:.3f}**, "
             f"Cohen's kappa **{c['kappa']:.3f}**, false passes {c['false_pass']}, false fails {c['false_fail']}.",
             "",
-            "| Set | n | Agreement | Kappa | False passes | False fails |" + (" Human agreement | Human kappa |" if has_human else ""),
+            "| Set | n | Agreement | Kappa | False passes | False fails |" + (" Reviewer agreement | Reviewer kappa |" if has_human else ""),
             "|---|---|---|---|---|---|" + ("---|---|" if has_human else ""),
         ]
         for name, s in c["by_set"].items():
@@ -1092,7 +1092,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "`original` items were written alongside the golden set (some after the judge disagreed on a golden item); "
             "`independent` items use questions that appear in no golden item; "
-            "`borderline` items (when labelled by two humans) measure near-miss agreement next to human-human agreement and stay out of the headline.",
+            "`borderline` items measure near-miss agreement next to dual-reviewer agreement (`eval/labels/README.md`) and stay out of the headline.",
             "",
         ]
         if disagreements:

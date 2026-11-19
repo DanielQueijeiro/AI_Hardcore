@@ -449,7 +449,7 @@ def test_markdown_report_renders_heldout_retrieval_glossary_ablation_borderline_
     assert "### Glossary ablation (dev, glossary off)" in md
     assert "### Held-out queries (36 queries, written after the glossary)" in md
     assert "### Held-out queries, glossary off" in md
-    assert "Human agreement | Human kappa" in md and "0.850 | 0.700" in md
+    assert "Reviewer agreement | Reviewer kappa" in md and "0.850 | 0.700" in md
     assert "Cassette (replay): `eval/reports/openai/cassette.json.gz`" in md
 
 
