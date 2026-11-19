@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # Evaluation only: record every model call, live-tool result and embedding of a run, or replay one without a key.
     record_to: Path | None = None
     replay_from: Path | None = None
+    # Prefix for this app's cassette keys, so conversations evaluated in parallel never share a recording (src/cassette.py).
+    cassette_scope: str = ""
     openai_api_key: str | None = None
     openai_base_url: str | None = None
     openai_model: str = "gpt-6-luna"

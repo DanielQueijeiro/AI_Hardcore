@@ -9,6 +9,9 @@ clients; replaying swaps them for ones that answer from the file and refuse anyt
   (ticket and service-order ids, trace ids, timestamps) are normalized out of the key.
 - The same request can get different answers (a `--repeat 3` run sends identical prompts three times), so each key
   holds a FIFO list and replay hands the answers back in the order they were recorded.
+- An evaluation that runs conversations in parallel gives each one a scope (`Settings.cassette_scope`, e.g.
+  `golden/2/g08`) that prefixes its keys, so identical requests from two conversations never share a FIFO list and
+  the replay pairs every answer with the conversation that received it, whatever order the threads ran in.
 - Prompts carry today's date, so the recording stores its date and replay freezes the clock to it (src/clock.py).
 - A request with no recording raises CassetteMiss naming the role: a changed prompt never silently falls back.
 """
@@ -34,7 +37,7 @@ from src.tools.live import LiveData
 if TYPE_CHECKING:
     from src.llm.base import LLMClient, LLMResponse
 
-FORMAT = 2  # 2: first recorded vector per text wins, canary normalized
+FORMAT = 3  # 2: first recorded vector per text wins, canary normalized; 3: per-conversation scopes
 _VOLATILE = (
     (re.compile(r"\bTKT-\d{6}-[0-9A-F]{6}\b"), "TKT-ID"),
     (re.compile(r"\bSO-[0-9A-F]{8}\b"), "SO-ID"),
@@ -75,6 +78,10 @@ def normalize(text: str) -> str:
     for pattern, placeholder in _VOLATILE:
         text = pattern.sub(placeholder, text)
     return text
+
+
+def scoped(kind: str, scope: str) -> str:
+    return f"{scope}|{kind}" if scope else kind
 
 
 def request_key(kind: str, payload: dict[str, Any]) -> str:
@@ -208,15 +215,15 @@ def _load_response(data: dict[str, Any]) -> LLMResponse:
 
 
 class RecordingLLM:
-    def __init__(self, inner: LLMClient, cassette: Cassette, slot: str = "app") -> None:
-        self.inner, self.cassette, self.slot = inner, cassette, slot
+    def __init__(self, inner: LLMClient, cassette: Cassette, slot: str = "app", scope: str = "") -> None:
+        self.inner, self.cassette, self.slot, self.scope = inner, cassette, slot, scope
         self.name, self.model = inner.name, inner.model
         cassette.meta.setdefault("models", {})[slot] = inner.model
         cassette.meta.setdefault("names", {})[slot] = inner.name  # code paths that branch on the client name replay the same way
 
     def complete(self, **kwargs: Any) -> LLMResponse:
         response = self.inner.complete(**kwargs)
-        self.cassette.put(f"llm:{self.slot}", _llm_payload(kwargs), _dump_response(response))
+        self.cassette.put(scoped(f"llm:{self.slot}", self.scope), _llm_payload(kwargs), _dump_response(response))
         return response
 
     def __getattr__(self, item: str) -> Any:  # breaker state and the like stay visible
@@ -224,13 +231,13 @@ class RecordingLLM:
 
 
 class ReplayLLM:
-    def __init__(self, cassette: Cassette, slot: str = "app") -> None:
-        self.cassette, self.slot = cassette, slot
+    def __init__(self, cassette: Cassette, slot: str = "app", scope: str = "") -> None:
+        self.cassette, self.slot, self.scope = cassette, slot, scope
         self.model = cassette.meta.get("models", {}).get(slot, "replay")
         self.name = cassette.meta.get("names", {}).get(slot, "replay")
 
     def complete(self, **kwargs: Any) -> LLMResponse:
-        return _load_response(self.cassette.take(f"llm:{self.slot}", _llm_payload(kwargs), f"role {kwargs.get('role')}"))
+        return _load_response(self.cassette.take(scoped(f"llm:{self.slot}", self.scope), _llm_payload(kwargs), f"role {kwargs.get('role')}"))
 
 
 # --- embeddings -----------------------------------------------------------------------------------
@@ -270,36 +277,36 @@ class ReplayEmbedder:
 
 
 class RecordingLive(LiveData):
-    def __init__(self, cassette: Cassette, **kwargs: Any) -> None:
+    def __init__(self, cassette: Cassette, scope: str = "", **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.cassette = cassette
+        self.cassette, self.kind = cassette, scoped("live", scope)
 
     def fx_rate(self, base: str, quote: str) -> dict[str, Any]:
         out = super().fx_rate(base, quote)
-        self.cassette.put("live", {"fx": [base, quote]}, out)
+        self.cassette.put(self.kind, {"fx": [base, quote]}, out)
         return out
 
     def weather(self, city: str, days: int = 3) -> dict[str, Any]:
         out = super().weather(city, days)
-        self.cassette.put("live", {"weather": [city, days]}, out)
+        self.cassette.put(self.kind, {"weather": [city, days]}, out)
         return out
 
     def web_search(self, query: str, max_results: int = 4) -> dict[str, Any]:
         out = super().web_search(query, max_results)
-        self.cassette.put("live", {"web": [query, max_results]}, out)
+        self.cassette.put(self.kind, {"web": [query, max_results]}, out)
         return out
 
 
 class ReplayLive(LiveData):
-    def __init__(self, cassette: Cassette, **kwargs: Any) -> None:
+    def __init__(self, cassette: Cassette, scope: str = "", **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.cassette = cassette
+        self.cassette, self.kind = cassette, scoped("live", scope)
 
     def fx_rate(self, base: str, quote: str) -> dict[str, Any]:
-        return self.cassette.take("live", {"fx": [base, quote]}, f"fx {base}/{quote}")
+        return self.cassette.take(self.kind, {"fx": [base, quote]}, f"fx {base}/{quote}")
 
     def weather(self, city: str, days: int = 3) -> dict[str, Any]:
-        return self.cassette.take("live", {"weather": [city, days]}, f"weather {city}")
+        return self.cassette.take(self.kind, {"weather": [city, days]}, f"weather {city}")
 
     def web_search(self, query: str, max_results: int = 4) -> dict[str, Any]:
-        return self.cassette.take("live", {"web": [query, max_results]}, "web search")
+        return self.cassette.take(self.kind, {"web": [query, max_results]}, "web search")

@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -208,7 +209,7 @@ RECORDED_SETTINGS = (
 )
 
 
-def make_settings(mode: str, workdir: Path, live: bool) -> Settings:
+def make_settings(mode: str, workdir: Path, live: bool, scope: str = "") -> Settings:
     base = Settings()
     provider = "offline" if mode == "offline" or not base.openai_api_key else "openai"
     recorded: dict[str, Any] = {}
@@ -223,6 +224,7 @@ def make_settings(mode: str, workdir: Path, live: bool) -> Settings:
             **recorded,
             **(CASSETTE if mode != "offline" else {"record_to": None, "replay_from": None}),
             "llm_provider": provider,
+            "cassette_scope": scope,
             "sqlite_db_path": workdir / "support.db",
             "checkpoint_db_path": workdir / "checkpoints.db",
             "jwt_secret": secrets.token_urlsafe(32),
@@ -238,7 +240,7 @@ def make_settings(mode: str, workdir: Path, live: bool) -> Settings:
 
 def judge_client(settings: Settings) -> LLMClient:
     if settings.effective_provider() == "replay":
-        return ReplayLLM(open_cassette(settings.replay_from, "replay"), slot="judge")  # type: ignore[arg-type]
+        return ReplayLLM(open_cassette(settings.replay_from, "replay"), slot="judge", scope=settings.cassette_scope)  # type: ignore[arg-type]
     if settings.effective_provider() != "openai":
         return OfflinePolicyLLM()
     client: LLMClient = OpenAIResponsesClient(
@@ -249,7 +251,7 @@ def judge_client(settings: Settings) -> LLMClient:
         max_retries=settings.llm_max_retries,
     )
     if settings.record_to:
-        client = RecordingLLM(client, open_cassette(settings.record_to, "record"), slot="judge")
+        client = RecordingLLM(client, open_cassette(settings.record_to, "record"), slot="judge", scope=settings.cassette_scope)
     return client
 
 
@@ -331,18 +333,37 @@ def select_golden(ids: list[str] | None = None, split: str | None = None) -> lis
     return items
 
 
-def run_golden(make_harness: Any, grader: LLMClient, items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Each item runs on its own fresh application and databases: an approved ticket or a service order left by
-    one conversation must not change how the same merchant's next conversation is handled."""
+def run_golden(
+    make_harness: Any, make_grader: Any, items: list[dict[str, Any]] | None = None, *, repeat: int = 1, workers: int = 1
+) -> list[dict[str, Any]]:
+    """Run the golden items `repeat` times and return one summary per run.
+
+    Each item runs on its own fresh application and databases: an approved ticket or a service order left by
+    one conversation must not change how the same merchant's next conversation is handled. That isolation is also
+    what lets `workers` conversations run at once: `make_harness(run, item)` and `make_grader(settings)` build a
+    scoped app and judge per conversation, so its cassette keys are its own (src/cassette.py), and the rows come back
+    in item order whatever order the threads finished in.
+    """
     items = items if items is not None else load_jsonl(DATASETS / "golden.jsonl")
-    rows: list[dict[str, Any]] = []
-    for item in items:
-        h = make_harness()
+    repeat = max(1, repeat)
+    tasks = [(run, item) for run in range(repeat) for item in items]
+
+    def one(task: tuple[int, dict[str, Any]]) -> dict[str, Any]:
+        h = make_harness(*task)
         try:
-            rows.append(_golden_item(h, grader, item))
+            return _golden_item(h, make_grader(h.settings), task[1])
         finally:
             h.close()
-    return _golden_summary(rows)
+
+    if workers <= 1:
+        rows = [one(t) for t in tasks]
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="golden")
+        try:
+            rows = list(pool.map(one, tasks))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)  # one failed conversation cancels the queued ones
+    return [_golden_summary(rows[r * len(items) : (r + 1) * len(items)]) for r in range(repeat)]
 
 
 def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[str, Any]:
@@ -904,6 +925,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         if "unused_recorded_calls" in cas:
             detail += f", unused calls: {cas['unused_recorded_calls']}"
         lines.append(detail)
+    if report.get("golden_workers"):
+        lines.append(f"- Golden conversations evaluated {report['golden_workers']} at a time, each on its own app")
+    if report.get("stopped_early"):
+        lines.append(f"- **Stopped early:** {report['stopped_early']}; the adversarial, Critic and judge suites did not run")
     lines.append("")
     if report["mode"] == "offline":
         lines += [
@@ -1128,6 +1153,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", choices=["auto", "on", "off"], default="auto", help="live web tools (default: on with a model, off offline)")
     parser.add_argument("--gate", action="store_true", help="exit non-zero if a metric regresses below eval/baseline.json")
     parser.add_argument("--repeat", type=int, default=1, help="run the golden suite N times; the gate reads every run (ADR-0019)")
+    parser.add_argument("--workers", type=int, default=1, help="golden conversations evaluated at once, each on its own app")
+    parser.add_argument("--fail-fast", action="store_true", help="with --gate: skip the other suites if the golden suite already fails the gate")
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--ids", help="comma-separated golden item ids to run (golden suite only; never gated, never the report)")
     parser.add_argument("--split", choices=SPLITS, help="run only this golden split (golden suite only; never gated, never the report)")
@@ -1144,7 +1171,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.replay:
         # A replay reproduces the recorded run: same suites, repetitions, selection and gate.
         recorded_args = open_cassette(args.replay, "replay").meta.get("args", {})
-        for name in ("suite", "repeat", "ids", "split", "live", "gate", "mode"):
+        for name in ("suite", "repeat", "ids", "split", "live", "gate", "mode", "workers", "fail_fast"):
             if name in recorded_args:
                 setattr(args, name, recorded_args[name])
     if args.adjudicate:
@@ -1205,14 +1232,18 @@ def main(argv: list[str] | None = None) -> int:
                         raise
                     except Exception as exc:  # noqa: BLE001 - an embeddings outage must not lose the rest of the report
                         report["retrieval_hosted_error"] = repr(exc)[:200]
+            stopped = False
             if wanted("golden"):
-                counter = iter(range(100_000))
                 items = select_golden(ids, args.split)
-                runs = [
-                    run_golden(lambda: Harness(make_settings(args.mode, Path(tmp) / f"golden-{next(counter)}", live)), grader, items)
-                    for _ in range(max(1, args.repeat))
-                ]
+
+                def golden_harness(run: int, item: dict[str, Any]) -> Harness:
+                    scope = f"golden/{run + 1}/{item['id']}"
+                    return Harness(make_settings(args.mode, Path(tmp) / scope, live, scope=scope))
+
+                runs = run_golden(golden_harness, judge_client, items, repeat=args.repeat, workers=args.workers)
                 report["golden"] = runs[0]
+                if args.workers > 1:
+                    report["golden_workers"] = args.workers
                 if len(runs) > 1:
                     report["golden_repeats"] = repeat_summary(runs)
                     report["golden_repeat_items"] = [run["items"] for run in runs[1:]]
@@ -1220,11 +1251,16 @@ def main(argv: list[str] | None = None) -> int:
                     # Model runs only: offline failures are the rule policy's known limits (language, decomposition),
                     # described in the offline report itself, not answers to review one by one.
                     report["adjudication"] = adjudicate(report, load_adjudications())
-            if wanted("adversarial"):
+                if args.fail_fast and args.gate and check_gate(report, load_baseline(mode)):
+                    # The golden suite already fails the gate: skip the other suites instead of spending the rest of
+                    # a model run on a result that cannot pass. The report says so, and a replay stops at the same point.
+                    stopped = True
+                    report["stopped_early"] = "the gate already failed on the golden suite (--fail-fast)"
+            if wanted("adversarial") and not stopped:
                 report["adversarial"] = run_adversarial(make_settings(args.mode, Path(tmp) / "adversarial", live=False))
-            if wanted("critic"):
+            if wanted("critic") and not stopped:
                 report["critic"] = run_critic(make_settings(args.mode, Path(tmp) / "critic", live=False))
-            if wanted("calibration"):
+            if wanted("calibration") and not stopped:
                 # borderline answers count only once two humans have labelled them (eval/borderline.py)
                 borderline = [b for b in load_jsonl(DATASETS / "judge_borderline.jsonl") if b.get("label")]
                 report["calibration"] = calibrate(grader, [*load_jsonl(DATASETS / "judge_calibration.jsonl"), *borderline])
@@ -1244,8 +1280,7 @@ def main(argv: list[str] | None = None) -> int:
 
     failures: list[str] = []
     if args.gate:
-        baseline = json.loads((ROOT / "baseline.json").read_text(encoding="utf-8")).get(mode, {})
-        failures = check_gate(report, baseline)
+        failures = check_gate(report, load_baseline(mode))
         report["gate"] = failures
         report["gate_rule"] = GATE_RULE
 
@@ -1258,6 +1293,10 @@ def main(argv: list[str] | None = None) -> int:
         write_report(report, markdown, REPORTS / mode / "report")
     print(markdown)
     return 1 if failures else 0
+
+
+def load_baseline(mode: str) -> dict[str, Any]:
+    return json.loads((ROOT / "baseline.json").read_text(encoding="utf-8")).get(mode, {})
 
 
 def write_report(report: dict[str, Any], markdown: str, stem: Path) -> None:

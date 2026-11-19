@@ -12,7 +12,7 @@ def build_llm(settings: Settings) -> LLMClient:
     if settings.effective_provider() == "replay":
         from src.cassette import ReplayLLM, open_cassette
 
-        return ReplayLLM(open_cassette(settings.replay_from, "replay"))  # type: ignore[arg-type]
+        return ReplayLLM(open_cassette(settings.replay_from, "replay"), scope=settings.cassette_scope)  # type: ignore[arg-type]
     if settings.effective_provider() != "openai":
         return offline
     primary = OpenAIResponsesClient(
@@ -32,5 +32,5 @@ def build_llm(settings: Settings) -> LLMClient:
     if settings.record_to:
         from src.cassette import RecordingLLM, open_cassette
 
-        client = RecordingLLM(client, open_cassette(settings.record_to, "record"))
+        client = RecordingLLM(client, open_cassette(settings.record_to, "record"), scope=settings.cassette_scope)
     return client

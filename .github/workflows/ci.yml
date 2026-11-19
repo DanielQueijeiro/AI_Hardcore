@@ -14,6 +14,10 @@ on:
         description: "Independent model for the LLM judge (should differ from OPENAI_MODEL)"
         type: string
         default: "gpt-5.4-mini"
+      eval_workers:
+        description: "Golden conversations evaluated in parallel (each on its own app; lower it if the API rate-limits)"
+        type: number
+        default: 4
 
 permissions:
   contents: read
@@ -72,8 +76,10 @@ jobs:
   model-eval:
     # Semantic evaluation with the real model and the LLM judge, three runs, recorded to a cassette so anyone can
     # replay it without a key (job below). Manual, because it costs tokens.
+    # --workers runs golden conversations in parallel; --fail-fast skips the other suites once golden fails the gate.
     if: github.event_name == 'workflow_dispatch' && inputs.run_model_eval
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -81,7 +87,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e .
-      - run: python -m eval.run --gate --repeat 3 --record eval/reports/openai/cassette.json.gz
+      - run: python -m eval.run --gate --repeat 3 --workers "${{ inputs.eval_workers }}" --fail-fast --record eval/reports/openai/cassette.json.gz
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           JUDGE_MODEL: ${{ inputs.judge_model }}

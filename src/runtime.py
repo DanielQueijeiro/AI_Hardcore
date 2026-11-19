@@ -53,11 +53,11 @@ def build_live(settings: Settings, metrics: Metrics) -> LiveData:
     if settings.replay_from:
         from src.cassette import ReplayLive, open_cassette
 
-        return ReplayLive(open_cassette(settings.replay_from, "replay"), **options)
+        return ReplayLive(open_cassette(settings.replay_from, "replay"), scope=settings.cassette_scope, **options)
     if settings.record_to:
         from src.cassette import RecordingLive, open_cassette
 
-        return RecordingLive(open_cassette(settings.record_to, "record"), **options)
+        return RecordingLive(open_cassette(settings.record_to, "record"), scope=settings.cassette_scope, **options)
     return LiveData(**options)
 
 

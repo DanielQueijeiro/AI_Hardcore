@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pytest
@@ -208,3 +209,43 @@ def test_replay_restores_recorded_settings_and_compare_flags_unused_calls(tmp_pa
     replayed_report = {**published, "cassette": {"mode": "replay", "unused_recorded_calls": 2}}
     diffs = compare.differences(published, replayed_report)
     assert diffs == ["cassette: 2 recorded call(s) were not used during replay"]
+
+
+def test_scoped_conversations_replay_their_own_answers_whatever_order_they_ran_in(tmp_path):
+    # g08 and g15 open with the same message; evaluated in parallel, g15 may reach the model first. Unscoped, the
+    # FIFO list would hand g15's answer to g08 on a sequential replay.
+    path = tmp_path / "scoped.json.gz"
+    recorder = Cassette(path, "record")
+    request = {"role": "supervisor", "instructions": "i", "prompt": "My card machine is showing a transaction decline error."}
+    for scope, answer in (("golden/1/g15", "answer for g15"), ("golden/1/g08", "answer for g08")):
+        RecordingLLM(scripted({"supervisor": finish(answer)}), recorder, scope=scope).complete(**request)
+        RecordingLive(recorder, scope=scope, enabled=False).weather("Recife")
+    recorder.save()
+
+    replay = Cassette(path, "replay")
+    for scope, answer in (("golden/1/g08", "answer for g08"), ("golden/1/g15", "answer for g15")):
+        got = ReplayLLM(replay, scope=scope).complete(**request)
+        assert answer in str(got.tool_calls[0].arguments)
+        ReplayLive(replay, scope=scope).weather("Recife")
+    assert replay.unused() == 0
+    with pytest.raises(CassetteMiss):
+        ReplayLLM(replay).complete(**request)  # an unscoped request never reads a scoped recording
+
+
+def test_parallel_golden_runs_match_sequential_ones(tmp_path):
+    from eval import run as ev
+
+    items = ev.select_golden(["g01", "g08", "g15", "g17"])
+
+    def harness(run, item):
+        return ev.Harness(ev.make_settings("offline", tmp_path / f"w{id(item)}-{run}-{item['id']}", live=False, scope=f"golden/{run + 1}/{item['id']}"))
+
+    def strip(summary):
+        # Ticket and service-order ids are minted at random per conversation, sequential or not.
+        rows = [{k: v for k, v in row.items() if k not in ("latency_ms", "cost_usd", "answer_sha256")} for row in summary["items"]]
+        return normalize(json.dumps(rows, sort_keys=True, ensure_ascii=False))
+
+    sequential = ev.run_golden(harness, ev.judge_client, items, repeat=2, workers=1)
+    parallel = ev.run_golden(harness, ev.judge_client, items, repeat=2, workers=4)
+    assert [strip(s) for s in parallel] == [strip(s) for s in sequential]
+    assert [row["id"] for row in parallel[1]["items"]] == ["g01", "g08", "g15", "g17"]
