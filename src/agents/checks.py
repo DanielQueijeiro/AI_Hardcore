@@ -134,6 +134,18 @@ _COMPARE_OR_PRICE = re.compile(
     re.I,
 )
 _AMOUNT = re.compile(r"R\$\s?\d")
+_RATE_WORD = re.compile(r"\b(?:rates?|taxas?|tasas?|tarifas?)\b", re.I)
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+# Settlement modalities as get_settlements names them ("Pix Sales", "Debit Card Sales", "Credit Card Sales (1x)"),
+# matched on accent-folded text in English, Portuguese and Spanish. Word boundaries keep "credited" and
+# "crediário" from counting as the credit modality.
+_MODALITY_WORDS = {
+    "pix": re.compile(r"\bpix\b"),
+    "debit": re.compile(r"\b(?:debit|debito)\b"),
+    "credit": re.compile(r"\b(?:credit|credito)\b"),
+    "prepaid": re.compile(r"\b(?:prepaid|pre-?pago)\b"),
+    "voucher": re.compile(r"\bvouchers?\b"),
+}
 MAX_CHECKLIST_ITEMS = 8
 
 
@@ -216,7 +228,7 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
         executed = bool((observation.get("action_result") or {}).get("executed"))
         decision = {
             "reject": "The human operator did NOT approve the proposed action; nothing was changed. The draft must say so "
-            "plainly, give the operator's note, and stay on the problem the merchant asked about.",
+            "plainly in its first sentence, then give the operator's note, and stay on the problem the merchant asked about.",
             "answer": "A human specialist answered in this conversation. The draft must relay their answer and must not "
             "say that a person cannot be reached or that it cannot connect the merchant to one.",
             "approve": "The human operator approved the action. "
@@ -224,6 +236,12 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
         }.get(str(observation.get("decision")))
         if decision:
             items.append({"item": f"{decision} Operator's note: {note or '(none)'}", "found_in_draft": None})
+        # On approval the answer reports what is being fixed, so it names the code. A rejection leads with the decision
+        # and the operator's note; the code was already in the message sent while the operator reviewed.
+        if observation.get("proposed_action") and observation.get("decision") == "approve":
+            items += _decline_code_items(draft, observations)
+
+    items += _settlement_amount_items(draft, observations)
 
     for passage in passages:
         for steps in procedure_steps(str(passage["text"])):
@@ -272,7 +290,90 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
                 items.append(
                     {"item": f"Price the evidence states for {name}: " + ", ".join(f"R$ {a}" for a in amounts), "found_in_draft": False}
                 )
+    if len(asked) >= 2 and not _RATE_WORD.search(draft) and "%" not in draft:
+        items += _compared_rate_items(passages, asked)
     return items[:MAX_CHECKLIST_ITEMS]
+
+
+def _decline_code_items(draft: str, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """After a human approved a terminal action, the answer still owes the merchant the diagnosis they asked about:
+    the exact decline code of the transaction the action was proposed for (g08: 'POS_KEY_SYNC_WARN' alone)."""
+    items = []
+    for observation in observations:
+        if observation.get("agent") != "support":
+            continue
+        for call in observation.get("evidence") or []:
+            decline = (call.get("result") or {}).get("last_transaction_decline")
+            if not isinstance(decline, dict) or not decline.get("decline_code"):
+                continue
+            code = str(decline["decline_code"])
+            parts = [p.strip() for p in re.split(r"[/+,]", code) if p.strip()]
+            if all(p.lower() in draft.lower() for p in parts):
+                continue
+            transaction = str(decline.get("transaction_id") or "")
+            items.append(
+                {
+                    "item": f"The exact decline code the merchant asked about: {code}"
+                    + (f" on transaction {transaction}" if transaction else "")
+                    + ". State the whole code, not part of it.",
+                    "found_in_draft": False,
+                }
+            )
+    return list({i["item"]: i for i in items}.values())
+
+
+def _settlement_amount_items(draft: str, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each settlement modality the draft talks about must come with its amount (g17: Pix, debit and credit
+    schedules given, R$ 410 / 620 / 1,067 dropped because the Router asked for 'amounts only if needed').
+    Modalities the draft does not mention are left alone: the merchant may have asked about one of them only."""
+    folded = _fold(draft)
+    in_draft = numbers_in(draft)
+    items = []
+    for observation in observations:
+        if observation.get("agent") != "support":
+            continue
+        for call in observation.get("evidence") or []:
+            for row in (call.get("result") or {}).get("settlements") or []:
+                if not isinstance(row, dict):
+                    continue
+                modality = str(row.get("modality") or "")
+                key = _fold(modality).split()[0] if modality.strip() else ""
+                pattern = _MODALITY_WORDS.get(key)
+                amount = str(row.get("net_amount_brl") or row.get("gross_amount_brl") or "")
+                value = _normalize_number(_NUMBER.findall(amount)[0]) if _NUMBER.search(amount) else ""
+                if not (pattern and value and pattern.search(folded)) or value in in_draft:
+                    continue
+                window = str(row.get("scheduled_window") or row.get("settlement_cycle") or "")
+                items.append(
+                    {
+                        "item": f"Amount for {modality}: {amount} net ({window}). The draft gives this modality's schedule, "
+                        "so it must give its amount too.",
+                        "found_in_draft": False,
+                    }
+                )
+    return list({i["item"]: i for i in items}.values())
+
+
+def _compared_rate_items(passages: list[dict[str, Any]], asked: list[str]) -> list[dict[str, Any]]:
+    """Card rates are part of comparing two machines (g01: features and rental given, the shared rates dropped).
+    Only passages that name every compared product are read, so one product's rates are never pinned on another."""
+    sentences: list[str] = []
+    for passage in passages:
+        text = str(passage["text"])
+        if not all(name in text for name in asked):
+            continue
+        for sentence in _SENTENCE_END.split(text):
+            if "%" in sentence and _RATE_WORD.search(sentence) and sentence not in sentences:
+                sentences.append(sentence.strip())
+    if not sentences:
+        return []
+    return [
+        {
+            "item": f"Card rates the evidence states for {' and '.join(asked)}: " + " ".join(sentences[:2])[:400]
+            + " Say whether they differ.",
+            "found_in_draft": False,
+        }
+    ]
 
 
 def _fold(text: str) -> str:

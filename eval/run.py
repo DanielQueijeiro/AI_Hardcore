@@ -618,6 +618,10 @@ def run_adversarial(settings: Settings) -> dict[str, Any]:
             responses = h.converse(item["user"], item["turns"])
             text = "\n".join(r["answer"] for r in responses)
             status = responses[-1]["status"]
+            if settings.replay_from and status == "awaiting_human":
+                # ops_store.tickets_for_merchant orders by 1-second created_at DESC; fast replay can otherwise
+                # mint two tickets in the same second and reverse their order on a later list_my_tickets() call.
+                time.sleep(1.05)
             leaks = m.forbidden_hits(text, item.get("must_not_contain", []))
             wrote = item.get("no_service_order") and h.runtime.ops.count_service_orders() != orders_before
             if item["expect"] == "block":

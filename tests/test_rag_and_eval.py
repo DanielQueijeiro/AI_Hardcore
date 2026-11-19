@@ -370,6 +370,72 @@ def test_a_human_decision_is_the_first_checklist_item_whatever_the_language():
     assert "not finished" in evidence_checklist("fix it", "x", approved)[0]["item"]
 
 
+def test_checklist_keeps_the_decline_code_settlement_amounts_and_compared_rates():
+    from src.agents.checks import evidence_checklist
+
+    # g08: after the operator decided on the re-key, half of the code is not the diagnosis the merchant asked for.
+    diagnostics = {
+        "agent": "support",
+        "evidence": [
+            {
+                "tool": "get_pos_diagnostics",
+                "result": {"last_transaction_decline": {"transaction_id": "TX-88410", "decline_code": "ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN"}},
+            }
+        ],
+    }
+    decided = [diagnostics, {"agent": "escalation", "decision": "approve", "proposed_action": "terminal_rekey_or_swap"}]
+    half = "The decline is POS_KEY_SYNC_WARN. The re-key was approved; service order SO-D68D5A35 was created."
+    items = evidence_checklist("My card machine is showing a transaction decline error.", half, decided)
+    assert [i["found_in_draft"] for i in items[1:]] == [False] and "ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN on transaction TX-88410" in items[1]["item"]
+    whole = "The decline is ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN. The re-key was approved."
+    assert len(evidence_checklist("decline error", whole, decided)) == 1, "only the decision item when the code is there"
+    assert len(evidence_checklist("decline error", half, [diagnostics])) == 0, "no decision, no post-decision item"
+
+    # g17: every modality the draft schedules must carry its amount; a modality it does not mention is left alone.
+    settlements = [
+        {
+            "agent": "support",
+            "evidence": [
+                {
+                    "tool": "get_settlements",
+                    "result": {
+                        "settlements": [
+                            {"modality": "Pix Sales", "net_amount_brl": "R$ 410.00", "scheduled_window": "Instant (D+0, already credited)"},
+                            {"modality": "Debit Card Sales", "net_amount_brl": "R$ 620.00", "scheduled_window": "Today (D+1) by 14:00 BRT"},
+                            {"modality": "Credit Card Sales (1x)", "gross_amount_brl": "R$ 1,100.00", "net_amount_brl": "R$ 1,067.00"},
+                        ]
+                    },
+                }
+            ],
+        }
+    ]
+    message = "When will the money from yesterday's sales be deposited?"
+    no_amounts = "Pix was credited instantly; debit is scheduled for today by 2:00 p.m.; credit card 1x follows D+30."
+    items = evidence_checklist(message, no_amounts, settlements)
+    assert [i["item"].split(":")[0] for i in items] == ["Amount for Pix Sales", "Amount for Debit Card Sales", "Amount for Credit Card Sales (1x)"]
+    with_amounts = "Pix R$410 was credited instantly; debit R$ 620.00 is due today; credit card 1x R$1,067 follows D+30."
+    assert evidence_checklist(message, with_amounts, settlements) == []
+    portuguese = "O Pix (R$ 410,00) já caiu; o débito (R$ 620,00) cai hoje; o crédito à vista (R$ 1.067,00) segue D+30."
+    assert evidence_checklist("Quando cai o dinheiro?", portuguese, settlements, compare_text=False) == []
+    crediario = "Crediário sales are credited in one payment within 2 business days after capture."
+    assert evidence_checklist("When do I receive the crediário money?", crediario, settlements) == [], "'credited' is not the credit modality"
+
+    # g01: comparing two machines from a passage that names both and states their card rates.
+    def obs(text):
+        return [{"agent": "knowledge", "evidence": [{"tool": "search_getnet_knowledge", "result": {"results": [{"text": text, "source_url": "https://x.test/0"}]}}]}]
+
+    lineup = (
+        "Get Clássica and Get Smart are POS machines sold with the same published card rates (debit 1.69%, installments from "
+        "7.98% to 12.88%). Rental is R$ 79.90 for the Get Clássica versus R$ 129.90 for the Get Smart."
+    )
+    compare = "What's the difference between the Get Clássica and the Get Smart?"
+    draft = "The Get Smart is a 5-in-1 device. Rental is R$ 79.90 for the Clássica and R$ 129.90 for the Smart."
+    items = evidence_checklist(compare, draft, obs(lineup))
+    assert len(items) == 1 and items[0]["item"].startswith("Card rates the evidence states for Get Clássica and Get Smart: Get Clássica and Get Smart are POS")
+    assert evidence_checklist(compare, draft + " Their published card rates are the same.", obs(lineup)) == []
+    assert evidence_checklist("Does the Get Smart print?", "Yes.", obs(lineup)) == [], "one product: no comparison"
+
+
 def test_fx_quote_defaults_to_reais(monkeypatch, client):
     from src.security.auth import Principal
     from src.tools.registry import KNOWLEDGE_TOOLS, TOOLS, ToolContext, run_tool
