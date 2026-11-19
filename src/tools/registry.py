@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.cassette import CassetteMiss
 from src.db import support_store
 from src.runtime import Runtime
 from src.security.auth import Principal
@@ -75,15 +76,16 @@ def _search_getnet_knowledge(ctx: ToolContext, query: str, query_en: str = "") -
     """
     settings = ctx.runtime.settings
     k, mode = settings.retrieval_top_k, settings.effective_retrieval_mode()
-    primary = ctx.runtime.retriever.search(query, k=k, mode=mode)
-    found: list[tuple[str, Any]] = [("query", hit) for hit in primary]
-    seen = {hit.chunk.chunk_id for hit in primary}
     variants: dict[str, str] = {}
     for label, text in (("query_en", query_en), ("merchant_message", ctx.merchant_message[:MAX_STRING_ARG])):
         text = " ".join(text.split())
         if text and text.casefold() not in {query.casefold(), *(v.casefold() for v in variants.values())}:
             variants[label] = text
-    rankings = {label: ctx.runtime.retriever.search(text, k=k, mode=mode) for label, text in variants.items()}
+    all_rankings = ctx.runtime.retriever.search_many({"query": query, **variants}, k=k, mode=mode)
+    primary = all_rankings["query"]
+    found: list[tuple[str, Any]] = [("query", hit) for hit in primary]
+    seen = {hit.chunk.chunk_id for hit in primary}
+    rankings = {label: all_rankings[label] for label in variants}
     extras: list[tuple[str, Any]] = []
     for rank in range(k):  # interleave by rank, so each wording's best passage comes before anyone's second
         for label, hits in rankings.items():
@@ -373,6 +375,8 @@ def run_tool(ctx: ToolContext, name: str, arguments: dict[str, Any], allowed: tu
     try:
         result = tool.handler(ctx, **clean)
         outcome = "error" if result.get("error") or result.get("available") is False else "ok"
+    except CassetteMiss:
+        raise
     except Exception as exc:  # noqa: BLE001 - a broken tool is an observation for the agent, not a crashed turn
         logger.exception("tool_failed", extra={"tool": name})
         result = {"error": "tool_failed", "detail": type(exc).__name__}

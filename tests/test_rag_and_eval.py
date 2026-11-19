@@ -303,6 +303,18 @@ def test_evidence_checklist_lists_dropped_procedure_steps_and_prices():
     assert evidence_checklist(compare, "Rental is R$ 79.90 vs R$ 129.90.", obs(prices)) == []
     assert evidence_checklist("Does the Get Smart print receipts?", "Yes, it has a printer.", obs(prices)) == [], "no price asked, one product"
 
+    # Comparative sentence where prices appear *before* each product and 'versus' separates them (get-smart#5):
+    # each product must only receive its own prices, never the other product's.
+    versus = (
+        "Rental without minimum volume is R$ 79.90 per month for the Get Clássica versus R$ 129.90 for the Get Smart, "
+        "and the rental waiver starts at R$ 10 thousand of monthly sales for the Get Clássica versus R$ 60 thousand for the Get Smart."
+    )
+    items = evidence_checklist(compare, "The Get Smart is a 5-in-1 device; the Get Clássica is a classic POS.", obs(versus))
+    assert [i["item"] for i in items] == [
+        "Price the evidence states for Get Clássica: R$ 79.90, R$ 10 thousand",
+        "Price the evidence states for Get Smart: R$ 129.90, R$ 60 thousand",
+    ]
+
 
 def test_a_human_decision_is_the_first_checklist_item_whatever_the_language():
     from src.agents.checks import evidence_checklist
@@ -383,3 +395,59 @@ def test_borderline_labels_merge_and_report_human_agreement_apart(tmp_path, monk
     result = calibrate(ScriptedLLM({"judge": grade}), [clear, *merged])
     assert result["n"] == 1 and result["agreement"] == 1.0, "the headline is the clear-cut sets only"
     assert result["by_set"]["borderline"]["human_agreement"] == 0.75 and "human_kappa" in result["by_set"]["borderline"]
+
+
+def test_multi_query_dense_search_batches_embeddings_into_one_call(client):
+    from src.rag import Retriever, load_corpus
+    from src.security.auth import Principal
+    from src.tools.registry import KNOWLEDGE_TOOLS, ToolContext, run_tool
+
+    batches: list[list[str]] = []
+
+    class CountingEmbedder:
+        name = "counting-dense"
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            batches.append(list(texts))
+            return [[1.0, float(len(t) % 7) + 0.1] for t in texts]
+
+    runtime = client.app.state.runtime
+    runtime.retriever = Retriever(load_corpus(CORPUS), CountingEmbedder())
+    runtime.settings = runtime.settings.model_copy(update={"retrieval_mode": "dense"})
+    ctx = ToolContext(runtime, Principal("cliente1988", "merchant"), merchant_message="How many devices in one store?")
+    run_tool(ctx, "search_getnet_knowledge", {"query": "limite dispositivos loja", "query_en": "device limit per store"}, KNOWLEDGE_TOOLS)
+    assert len(batches) == 2, "one batch for corpus chunks, one batch for all three query wordings"
+    assert len(batches[1]) == 3
+
+
+def test_markdown_report_renders_heldout_retrieval_glossary_ablation_borderline_and_cassette(settings):
+    from eval.run import render_markdown
+
+    retrieval = run_retrieval(settings)
+    report = {
+        "mode": "openai",
+        "model": "m",
+        "judge_model": "j",
+        "live_web": True,
+        "generated_at": "2026-11-18T00:00:00+00:00",
+        "cassette": {"mode": "replay", "path": "eval/reports/openai/cassette.json.gz", "recorded_on": "2026-11-18", "unused_recorded_calls": 0},
+        "retrieval": retrieval,
+        "calibration": {
+            "n": 1,
+            "agreement": 1.0,
+            "kappa": 1.0,
+            "false_pass": 0,
+            "false_fail": 0,
+            "by_set": {
+                "independent": {"n": 1, "agreement": 1.0, "kappa": 1.0, "false_pass": 0, "false_fail": 0},
+                "borderline": {"n": 4, "agreement": 0.75, "kappa": 0.5, "false_pass": 0, "false_fail": 1, "human_agreement": 0.85, "human_kappa": 0.7},
+            },
+            "rows": [],
+        },
+    }
+    md = render_markdown(report)
+    assert "### Glossary ablation (dev, glossary off)" in md
+    assert "### Held-out queries (36 queries, written after the glossary)" in md
+    assert "### Held-out queries, glossary off" in md
+    assert "Human agreement | Human kappa" in md and "0.850 | 0.700" in md
+    assert "Cassette (replay): `eval/reports/openai/cassette.json.gz`" in md

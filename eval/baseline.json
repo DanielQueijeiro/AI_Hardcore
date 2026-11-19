@@ -27,6 +27,8 @@
   "openai": {
     "min": {
       "retrieval.modes.bm25.recall@4": 0.97,
+      "retrieval_hosted.modes.dense.mrr": 0.93,
+      "retrieval_hosted.modes.dense.recall@4": 0.97,
       "retrieval_hosted.modes.hybrid.mrr": 0.93,
       "retrieval_hosted.modes.hybrid.recall@4": 0.97,
       "calibration.agreement": 0.9,

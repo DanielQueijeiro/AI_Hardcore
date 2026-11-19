@@ -41,7 +41,7 @@ from eval.judge import calibrate, fit_evidence, judge, load_jsonl
 from src import clock
 from src.agents.checks import evidence_text
 from src.api.main import create_app
-from src.cassette import RecordingLLM, ReplayLLM, close_cassettes, open_cassette
+from src.cassette import CassetteMiss, RecordingLLM, ReplayLLM, close_cassettes, open_cassette
 from src.config import Settings
 from src.llm.base import LLMClient
 from src.llm.offline import OfflinePolicyLLM
@@ -187,13 +187,38 @@ class Harness:
 
 # Set by --record / --replay for the whole run; never applied to an offline run.
 CASSETTE: dict[str, Path | None] = {"record_to": None, "replay_from": None}
+# Runtime settings that shape prompts, retrieval or agent loops: saved into the cassette on --record and
+# restored on --replay, so a reviewer's local .env cannot make a replay diverge from the recording.
+RECORDED_SETTINGS = (
+    "retrieval_mode",
+    "retrieval_top_k",
+    "embedding_provider",
+    "embedding_model",
+    "reasoning_effort",
+    "guardrail_reasoning_effort",
+    "max_supervisor_steps",
+    "max_specialist_tool_steps",
+    "max_critic_rounds",
+    "max_parallel_tasks",
+    "history_keep_messages",
+    "history_compact_after",
+    "index_raw_pages",
+)
 
 
 def make_settings(mode: str, workdir: Path, live: bool) -> Settings:
     base = Settings()
     provider = "offline" if mode == "offline" or not base.openai_api_key else "openai"
+    recorded: dict[str, Any] = {}
+    if mode != "offline" and CASSETTE["replay_from"] is not None:
+        recorded = {
+            k: v
+            for k, v in open_cassette(CASSETTE["replay_from"], "replay").meta.get("settings", {}).items()
+            if k in RECORDED_SETTINGS
+        }
     return base.model_copy(
         update={
+            **recorded,
             **(CASSETTE if mode != "offline" else {"record_to": None, "replay_from": None}),
             "llm_provider": provider,
             "sqlite_db_path": workdir / "support.db",
@@ -848,6 +873,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         if p.get("git_dirty"):
             code += f" plus uncommitted changes in {', '.join(p['dirty_paths']) or 'the working tree'}"
         lines.append(f"- Code: {code}; input hashes in `provenance` of the JSON report")
+    if report.get("cassette"):
+        cas = report["cassette"]
+        detail = f"- Cassette ({cas['mode']}): `{cas['path']}` (date frozen to {cas.get('recorded_on')})"
+        if cas.get("sha256"):
+            detail += f", sha256 `{cas['sha256'][:16]}`"
+        if "unused_recorded_calls" in cas:
+            detail += f", unused calls: {cas['unused_recorded_calls']}"
+        lines.append(detail)
     lines.append("")
     if report["mode"] == "offline":
         lines += [
@@ -857,6 +890,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             "> `OPENAI_API_KEY` set for the model report.",
             "",
         ]
+    def _retrieval_table(modes: dict[str, Any]) -> list[str]:
+        rows = ["| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |", "|---|---|---|---|---|---|"]
+        for mode, s in modes.items():
+            rows.append(f"| {mode} | {s['hit@1']:.3f} | {s['recall@3']:.3f} | {s['recall@4']:.3f} | {s['mrr']:.3f} | {s['ndcg@4']:.3f} |")
+        return rows
+
+    def _retrieval_by_lang(modes: dict[str, Any]) -> list[str]:
+        rows = ["| Mode | Language | Hit@1 | Recall@4 | MRR |", "|---|---|---|---|---|"]
+        for mode, s in modes.items():
+            for lang, v in s["by_lang"].items():
+                rows.append(f"| {mode} | {lang} | {v['hit@1']:.3f} | {v['recall@4']:.3f} | {v['mrr']:.3f} |")
+        return rows
+
     for _key, _title in (("retrieval", "Retrieval"), ("retrieval_hosted", "Retrieval with hosted embeddings (same queries)")):
         if _key not in report:
             continue
@@ -864,18 +910,31 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines += [
             f"## {_title}",
             "",
-            f"{r['queries']} labelled queries (EN/PT/ES) over {r['chunks']} chunks. Dense embedder: `{r['embedder']}`. Configured mode: **{r['configured_mode']}**.",
+            f"{r['queries']} labelled queries (dev, EN/PT/ES) over {r['chunks']} chunks. Dense embedder: `{r['embedder']}`. Configured mode: **{r['configured_mode']}**.",
             "",
-            "| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |",
-            "|---|---|---|---|---|---|",
+            *_retrieval_table(r["modes"]),
+            "",
+            *_retrieval_by_lang(r["modes"]),
+            "",
+            f"Queries with no relevant chunk in the top {max(RETRIEVAL_KS)} ({r['configured_mode']}): {', '.join(r['misses_in_configured_mode']) or 'none'}",
+            "",
         ]
-        for mode, s in r["modes"].items():
-            lines.append(f"| {mode} | {s['hit@1']:.3f} | {s['recall@3']:.3f} | {s['recall@4']:.3f} | {s['mrr']:.3f} | {s['ndcg@4']:.3f} |")
-        lines += ["", "| Mode | Language | Hit@1 | Recall@4 | MRR |", "|---|---|---|---|---|"]
-        for mode, s in r["modes"].items():
-            for lang, v in s["by_lang"].items():
-                lines.append(f"| {mode} | {lang} | {v['hit@1']:.3f} | {v['recall@4']:.3f} | {v['mrr']:.3f} |")
-        lines += ["", f"Queries with no relevant chunk in the top {max(RETRIEVAL_KS)} ({r['configured_mode']}): {', '.join(r['misses_in_configured_mode']) or 'none'}", ""]
+        if r.get("glossary_off"):
+            lines += ["### Glossary ablation (dev, glossary off)", "", *_retrieval_table(r["glossary_off"]["modes"]), ""]
+        if r.get("heldout"):
+            h = r["heldout"]
+            lines += [
+                f"### Held-out queries ({h['queries']} queries, written after the glossary)",
+                "",
+                *_retrieval_table(h["modes"]),
+                "",
+                *_retrieval_by_lang(h["modes"]),
+                "",
+                f"Held-out queries with no relevant chunk in the top {max(RETRIEVAL_KS)} ({r['configured_mode']}): {', '.join(h['misses_in_configured_mode']) or 'none'}",
+                "",
+            ]
+            if h.get("glossary_off"):
+                lines += ["### Held-out queries, glossary off", "", *_retrieval_table(h["glossary_off"]["modes"]), ""]
     if "golden" in report:
         g = report["golden"]
         lines += [
@@ -995,22 +1054,29 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines += ["Disagreements: " + ", ".join(f"{r['id']} ({r['defect']}: {r['verdict']})" for r in wrong), ""]
     if report.get("calibration"):
         c = report["calibration"]
+        has_human = any("human_agreement" in s for s in c["by_set"].values())
         lines += [
             "## Judge calibration",
             "",
-            f"Judge vs reference pass/fail labels on {c['n']} hand-written answers: agreement **{c['agreement']:.3f}**, "
+            f"Judge vs reference pass/fail labels on {c['n']} clear-cut hand-written answers: agreement **{c['agreement']:.3f}**, "
             f"Cohen's kappa **{c['kappa']:.3f}**, false passes {c['false_pass']}, false fails {c['false_fail']}.",
             "",
-            "| Set | n | Agreement | Kappa | False passes | False fails |",
-            "|---|---|---|---|---|---|",
+            "| Set | n | Agreement | Kappa | False passes | False fails |" + (" Human agreement | Human kappa |" if has_human else ""),
+            "|---|---|---|---|---|---|" + ("---|---|" if has_human else ""),
         ]
         for name, s in c["by_set"].items():
-            lines.append(f"| {name} | {s['n']} | {s['agreement']:.3f} | {s['kappa']:.3f} | {s['false_pass']} | {s['false_fail']} |")
+            extra = (
+                f" {s['human_agreement']:.3f} | {s['human_kappa']:.3f} |"
+                if "human_agreement" in s
+                else (" n/a | n/a |" if has_human else "")
+            )
+            lines.append(f"| {name} | {s['n']} | {s['agreement']:.3f} | {s['kappa']:.3f} | {s['false_pass']} | {s['false_fail']} |{extra}")
         disagreements = [r for r in c["rows"] if r["human"] != r["judge"]]
         lines += [
             "",
             "`original` items were written alongside the golden set (some after the judge disagreed on a golden item); "
-            "`independent` items use questions that appear in no golden item.",
+            "`independent` items use questions that appear in no golden item; "
+            "`borderline` items (when labelled by two humans) measure near-miss agreement next to human-human agreement and stay out of the headline.",
             "",
         ]
         if disagreements:
@@ -1072,66 +1138,75 @@ def main(argv: list[str] | None = None) -> int:
             recorder = open_cassette(args.record, "record")
             recorder.meta["args"] = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k not in ("record", "replay")}
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        probe = make_settings(args.mode, Path(tmp) / "probe", live=False)
-        mode = "openai" if probe.effective_provider() in ("openai", "replay") else "offline"
-        live = args.live == "on" or (args.live == "auto" and mode == "openai")
-        grader = judge_client(probe)
-        report: dict[str, Any] = {
-            "mode": mode,
-            "model": (open_cassette(args.replay, "replay").meta.get("models", {}).get("app", "replay") if args.replay else probe.openai_model)
-            if mode == "openai"
-            else OfflinePolicyLLM.model,
-            "judge_model": getattr(grader, "model", "none") if mode == "openai" else "none",
-            "live_web": live,
-            "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-            "datasets_sha256": dataset_hashes(),
-            "provenance": provenance(),
-        }
-        if partial:
-            report["selection"] = {"ids": ids, "split": args.split}
-        wanted = lambda name: suite in ("all", name)  # noqa: E731
-        if wanted("retrieval"):
-            report["retrieval"] = run_retrieval(probe.model_copy(update={"embedding_provider": "local"}))  # keyless, as in CI
-            if mode == "openai":
-                # The keyless embedder is not a semantic model, so "hybrid vs BM25" is also measured with a real one.
-                hosted = probe.model_copy(update={"embedding_provider": "openai"})
-                try:
-                    report["retrieval_hosted"] = run_retrieval(hosted)
-                except Exception as exc:  # noqa: BLE001 - an embeddings outage must not lose the rest of the report
-                    report["retrieval_hosted_error"] = repr(exc)[:200]
-        if wanted("golden"):
-            counter = iter(range(100_000))
-            items = select_golden(ids, args.split)
-            runs = [
-                run_golden(lambda: Harness(make_settings(args.mode, Path(tmp) / f"golden-{next(counter)}", live)), grader, items)
-                for _ in range(max(1, args.repeat))
-            ]
-            report["golden"] = runs[0]
-            if len(runs) > 1:
-                report["golden_repeats"] = repeat_summary(runs)
-                report["golden_repeat_items"] = [run["items"] for run in runs[1:]]
-            if mode == "openai":
-                # Model runs only: offline failures are the rule policy's known limits (language, decomposition),
-                # described in the offline report itself, not answers to review one by one.
-                report["adjudication"] = adjudicate(report, load_adjudications())
-        if wanted("adversarial"):
-            report["adversarial"] = run_adversarial(make_settings(args.mode, Path(tmp) / "adversarial", live=False))
-        if wanted("critic"):
-            report["critic"] = run_critic(make_settings(args.mode, Path(tmp) / "critic", live=False))
-        if wanted("calibration"):
-            # borderline answers count only once two humans have labelled them (eval/borderline.py)
-            borderline = [b for b in load_jsonl(DATASETS / "judge_borderline.jsonl") if b.get("label")]
-            report["calibration"] = calibrate(grader, [*load_jsonl(DATASETS / "judge_calibration.jsonl"), *borderline])
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            probe = make_settings(args.mode, Path(tmp) / "probe", live=False)
+            if args.record:
+                open_cassette(args.record, "record").meta["settings"] = {k: getattr(probe, k) for k in RECORDED_SETTINGS}
+            mode = "openai" if probe.effective_provider() in ("openai", "replay") else "offline"
+            live = args.live == "on" or (args.live == "auto" and mode == "openai")
+            grader = judge_client(probe)
+            report: dict[str, Any] = {
+                "mode": mode,
+                "model": (open_cassette(args.replay, "replay").meta.get("models", {}).get("app", "replay") if args.replay else probe.openai_model)
+                if mode == "openai"
+                else OfflinePolicyLLM.model,
+                "judge_model": getattr(grader, "model", "none") if mode == "openai" else "none",
+                "live_web": live,
+                "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "datasets_sha256": dataset_hashes(),
+                "provenance": provenance(),
+            }
+            if partial:
+                report["selection"] = {"ids": ids, "split": args.split}
+            wanted = lambda name: suite in ("all", name)  # noqa: E731
+            if wanted("retrieval"):
+                report["retrieval"] = run_retrieval(probe.model_copy(update={"embedding_provider": "local"}))  # keyless, as in CI
+                if mode == "openai":
+                    # The keyless embedder is not a semantic model, so "hybrid vs BM25" is also measured with a real one.
+                    hosted = probe.model_copy(update={"embedding_provider": "openai"})
+                    try:
+                        report["retrieval_hosted"] = run_retrieval(hosted)
+                    except CassetteMiss:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - an embeddings outage must not lose the rest of the report
+                        report["retrieval_hosted_error"] = repr(exc)[:200]
+            if wanted("golden"):
+                counter = iter(range(100_000))
+                items = select_golden(ids, args.split)
+                runs = [
+                    run_golden(lambda: Harness(make_settings(args.mode, Path(tmp) / f"golden-{next(counter)}", live)), grader, items)
+                    for _ in range(max(1, args.repeat))
+                ]
+                report["golden"] = runs[0]
+                if len(runs) > 1:
+                    report["golden_repeats"] = repeat_summary(runs)
+                    report["golden_repeat_items"] = [run["items"] for run in runs[1:]]
+                if mode == "openai":
+                    # Model runs only: offline failures are the rule policy's known limits (language, decomposition),
+                    # described in the offline report itself, not answers to review one by one.
+                    report["adjudication"] = adjudicate(report, load_adjudications())
+            if wanted("adversarial"):
+                report["adversarial"] = run_adversarial(make_settings(args.mode, Path(tmp) / "adversarial", live=False))
+            if wanted("critic"):
+                report["critic"] = run_critic(make_settings(args.mode, Path(tmp) / "critic", live=False))
+            if wanted("calibration"):
+                # borderline answers count only once two humans have labelled them (eval/borderline.py)
+                borderline = [b for b in load_jsonl(DATASETS / "judge_borderline.jsonl") if b.get("label")]
+                report["calibration"] = calibrate(grader, [*load_jsonl(DATASETS / "judge_calibration.jsonl"), *borderline])
 
-    if args.record or args.replay:
-        used = open_cassette(args.record or args.replay, "record" if args.record else "replay")
-        report["cassette"] = {"mode": "record" if args.record else "replay", "path": str(args.record or args.replay), "recorded_on": used.meta.get("recorded_on")}
-        if args.replay:
-            report["cassette"]["unused_recorded_calls"] = used.unused()  # > 0: the replay took a different path
-        close_cassettes()
-        if args.record:
-            report["cassette"]["sha256"] = _file_sha256(args.record)
+        if args.record or args.replay:
+            used = open_cassette(args.record or args.replay, "record" if args.record else "replay")
+            report["cassette"] = {"mode": "record" if args.record else "replay", "path": str(args.record or args.replay), "recorded_on": used.meta.get("recorded_on")}
+            if args.replay:
+                report["cassette"]["unused_recorded_calls"] = used.unused()  # > 0: the replay took a different path
+            close_cassettes()
+            if args.record:
+                report["cassette"]["sha256"] = _file_sha256(args.record)
+    finally:
+        CASSETTE.update(record_to=None, replay_from=None)
+        clock.freeze(None)
+        close_cassettes(save=False)  # normal exit already saved above; never leave stale handles open
 
     failures: list[str] = []
     if args.gate:

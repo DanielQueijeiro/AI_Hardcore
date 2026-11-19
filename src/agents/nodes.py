@@ -29,6 +29,7 @@ from src.agents.checks import (
     urls_in,
 )
 from src.agents.state import AgentState
+from src.cassette import CassetteMiss, ReplayLLM, commit_recordings, stage_recordings
 from src.db.ops_store import ALLOWED_ACTIONS, OPEN_STATUSES
 from src.llm.base import LLMResponse
 from src.observability import Spans
@@ -147,13 +148,23 @@ class Nodes:
         with spans.timed("guardrail_input") as extra:
             verdict = deterministic_input_check(state["message"], principal)
             if verdict.allowed and self.rt.llm.name != "offline":
-                pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speculative-router") if settings.speculative_router else None
-                router = pool.submit(self.supervisor, state) if pool else None
+                run_speculative = settings.speculative_router and not settings.replay_from and not isinstance(self.rt.llm, ReplayLLM)
+                pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speculative-router") if run_speculative else None
+                staged: list[Any] = []
+
+                def run_router() -> dict[str, Any]:
+                    with stage_recordings(staged):
+                        return self.supervisor(state)
+
+                router = pool.submit(run_router) if pool else None
                 verdict = check_input(state["message"], principal, self.rt.llm, settings.guardrail_reasoning_effort)
                 if pool and router:
                     if verdict.allowed:
                         try:
                             speculative = router.result()
+                            commit_recordings(staged)
+                        except CassetteMiss:
+                            raise
                         except Exception as exc:  # noqa: BLE001 - the Router node simply runs the step again
                             logger.warning("speculative_router_failed", extra={"error": repr(exc)})
                     pool.shutdown(wait=False, cancel_futures=True)  # a blocked message does not wait for the Router

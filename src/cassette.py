@@ -23,12 +23,16 @@ import re
 import struct
 import threading
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src import clock
-from src.llm.base import LLMClient, LLMResponse, ToolCall
 from src.tools.live import LiveData
+
+if TYPE_CHECKING:
+    from src.llm.base import LLMClient, LLMResponse
 
 FORMAT = 2  # 2: first recorded vector per text wins, canary normalized
 _VOLATILE = (
@@ -42,6 +46,29 @@ _VOLATILE = (
 
 class CassetteMiss(RuntimeError):
     """Replay was asked for something the recording does not contain."""
+
+
+_STAGED = threading.local()
+
+
+@contextmanager
+def stage_recordings(bucket: list[tuple[Cassette, str, dict[str, Any], Any]]) -> Iterator[None]:
+    """Capture Cassette.put calls on this thread into `bucket` instead of writing them immediately.
+
+    Used by the speculative first Router step: if the input classifier blocks the message, `bucket` is dropped
+    and the discarded speculative call never enters the cassette or races with saving it.
+    """
+    previous = getattr(_STAGED, "bucket", None)
+    _STAGED.bucket = bucket
+    try:
+        yield
+    finally:
+        _STAGED.bucket = previous
+
+
+def commit_recordings(bucket: list[tuple[Cassette, str, dict[str, Any], Any]]) -> None:
+    for cassette, kind, payload, response in bucket:
+        cassette.put(kind, payload, response)
 
 
 def normalize(text: str) -> str:
@@ -77,8 +104,12 @@ class Cassette:
     # --- calls (FIFO per key) ---
 
     def put(self, kind: str, payload: dict[str, Any], response: Any) -> None:
-        key = request_key(kind, payload)
         frozen = json.loads(json.dumps(response, default=str))  # callers may mutate what they got back
+        bucket = getattr(_STAGED, "bucket", None)
+        if bucket is not None:
+            bucket.append((self, kind, payload, frozen))
+            return
+        key = request_key(kind, payload)
         with self._lock:
             self._calls.setdefault(key, deque()).append(frozen)
 
@@ -110,7 +141,8 @@ class Cassette:
 
     def vector(self, model: str, text: str) -> list[float]:
         key = request_key("embedding", {"model": model, "text": text})
-        packed = self.embeddings.get(key)
+        with self._lock:
+            packed = self.embeddings.get(key)
         if packed is None:
             raise CassetteMiss(f"no recorded embedding for a text of {len(text)} characters (model {model})")
         raw = base64.b64decode(packed)
@@ -136,10 +168,10 @@ def open_cassette(path: Path | str, mode: str) -> Cassette:
         return _OPEN[key]
 
 
-def close_cassettes() -> None:
+def close_cassettes(*, save: bool = True) -> None:
     with _OPEN_LOCK:
         for cassette in _OPEN.values():
-            if cassette.mode == "record":
+            if save and cassette.mode == "record":
                 cassette.save()
         _OPEN.clear()
 
@@ -163,6 +195,8 @@ def _dump_response(response: LLMResponse) -> dict[str, Any]:
 
 
 def _load_response(data: dict[str, Any]) -> LLMResponse:
+    from src.llm.base import LLMResponse, ToolCall
+
     return LLMResponse(
         text=data["text"],
         tool_calls=[ToolCall(**c) for c in data["tool_calls"]],

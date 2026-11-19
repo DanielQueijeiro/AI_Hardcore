@@ -275,9 +275,11 @@ def test_output_guard_does_not_take_a_luhn_valid_phone_number_for_a_card():
     ):
         answer, verdict = check_output(phone, MERCHANT)
         assert answer == phone and verdict.category == "safe", phone
-    for card in ("5555 5555 5555 4444", "3782 822463 10005", "4222222222222", "6062 8288 8866 6688"):
+    for card in ("5555 5555 5555 4444", "3782 822463 10005", "4222222222222", "6062 8288 8866 6688", "+4111 1111 1111 1111"):
         answer, verdict = check_output(f"The card {card} was declined.", MERCHANT)
-        assert verdict.category == "redacted_pii" and card not in answer, card
+        assert verdict.category == "redacted_pii" and card.lstrip("+") not in answer, card
+    _, tool_verdict = check_output("I used delegate_parallel to look both up.", MERCHANT)
+    assert not tool_verdict.allowed and tool_verdict.category == "prompt_leak"
 
 
 def test_specialist_degraded_flag_propagates_and_prevents_language_rewrite_loop(make_client):

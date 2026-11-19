@@ -3,8 +3,9 @@
     python -m eval.run --replay eval/reports/openai/cassette.json.gz --out /tmp/replay
     python -m eval.compare eval/reports/openai/report.json /tmp/replay.json
 
-Every metric must be identical. What a replay cannot reproduce is left out: wall-clock latency, the cost computed
-from it, timestamps, provenance (the replay runs other code paths' commit), and the cassette block itself.
+Every metric must be identical. What a replay cannot reproduce is left out: wall-clock latency, pricing-dependent
+cost, timestamps, provenance (the replay runs other code paths' commit), and the cassette block itself (except
+unused recorded calls, which must be zero).
 Answers are compared by their SHA-256, item by item, so a passing comparison means the replay produced the same
 answers, not just the same averages.
 """
@@ -35,6 +36,9 @@ def differences(published: dict[str, Any], replayed: dict[str, Any]) -> list[str
     out += [f"{k}: answer differs" for k in sorted(set(answers_a) | set(answers_b)) if answers_a.get(k) != answers_b.get(k)]
     if published.get("gate") != replayed.get("gate"):
         out.append(f"gate: published {published.get('gate')} vs replayed {replayed.get('gate')}")
+    unused = (replayed.get("cassette") or {}).get("unused_recorded_calls", 0)
+    if unused:
+        out.append(f"cassette: {unused} recorded call(s) were not used during replay")
     return out
 
 

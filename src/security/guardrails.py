@@ -21,6 +21,7 @@ import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from src.cassette import CassetteMiss
 from src.llm.base import LLMClient
 from src.security.auth import Principal
 
@@ -110,8 +111,9 @@ def _issuer_allows(digits: str) -> bool:
     return True
 
 
-def _written_as_phone(text: str, start: int, raw: str) -> bool:
-    return (start > 0 and text[start - 1] == "+") or bool(_PHONE_LAYOUT.match(raw))
+def _written_as_phone(text: str, start: int, raw: str, digits: str) -> bool:
+    # ITU-T E.164 phone numbers are at most 15 digits; a leading '+' must not exempt a 16-19 digit PAN.
+    return (start > 0 and text[start - 1] == "+" and len(digits) <= 15) or bool(_PHONE_LAYOUT.match(raw))
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -134,7 +136,7 @@ def redact_personal_identifiers(text: str) -> str:
             13 <= len(digits) <= 19
             and _luhn_valid(digits)
             and _issuer_allows(digits)
-            and not _written_as_phone(match.string, match.start(), raw)
+            and not _written_as_phone(match.string, match.start(), raw, digits)
         )
         return "[redacted card number]" if is_card else raw
 
@@ -142,7 +144,7 @@ def redact_personal_identifiers(text: str) -> str:
 
 
 _ORCHESTRATION_TOOL_PATTERN = re.compile(
-    r"\b(?:delegate_knowledge|delegate_support|escalate_to_human|human_review_brief|guardrail_verdict)\b",
+    r"\b(?:delegate_knowledge|delegate_support|delegate_parallel|escalate_to_human|human_review_brief|guardrail_verdict)\b",
     re.I,
 )
 
@@ -290,6 +292,8 @@ def check_input(message: str, principal: Principal, llm: LLMClient, effort: str 
         if second is not None and second[0] in UNSAFE_CATEGORIES:
             return GuardVerdict(False, second[0], second[1] or reason, layer="llm")
         return GuardVerdict(True, "safe", f"first pass said {category}; not confirmed on review", layer="llm")
+    except CassetteMiss:
+        raise
     except Exception:  # noqa: BLE001 - classifier outage must not take support down; layer 1 already passed
         return GuardVerdict(True, "safe", "llm classifier unavailable; deterministic layer passed", layer="deterministic")
 

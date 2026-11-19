@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from src.cassette import CassetteMiss
 from src.llm.base import LLMClient
 
 JUDGE_INSTRUCTIONS = """You are a strict evaluator of a payments-support assistant. Grade the ANSWER to the QUESTION using the REFERENCE (what a correct answer contains) and the EVIDENCE (everything the assistant was allowed to rely on). Call grade.
@@ -80,6 +81,8 @@ def judge(
             tool_choice="grade",
             effort="low",
         )
+    except CassetteMiss:
+        raise
     except Exception:  # noqa: BLE001
         return None
     if response.degraded or not response.tool_calls:

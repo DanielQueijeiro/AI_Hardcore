@@ -126,6 +126,8 @@ def fabricated_urls(answer: str, observations: list[dict[str, Any]], *context: s
 
 _STEP_MARK = re.compile(r"(?<![\w(])(\d{1,2})\)\s+")
 _PRODUCT_NAME = re.compile(r"\bGet [A-ZÀ-Ý][\wÀ-ÿ]+")
+_CLAUSE_SPLIT = re.compile(r"[.,](?!\d)|[;()]|\b(?:versus|vs\.?|and)\b", re.I)
+_PRICE_VALUE = re.compile(r"R\$\s?(\d[\d.,]*\d(?:\s+(?:thousand|million|mil))?)", re.I)
 _COMPARE_OR_PRICE = re.compile(
     r"differ|compar|\bvs\b|versus|better|which (one|should)|cost|price|how much|rent|\bfee|"
     r"diferen|melhor|cuesta|precio|pre[cç]o|quanto|aluguel|alquiler|\btaxa|tarifa",
@@ -133,6 +135,21 @@ _COMPARE_OR_PRICE = re.compile(
 )
 _AMOUNT = re.compile(r"R\$\s?\d")
 MAX_CHECKLIST_ITEMS = 8
+
+
+def _product_amounts(text: str, name: str) -> list[str]:
+    """R$ amounts that belong unambiguously to `name`.
+
+    Splits on clause boundaries (including 'versus'/'vs'/'and') and keeps only clauses where `name` is the sole
+    product mentioned, so comparative sentences ("R$ 79.90 for the Get Clássica versus R$ 129.90 for the Get Smart")
+    never attribute one product's price to another.
+    """
+    amounts: list[str] = []
+    for clause in _CLAUSE_SPLIT.split(text):
+        names = set(_PRODUCT_NAME.findall(clause))
+        if names == {name}:
+            amounts.extend(_PRICE_VALUE.findall(clause))
+    return list(dict.fromkeys(amounts))
 
 
 def evidence_passages(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -236,7 +253,7 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
     asked = sorted({n for n in _PRODUCT_NAME.findall(text) if _fold(n) in folded_message})
     if asked and (len(asked) >= 2 or _COMPARE_OR_PRICE.search(message)) and not _AMOUNT.search(draft):
         for name in asked:
-            amounts = list(dict.fromkeys(re.findall(re.escape(name) + r"[^.;()]{0,40}?R\$\s?(\d[\d.,]*\d)", text)))
+            amounts = _product_amounts(text, name)
             if amounts:
                 items.append(
                     {"item": f"Price the evidence states for {name}: " + ", ".join(f"R$ {a}" for a in amounts), "found_in_draft": False}

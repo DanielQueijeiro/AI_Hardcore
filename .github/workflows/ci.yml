@@ -10,6 +10,10 @@ on:
         description: "Also run the evaluation against the real model (needs the OPENAI_API_KEY secret)"
         type: boolean
         default: false
+      judge_model:
+        description: "Independent model for the LLM judge (should differ from OPENAI_MODEL)"
+        type: string
+        default: "gpt-5.4-mini"
 
 permissions:
   contents: read
@@ -80,6 +84,7 @@ jobs:
       - run: python -m eval.run --gate --repeat 3 --record eval/reports/openai/cassette.json.gz
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JUDGE_MODEL: ${{ inputs.judge_model }}
           RETRIEVAL_MODE: auto
           EMBEDDING_PROVIDER: auto
       - uses: actions/upload-artifact@v4
@@ -102,8 +107,13 @@ jobs:
       - name: Replay the recorded model run
         if: hashFiles('eval/reports/openai/cassette.json.gz') != ''
         run: |
-          python -m eval.run --replay eval/reports/openai/cassette.json.gz --out replayed > replayed-run.md || true
+          python -m eval.run --replay eval/reports/openai/cassette.json.gz --out replayed > replayed-run.md
           python -m eval.compare eval/reports/openai/report.json replayed.json
+      - uses: actions/upload-artifact@v4
+        if: always() && hashFiles('eval/reports/openai/cassette.json.gz') != ''
+        with:
+          name: model-eval-replay-report
+          path: replayed-run.md
       - name: No cassette committed yet
         if: hashFiles('eval/reports/openai/cassette.json.gz') == ''
         run: echo "eval/reports/openai/cassette.json.gz is not committed; nothing to replay."
