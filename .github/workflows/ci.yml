@@ -87,6 +87,10 @@ jobs:
           JUDGE_MODEL: ${{ inputs.judge_model }}
           RETRIEVAL_MODE: auto
           EMBEDDING_PROVIDER: auto
+          LLM_TIMEOUT_SECONDS: "90"
+          LLM_MAX_RETRIES: "5"
+          BREAKER_FAILURE_THRESHOLD: "8"
+          BREAKER_COOLDOWN_SECONDS: "15"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

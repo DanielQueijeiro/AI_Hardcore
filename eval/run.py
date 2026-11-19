@@ -25,10 +25,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -532,6 +534,14 @@ def critic_observations(item: dict[str, Any], chunks: dict[str, Any]) -> list[di
     return observations
 
 
+def _wait_for_breaker(llm: Any) -> None:
+    """Wait out an open circuit breaker before the next eval item so one transient API burst cannot
+    silently sweep the rest of a multi-item suite through the offline fallback in milliseconds."""
+    if getattr(llm, "breaker_open", False):
+        remaining = max(0.0, float(getattr(llm, "_open_until", 0.0)) - time.monotonic())
+        time.sleep(min(remaining + 0.5, float(getattr(llm, "cooldown_seconds", 60.0)) + 1.0))
+
+
 def run_critic(settings: Settings) -> dict[str, Any]:
     """The Critic as a classifier: does it send back drafts with a known defect, and approve clean ones?
 
@@ -546,6 +556,7 @@ def run_critic(settings: Settings) -> dict[str, Any]:
     rows = []
     try:
         for item in load_jsonl(DATASETS / "critic_calibration.jsonl"):
+            _wait_for_breaker(h.runtime.llm)
             state = {
                 "message": item["message"],
                 "observations": critic_observations(item, chunks),
@@ -602,6 +613,7 @@ def run_adversarial(settings: Settings) -> dict[str, Any]:
     rows = []
     try:
         for item in load_jsonl(DATASETS / "adversarial.jsonl"):
+            _wait_for_breaker(h.runtime.llm)
             orders_before = h.runtime.ops.count_service_orders()
             responses = h.converse(item["user"], item["turns"])
             text = "\n".join(r["answer"] for r in responses)
@@ -1160,6 +1172,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.record:
                 open_cassette(args.record, "record").meta["settings"] = {k: getattr(probe, k) for k in RECORDED_SETTINGS}
             mode = "openai" if probe.effective_provider() in ("openai", "replay") else "offline"
+            if mode == "openai" and not args.replay:
+                logging.getLogger("src.llm.resilient").setLevel(logging.WARNING)
             live = args.live == "on" or (args.live == "auto" and mode == "openai")
             grader = judge_client(probe)
             report: dict[str, Any] = {

@@ -504,3 +504,24 @@ def test_critic_calibration_reports_dev_and_heldout_separately(settings):
     assert result["by_set"]["heldout"]["recall"] == 0.125 and result["by_set"]["heldout"]["false_revise_rate"] == 0.0
     md = render_markdown({"mode": "offline", "model": "m", "judge_model": "none", "live_web": False, "generated_at": "now", "critic": result})
     assert "| Set | n | Recall | False revise |" in md and "| heldout | 16 | 0.125 | 0.000 |" in md
+
+
+def test_wait_for_breaker_sleeps_only_when_open(monkeypatch):
+    import eval.run as eval_run
+
+    slept: list[float] = []
+    monkeypatch.setattr(eval_run.time, "sleep", slept.append)
+    monkeypatch.setattr(eval_run.time, "monotonic", lambda: 100.0)
+
+    class Closed:
+        breaker_open = False
+
+    class Open:
+        breaker_open = True
+        cooldown_seconds = 15.0
+        _open_until = 110.0
+
+    eval_run._wait_for_breaker(Closed())
+    assert slept == []
+    eval_run._wait_for_breaker(Open())
+    assert len(slept) == 1 and 10.0 <= slept[0] <= 11.0
