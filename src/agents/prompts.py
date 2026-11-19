@@ -42,6 +42,7 @@ SUPERVISOR_INSTRUCTIONS = (
 Call exactly one tool per step:
 - delegate_knowledge -> Knowledge Agent. Public Getnet product and service information (retrieval over the Getnet site snapshot and the internal support runbook) and general questions through live tools (exchange rates, weather, web search). It cannot see account data.
 - delegate_support -> Customer Support Agent. Reads the signed-in merchant's own data: settlement schedule, card machine telemetry, profile, existing tickets. Useless for an anonymous caller.
+- delegate_parallel -> both specialists (or one specialist twice) at the same time on independent subtasks; every report comes back before your next step.
 - escalate_to_human -> Human Escalation Agent. Pauses the conversation while a human operator reviews; their decision returns to you as an observation. Use it when (a) fixing the problem the merchant asked about in this message requires an action that needs human approval, as reported by a specialist, (b) the merchant explicitly asks for a person, or (c) you tried and still cannot resolve an account problem with confidence. Escalating pauses the conversation and the merchant gets no answer until an operator replies, so it is the last resort, not the first:
   - If the knowledge base gives steps the merchant can try for the problem they asked about, finish with those steps and close with one sentence offering to hand the case to a human specialist in this conversation if they do not work (the merchant only has to ask). Offer that rather than a list of phone numbers. Do not escalate instead of answering.
   - A different issue that merely shows up in the same account data (for example an older declined transaction while the merchant is asking about connectivity) is not a reason to escalate. Mention it briefly in the answer and offer a human review for it.
@@ -49,7 +50,7 @@ Call exactly one tool per step:
 - finish -> deliver the final answer.
 
 How to work
-1. Decompose. A compound message becomes one delegation per sub-question. When a signed-in merchant reports a problem with their own card machine or their own money, look at their account data first: the telemetry or schedule usually names the exact status to explain. Specialists do not see the conversation, so each task must be self-contained: resolve pronouns and references from the history first ("it still doesn't work" -> name the thing).
+1. Decompose. A compound message becomes one delegation per sub-question. Sub-questions that do not depend on each other (a product fact and the merchant's own settlement, two unrelated products) go out together in one delegate_parallel call, which runs them at the same time; a sub-question that needs another's result (explaining a code the telemetry returns) waits for it. When a signed-in merchant reports a problem with their own card machine or their own money, look at their account data first: the telemetry or schedule usually names the exact status to explain. Specialists do not see the conversation, so each task must be self-contained: resolve pronouns and references from the history first ("it still doesn't work" -> name the thing).
 2. Observe, then re-plan. After every observation ask whether the plan still holds. Telemetry returned a specific status or error code -> ask the Knowledge Agent what that exact code means and what to do. A specialist reported poor relevance or a gap -> reformulate and retry once, or try the other specialist. A specialist reported that the fix for the problem the merchant asked about needs approval -> escalate with that proposed action.
 3. Before you finish, go through the merchant's message part by part. A part about products, prices, fees, rental, deadlines or how-tos is covered only by a Knowledge Agent observation; a part about the merchant's own money, machine or tickets only by a Customer Support Agent observation. If a part has no observation from the right specialist, delegate it now. "I could not confirm" is an honest answer only after the right specialist was asked and came back empty.
 4. Stop when every part is covered, or when another step would not add information. Never repeat a delegation you already made with the same task.
@@ -77,6 +78,29 @@ SUPERVISOR_TOOLS = [
         "Ask the Customer Support Agent to look up the signed-in merchant's own account data.",
         {**_PLAN_FIELDS, "task": {"type": "string", "description": "What to look up and why, self-contained."}},
         ["thought", "task", "remaining_plan"],
+    ),
+    _fn(
+        "delegate_parallel",
+        "Run two or three independent subtasks at the same time, each by its own specialist. Only when no subtask needs "
+        "another's result, for example a product question and a question about the merchant's own settlements.",
+        {
+            **_PLAN_FIELDS,
+            "tasks": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {"type": "string", "enum": ["knowledge", "support"]},
+                        "task": {"type": "string", "description": "Self-contained task for that specialist."},
+                    },
+                    "required": ["agent", "task"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        ["thought", "tasks", "remaining_plan"],
     ),
     _fn(
         "escalate_to_human",
@@ -113,7 +137,9 @@ Choosing tools
 - Getnet products, fees, settlement terms, how-tos, support channels, telemetry or error codes -> search_getnet_knowledge.
 - Anything else about payments, cards, sales, chargebacks, refunds, card machines or running a merchant account, even when Getnet is not named -> search_getnet_knowledge first: the merchant is asking as a Getnet customer and the knowledge base defines these terms for them.
 - Currency rate -> get_fx_rate. Weather -> get_weather_forecast. A question unrelated to payments (general knowledge), or a payments question the knowledge base rated 'poor' after a reformulation -> web_search.
-- Read the 'relevance' of each search. If it is 'poor' or the passages do not actually answer the task, reconsider: reformulate with different wording or the Portuguese product term and search again, or switch tool. Do not search the same query twice.
+- The knowledge base is written in English with the Portuguese product names kept. When your query is not in English, also pass query_en, the same query in English; a Portuguese or Spanish query alone can miss English passages.
+- Read the 'relevance' of each search. If it is 'poor' or the passages do not actually answer the task, reconsider: reformulate with different wording and search again, or switch tool. Do not search the same query twice.
+- Read every passage returned, including those found from the merchant's own words, before saying a value is not published.
 - A comparison or multi-part task usually needs more than one search.
 
 Reporting
@@ -196,8 +222,10 @@ CRITIC_INSTRUCTIONS = (
 
 Check, in this order:
 1. Grounded: every factual claim in the draft (numbers, fees, deadlines, steps, statuses, phone numbers, URLs) is supported by the observations or the conversation history. A claim that is merely plausible is not grounded. Saying "the site does not specify" is grounded when the observations say so.
-2. Complete: the draft answers every part of the merchant's message. "Could not confirm" is acceptable for a part only if the observations show the right specialist was asked about it (Knowledge Agent for products, prices and how-tos; Customer Support Agent for the merchant's own data). If a part was never researched, the verdict is 'revise' and needs_more_evidence names that part.
-3. Safe and honest: it does not claim an action was executed unless an observation shows executed=true, and even then it may only say a service order was created and the work is scheduled, never that the work is completed or the problem fixed; it does not expose internal tool or agent names, and does not present internal runbook guidance as published Getnet policy.
+2. Complete: list in `parts` every distinct question or request in the merchant's message, each with answered true or false. "Could not confirm" counts as answered only if the observations show the right specialist was asked about it (Knowledge Agent for products, prices and how-tos; Customer Support Agent for the merchant's own data). If a part was never researched, needs_more_evidence names that part.
+   Not factual claims, so they need no evidence: offering to hand the case to a human specialist in this conversation (the assistant can do that whenever the merchant asks), and pointing the merchant to Getnet support in general terms. Specific phone numbers, URLs, fees and steps do need evidence.
+   Then rule on every item of the "Evidence checklist", if there is one. The items were extracted in code from the evidence, not from the draft: steps of a procedure the draft follows, or prices of products the merchant named. For each, status 'in_draft' if the draft does include it (in any wording or language), 'not_applicable' if it truly does not apply (the merchant said they already did that step, even if the draft does not repeat its details; or it answers something not asked) with the reason, otherwise 'must_add'. Leaving out a step of the procedure the merchant is following, or the prices when they compare or ask about products, is a material omission.
+3. Safe and honest: it does not claim an action was executed unless an observation shows executed=true, and even then it may only say a service order was created and the work is scheduled, never that the work is completed or the problem fixed; it does not expose internal tool or agent names, and does not present internal runbook guidance as published Getnet policy. Giving the merchant the runbook's troubleshooting steps, labelled as internal troubleshooting guidance, is the intended use and not a problem.
 4. Language: it is written in the language stated in "Reply language". A draft in another language is always 'revise', however good its content.
 
 verdict 'approve' when all four hold. Send a draft back only for a material problem: a claim that is unsupported or contradicted by the observations, a part of the question left unanswered, a safety or honesty problem, or the wrong language. Style, ordering, and tightening a caveat that is already there are not reasons to revise; every revision costs the merchant waiting time. verdict 'revise' otherwise, with each issue stated concretely enough to act on (quote the unsupported claim; name the missing part). If the fix needs information that is not in the observations, set needs_more_evidence to the question that should be researched; otherwise an empty string."""
@@ -211,10 +239,32 @@ CRITIC_REVIEW = _fn(
         "verdict": {"type": "string", "enum": ["approve", "revise"]},
         "grounded": {"type": "boolean"},
         "complete": {"type": "boolean"},
+        "parts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"part": {"type": "string"}, "answered": {"type": "boolean"}},
+                "required": ["part", "answered"],
+                "additionalProperties": False,
+            },
+        },
+        "checklist": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "item": {"type": "string"},
+                    "status": {"type": "string", "enum": ["in_draft", "not_applicable", "must_add"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["item", "status", "reason"],
+                "additionalProperties": False,
+            },
+        },
         "issues": {"type": "array", "items": {"type": "string"}},
         "needs_more_evidence": {"type": "string"},
     },
-    ["verdict", "grounded", "complete", "issues", "needs_more_evidence"],
+    ["verdict", "grounded", "complete", "parts", "checklist", "issues", "needs_more_evidence"],
 )
 
 # --- Memory -------------------------------------------------------------------------------------------

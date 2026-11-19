@@ -99,6 +99,10 @@ def calibrate(llm: LLMClient, items: list[dict[str, Any]]) -> dict[str, Any] | N
     disagree on a golden item) or "independent" (questions that appear in no golden item). Agreement is
     reported per set, because only the independent one says something about answers the judge was not
     adjusted on. Cohen's kappa corrects the raw agreement for what two graders would agree on by chance.
+
+    A third set, "borderline", holds near-miss answers labelled independently by two humans (eval/borderline.py).
+    It is reported on its own, next to the humans' agreement with each other, and kept out of the headline
+    agreement: the headline measures separation of clear cases, the borderline set measures the hard ones.
     """
     rows = []
     for item in items:
@@ -111,12 +115,13 @@ def calibrate(llm: LLMClient, items: list[dict[str, Any]]) -> dict[str, Any] | N
                 "set": item.get("set", "original"),
                 "human": item.get("label") or item["human_label"],
                 "judge": "pass" if grade["pass"] else "fail",
+                "human_labels": item.get("human_labels"),
                 **grade,
             }
         )
 
     def summarize(subset: list[dict[str, Any]]) -> dict[str, Any]:
-        return {
+        out = {
             "n": len(subset),
             "agreement": sum(r["human"] == r["judge"] for r in subset) / len(subset),
             "kappa": round(cohen_kappa([r["human"] for r in subset], [r["judge"] for r in subset]), 4),
@@ -124,9 +129,15 @@ def calibrate(llm: LLMClient, items: list[dict[str, Any]]) -> dict[str, Any] | N
             "false_pass": sum(r["human"] == "fail" and r["judge"] == "pass" for r in subset),
             "false_fail": sum(r["human"] == "pass" and r["judge"] == "fail" for r in subset),
         }
+        pairs = [list(r["human_labels"].values()) for r in subset if r.get("human_labels") and len(r["human_labels"]) == 2]
+        if pairs and all(None not in p for p in pairs):
+            out["human_agreement"] = round(sum(a == b for a, b in pairs) / len(pairs), 4)
+            out["human_kappa"] = round(cohen_kappa([a for a, _ in pairs], [b for _, b in pairs]), 4)
+        return out
 
+    clear_cut = [r for r in rows if r["set"] != "borderline"]
     return {
-        **summarize(rows),
+        **summarize(clear_cut or rows),
         "by_set": {name: summarize([r for r in rows if r["set"] == name]) for name in sorted({r["set"] for r in rows})},
         "rows": rows,
     }

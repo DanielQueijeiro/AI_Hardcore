@@ -40,3 +40,39 @@
 {"id": "r40", "lang": "es", "query": "¿Cuánto cuesta el alquiler de la Get Smart?", "relevant": ["get-smart::rental"]}
 {"id": "r41", "lang": "es", "query": "¿Cómo funciona el anticipo de ventas?", "relevant": ["antecipacao"]}
 {"id": "r42", "lang": "en", "query": "second identical sale was cancelled automatically", "relevant": ["duvidas-faq::Declined"]}
+{"id": "rh01", "split": "heldout", "lang": "en", "query": "can my customers pay with their phone by tapping, using pix?", "relevant": ["pix::Ways to accept"]}
+{"id": "rh02", "split": "heldout", "lang": "en", "query": "is there a monthly charge to keep the getnet digital account", "relevant": ["conta-digital::What Get Conta is"]}
+{"id": "rh03", "split": "heldout", "lang": "en", "query": "the reader keeps refusing every card I insert", "relevant": ["internal-support-runbook::Decline codes", "duvidas-faq::Declined"]}
+{"id": "rh04", "split": "heldout", "lang": "en", "query": "how much do I pay per sale with a shareable checkout link on the basic plan", "relevant": ["link-de-pagamento::plans and fees"]}
+{"id": "rh05", "split": "heldout", "lang": "en", "query": "can I put several products in one link and add shipping", "relevant": ["link-de-pagamento::How to create"]}
+{"id": "rh06", "split": "heldout", "lang": "en", "query": "the till device shows no signal bars", "relevant": ["internal-support-runbook::OFFLINE_GPRS_TIMEOUT", "duvidas-faq::Machine connection"]}
+{"id": "rh07", "split": "heldout", "lang": "en", "query": "how do I put a SIM card into the terminal", "relevant": ["duvidas-faq::Machine connection"]}
+{"id": "rh08", "split": "heldout", "lang": "en", "query": "which terminal prints receipts and reads barcodes", "relevant": ["get-smart::overview", "get-smart::differences"]}
+{"id": "rh09", "split": "heldout", "lang": "en", "query": "do prepaid cards get paid out faster", "relevant": ["get-classica::settlement", "duvidas-faq::paid out"]}
+{"id": "rh10", "split": "heldout", "lang": "en", "query": "can I cancel yesterday's sale on the smart device", "relevant": ["duvidas-faq::Declined"]}
+{"id": "rh11", "split": "heldout", "lang": "en", "query": "pre-authorization how many days to confirm", "relevant": ["duvidas-faq::Other FAQ"]}
+{"id": "rh12", "split": "heldout", "lang": "en", "query": "can I buy the machine outright or is it rent only", "relevant": ["get-classica::rental", "get-smart::rental"]}
+{"id": "rh13", "split": "heldout", "lang": "pt", "query": "dá pra receber pix por aproximação?", "relevant": ["pix::Ways to accept"]}
+{"id": "rh14", "split": "heldout", "lang": "pt", "query": "quanto tempo demora pra cair o dinheiro do pix", "relevant": ["pix::settlement time"]}
+{"id": "rh15", "split": "heldout", "lang": "pt", "query": "preciso ter CNPJ pra abrir a conta?", "relevant": ["conta-digital::Opening"]}
+{"id": "rh16", "split": "heldout", "lang": "pt", "query": "qual a taxa no crédito à vista da clássica", "relevant": ["get-classica::fees"]}
+{"id": "rh17", "split": "heldout", "lang": "pt", "query": "a smart sai de graça se eu vender bastante?", "relevant": ["get-smart::rental"]}
+{"id": "rh18", "split": "heldout", "lang": "pt", "query": "o banco estornou uma venda e me cobrou, o que é isso", "relevant": ["duvidas-faq::Declined"]}
+{"id": "rh19", "split": "heldout", "lang": "pt", "query": "como faço o teste de comunicação", "relevant": ["duvidas-faq::Machine connection"]}
+{"id": "rh20", "split": "heldout", "lang": "pt", "query": "quais formas de pagamento o cliente tem no link", "relevant": ["link-de-pagamento::plans and fees"]}
+{"id": "rh21", "split": "heldout", "lang": "pt", "query": "ouvidoria getnet horário", "relevant": ["duvidas-faq::support channels"]}
+{"id": "rh22", "split": "heldout", "lang": "pt", "query": "quantas chaves pix posso cadastrar como pessoa física", "relevant": ["pix::requirements"]}
+{"id": "rh23", "split": "heldout", "lang": "pt", "query": "o crediário paga parcelado pra mim ou de uma vez?", "relevant": ["crediario::settlement"]}
+{"id": "rh24", "split": "heldout", "lang": "pt", "query": "quais máquinas a getnet vende", "relevant": ["todas-as-maquininhas::line-up"]}
+{"id": "rh25", "split": "heldout", "lang": "es", "query": "¿la máquina inteligente tiene tienda de aplicaciones?", "relevant": ["get-smart::apps"]}
+{"id": "rh26", "split": "heldout", "lang": "es", "query": "¿cuánto cobran por vender a débito con la clásica?", "relevant": ["get-classica::fees"]}
+{"id": "rh27", "split": "heldout", "lang": "es", "query": "¿en cuántos días me depositan las ventas a crédito?", "relevant": ["duvidas-faq::paid out", "get-classica::settlement"]}
+{"id": "rh28", "split": "heldout", "lang": "es", "query": "¿puedo cobrar por redes sociales sin tener terminal?", "relevant": ["link-de-pagamento::WhatsApp"]}
+{"id": "rh29", "split": "heldout", "lang": "es", "query": "¿qué significa el error de sincronización de llaves del pinpad?", "relevant": ["internal-support-runbook::Decline codes"]}
+{"id": "rh30", "split": "heldout", "lang": "es", "query": "¿hay número de whatsapp para clientes?", "relevant": ["duvidas-faq::support channels"]}
+{"id": "rh31", "split": "heldout", "lang": "es", "query": "¿cómo se crea un enlace de cobro?", "relevant": ["link-de-pagamento::How to create"]}
+{"id": "rh32", "split": "heldout", "lang": "es", "query": "¿la batería de la smart cuánto tiempo hay que cargarla?", "relevant": ["duvidas-faq::Other FAQ"]}
+{"id": "rh33", "split": "heldout", "lang": "es", "query": "¿quién puede contratar la oferta de la clásica?", "relevant": ["get-classica::settlement"]}
+{"id": "rh34", "split": "heldout", "lang": "es", "query": "¿cuál es la diferencia de precio de renta entre los modelos?", "relevant": ["todas-as-maquininhas::Rental by model", "get-classica::rental"]}
+{"id": "rh35", "split": "heldout", "lang": "es", "query": "¿qué es Get Conta?", "relevant": ["conta-digital::What Get Conta is"]}
+{"id": "rh36", "split": "heldout", "lang": "es", "query": "¿se puede pagar con pix usando código QR en la maquinita?", "relevant": ["pix::Ways to accept"]}

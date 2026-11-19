@@ -34,6 +34,7 @@ class ToolContext:
     principal: Principal
     thread_key: str = ""
     turn_id: str = ""
+    merchant_message: str = ""  # the merchant's own words, searched alongside the model's query
 
 
 @dataclass(frozen=True)
@@ -61,30 +62,59 @@ class Tool:
 # --- knowledge tools ----------------------------------------------------------------------------------
 
 
-def _search_getnet_knowledge(ctx: ToolContext, query: str) -> dict[str, Any]:
+MAX_EXTRA_PASSAGES = 2
+
+
+def _search_getnet_knowledge(ctx: ToolContext, query: str, query_en: str = "") -> dict[str, Any]:
+    """Search with the model's query, then with other wordings of the same need.
+
+    The corpus is restated in English and BM25 is lexical, so a query in the wrong language can miss a passage
+    entirely (s04, 2026-11-16: six Portuguese reformulations never reached "up to 5 devices"). The model's query
+    keeps its top-k unchanged; the English form and the merchant's own words can each add a passage the first
+    ranking did not have, up to MAX_EXTRA_PASSAGES. Which wording found each passage is recorded in `matched_by`.
+    """
     settings = ctx.runtime.settings
-    hits = ctx.runtime.retriever.search(query, k=settings.retrieval_top_k, mode=settings.retrieval_mode)
+    k, mode = settings.retrieval_top_k, settings.effective_retrieval_mode()
+    primary = ctx.runtime.retriever.search(query, k=k, mode=mode)
+    found: list[tuple[str, Any]] = [("query", hit) for hit in primary]
+    seen = {hit.chunk.chunk_id for hit in primary}
+    variants: dict[str, str] = {}
+    for label, text in (("query_en", query_en), ("merchant_message", ctx.merchant_message[:MAX_STRING_ARG])):
+        text = " ".join(text.split())
+        if text and text.casefold() not in {query.casefold(), *(v.casefold() for v in variants.values())}:
+            variants[label] = text
+    rankings = {label: ctx.runtime.retriever.search(text, k=k, mode=mode) for label, text in variants.items()}
+    extras: list[tuple[str, Any]] = []
+    for rank in range(k):  # interleave by rank, so each wording's best passage comes before anyone's second
+        for label, hits in rankings.items():
+            if rank < len(hits) and hits[rank].chunk.chunk_id not in seen and len(extras) < MAX_EXTRA_PASSAGES:
+                seen.add(hits[rank].chunk.chunk_id)
+                extras.append((label, hits[rank]))
     results: list[dict[str, Any]] = []
     filtered = False
-    for hit in hits:
+    for label, hit in [*found, *extras]:
         evidence = hit.as_evidence()
         evidence["text"], flagged = sanitize_untrusted(str(evidence["text"]))
+        evidence["matched_by"] = label
         filtered = filtered or flagged
         results.append(evidence)
-    best = max((h.coverage for h in hits), default=0.0)
+    # relevance is the best any wording achieved: a good English hit is a good result even if the query was poor
+    best = max([h.coverage for h in primary] + [h.coverage for hits in rankings.values() for h in hits[:1]], default=0.0)
     out: dict[str, Any] = {
         "query": query,
         "results": results,
         "best_coverage": round(best, 2),
         "relevance": "good" if best >= 0.6 else "partial" if best >= 0.34 else "poor",
     }
+    if variants:
+        out["also_searched"] = variants
     if filtered:
         out["injection_filtered"] = True
     return out
 
 
 def _get_fx_rate(ctx: ToolContext, base: str, quote: str = "BRL") -> dict[str, Any]:
-    return ctx.runtime.live.fx_rate(base, quote)
+    return ctx.runtime.live.fx_rate(base, quote or "BRL")
 
 
 def _get_weather_forecast(ctx: ToolContext, city: str) -> dict[str, Any]:
@@ -200,18 +230,29 @@ TOOLS: dict[str, Tool] = {
         Tool(
             "search_getnet_knowledge",
             "Search the Getnet knowledge base (public site snapshot plus the internal support runbook). Returns passages "
-            "with source_url and a relevance rating. If relevance is 'poor', reformulate (try the Portuguese product term, "
-            "e.g. 'antecipação', 'maquininha', 'crediário') before concluding the knowledge base does not cover it.",
+            "with source_url and a relevance rating. The passages are written in English with the Portuguese product "
+            "names kept (e.g. 'antecipação', 'maquininha', 'crediário'). The merchant's own message is searched too. "
+            "If relevance is 'poor', reformulate with different wording before concluding the knowledge base does not cover it.",
             _search_getnet_knowledge,
-            {"query": {**_TEXT, "description": "Focused search query, one topic per call."}},
+            {
+                "query": {**_TEXT, "description": "Focused search query, one topic per call, in any language."},
+                "query_en": {
+                    **_TEXT,
+                    "description": "The same query in English, the language of the knowledge base. Required when 'query' is not in English.",
+                },
+            },
             ("query",),
         ),
         Tool(
             "get_fx_rate",
-            "Today's reference exchange rate between two ISO currency codes (ECB data).",
+            "Today's reference exchange rate between two ISO currency codes (ECB data). The merchants are in Brazil: "
+            "when only one currency is named ('how much is the dollar today?'), it is quoted in reais (BRL).",
             _get_fx_rate,
-            {"base": {**_TEXT, "description": "ISO code, e.g. EUR"}, "quote": {**_TEXT, "description": "ISO code, e.g. BRL"}},
-            ("base", "quote"),
+            {
+                "base": {**_TEXT, "description": "ISO code, e.g. USD"},
+                "quote": {**_TEXT, "description": "ISO code; omit for BRL"},
+            },
+            ("base",),
         ),
         Tool(
             "get_weather_forecast",

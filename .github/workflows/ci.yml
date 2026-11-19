@@ -66,7 +66,8 @@ jobs:
             -d "{\"message\": \"How many installments can I split a sale into with the crediario?\", \"user_id\": \"cliente1988\"}" | grep -q "48"
 
   model-eval:
-    # Semantic evaluation with the real model and the LLM judge. Manual, because it costs tokens.
+    # Semantic evaluation with the real model and the LLM judge, three runs, recorded to a cassette so anyone can
+    # replay it without a key (job below). Manual, because it costs tokens.
     if: github.event_name == 'workflow_dispatch' && inputs.run_model_eval
     runs-on: ubuntu-latest
     steps:
@@ -76,11 +77,33 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e .
-      - run: python -m eval.run --gate
+      - run: python -m eval.run --gate --repeat 3 --record eval/reports/openai/cassette.json.gz
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RETRIEVAL_MODE: auto
+          EMBEDDING_PROVIDER: auto
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: model-eval-report
           path: eval/reports/openai/
+
+  model-eval-replay:
+    # Re-runs the published model evaluation from its recorded cassette, with no key and no network, and checks that
+    # every answer and every metric of the committed report comes out identical.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e .
+      - name: Replay the recorded model run
+        if: hashFiles('eval/reports/openai/cassette.json.gz') != ''
+        run: |
+          python -m eval.run --replay eval/reports/openai/cassette.json.gz --out replayed > replayed-run.md || true
+          python -m eval.compare eval/reports/openai/report.json replayed.json
+      - name: No cassette committed yet
+        if: hashFiles('eval/reports/openai/cassette.json.gz') == ''
+        run: echo "eval/reports/openai/cassette.json.gz is not committed; nothing to replay."

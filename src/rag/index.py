@@ -195,8 +195,9 @@ class Retriever:
     B = 0.6
     RRF_K = 60
 
-    def __init__(self, chunks: list[Chunk], embedder: Embedder | None = None) -> None:
+    def __init__(self, chunks: list[Chunk], embedder: Embedder | None = None, *, use_glossary: bool = True) -> None:
         self.chunks = chunks
+        self.use_glossary = use_glossary  # off only to measure what the hand-written glossary contributes
         self.embedder: Embedder = embedder or HashingEmbedder()
         self._doc_tokens = [tokenize(c.indexed_text) + tokenize(f"{c.title} {c.section}") for c in chunks]
         self._tf = [Counter(tokens) for tokens in self._doc_tokens]
@@ -211,7 +212,7 @@ class Retriever:
     # --- rankers -------------------------------------------------------------------------------
 
     def _bm25(self, query: str) -> list[tuple[int, float]]:
-        terms = tokenize(query, expand=True)
+        terms = tokenize(query, expand=self.use_glossary)
         scores: list[tuple[int, float]] = []
         for idx, tf in enumerate(self._tf):
             length = len(self._doc_tokens[idx])
@@ -229,7 +230,7 @@ class Retriever:
     def _dense(self, query: str) -> list[tuple[int, float]]:
         if self._vectors is None:
             self._vectors = self.embedder.embed([c.indexed_text for c in self.chunks])
-        expanded = f"{query} {' '.join(t for t in tokenize(query, expand=True))}"
+        expanded = f"{query} {' '.join(t for t in tokenize(query, expand=self.use_glossary))}"
         qv = self.embedder.embed([expanded if isinstance(self.embedder, HashingEmbedder) else query])[0]
         scores = [(idx, _cosine(qv, vec)) for idx, vec in enumerate(self._vectors)]
         return sorted(scores, key=lambda item: -item[1])
@@ -238,7 +239,8 @@ class Retriever:
         terms = set(tokenize(query, expand=False))
         if not terms:
             return 0.0
-        expanded = {t: {t, *(_stem(e) for e in GLOSSARY.get(t, ()))} for t in terms}
+        glossary = GLOSSARY if self.use_glossary else {}
+        expanded = {t: {t, *(_stem(e) for e in glossary.get(t, ()))} for t in terms}
         present = sum(1 for alts in expanded.values() if any(a in self._tf[idx] for a in alts))
         return present / len(terms)
 
@@ -250,7 +252,11 @@ class Retriever:
         if mode == "bm25":
             ranked = self._bm25(query)
         elif mode == "dense":
-            ranked = self._dense(query)
+            try:
+                ranked = self._dense(query)
+            except Exception as exc:  # noqa: BLE001 - an embedding outage degrades to lexical, never to a 500
+                logger.warning("dense_retrieval_failed", extra={"error": repr(exc)})
+                ranked = self._bm25(query)
         else:
             try:
                 dense = self._dense(query)

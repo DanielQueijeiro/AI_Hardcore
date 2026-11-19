@@ -263,6 +263,23 @@ def test_output_guard_redacts_cpf_cnpj_and_card_numbers_but_not_ordinary_numbers
     assert answer == ordinary and verdict.category == "safe"
 
 
+def test_output_guard_does_not_take_a_luhn_valid_phone_number_for_a_card():
+    # s21, 2026-11-16 run 2: the official WhatsApp number has 13 digits that pass Luhn and was redacted.
+    from src.security.guardrails import _luhn_valid
+
+    assert _luhn_valid("5511976946815")
+    for phone in (
+        "Message Getnet on WhatsApp at +55 11 97694-6815.",
+        "WhatsApp: 55 11 97694-6815",
+        "WhatsApp 5511976946815",  # 13 digits are only ever a Visa (prefix 4)
+    ):
+        answer, verdict = check_output(phone, MERCHANT)
+        assert answer == phone and verdict.category == "safe", phone
+    for card in ("5555 5555 5555 4444", "3782 822463 10005", "4222222222222", "6062 8288 8866 6688"):
+        answer, verdict = check_output(f"The card {card} was declined.", MERCHANT)
+        assert verdict.category == "redacted_pii" and card not in answer, card
+
+
 def test_specialist_degraded_flag_propagates_and_prevents_language_rewrite_loop(make_client):
     from src.llm.offline import OfflinePolicyLLM
     from src.llm.resilient import ResilientLLM

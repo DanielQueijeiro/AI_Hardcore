@@ -9,14 +9,19 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from langgraph.types import interrupt
 
+from src import clock
 from src.agents import prompts
 from src.agents.checks import (
     LANGUAGE_NAMES,
+    MAX_CHECKLIST_ITEMS,
     conversation_language,
+    detect_language,
+    evidence_checklist,
     evidence_text,
     fabricated_urls,
     language_mismatch,
@@ -33,6 +38,7 @@ from src.security.guardrails import (
     REFUSALS,
     check_input,
     check_output,
+    deterministic_input_check,
     neutralize_delimiters,
     sanitize_untrusted,
 )
@@ -103,6 +109,11 @@ def language_rule(language: str | None) -> str:
     )
 
 
+def today_line() -> str:
+    """Models do not know the date; without it "tomorrow" or "yesterday's sales" sent the Router to re-check (g02)."""
+    return f"Today is {clock.today():%A, %Y-%m-%d} (Brasília time)."
+
+
 def _events(state: AgentState, spans: Spans) -> list[dict[str, Any]]:
     return [*(state.get("events") or []), *spans.items]
 
@@ -123,14 +134,38 @@ class Nodes:
     # --- input guard ----------------------------------------------------------------------------------
 
     def guard(self, state: AgentState) -> dict[str, Any]:
+        """Input guard. While the LLM classifier decides, the Router's first step runs speculatively.
+
+        The deterministic screen runs first and alone, so a message it blocks never reaches a model. The Router's
+        first step has no side effect (it only chooses a delegation), and nothing it chose runs before the verdict:
+        if the classifier blocks, the speculative step is discarded and the turn ends exactly as before.
+        """
         spans = Spans("guard")
+        settings = self.rt.settings
         principal = Principal.from_dict(state["principal"])
+        speculative: dict[str, Any] | None = None
         with spans.timed("guardrail_input") as extra:
-            verdict = check_input(state["message"], principal, self.rt.llm, self.rt.settings.guardrail_reasoning_effort)
+            verdict = deterministic_input_check(state["message"], principal)
+            if verdict.allowed and self.rt.llm.name != "offline":
+                pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speculative-router") if settings.speculative_router else None
+                router = pool.submit(self.supervisor, state) if pool else None
+                verdict = check_input(state["message"], principal, self.rt.llm, settings.guardrail_reasoning_effort)
+                if pool and router:
+                    if verdict.allowed:
+                        try:
+                            speculative = router.result()
+                        except Exception as exc:  # noqa: BLE001 - the Router node simply runs the step again
+                            logger.warning("speculative_router_failed", extra={"error": repr(exc)})
+                    pool.shutdown(wait=False, cancel_futures=True)  # a blocked message does not wait for the Router
+                    self.rt.metrics.inc("speculative_router_steps_total", outcome="used" if speculative else "discarded")
             extra.update(verdict.as_dict())
         if not verdict.allowed:
             self.rt.metrics.inc("guardrail_blocks_total", category=verdict.category, layer=verdict.layer)
-        return {"guard": verdict.as_dict(), "events": _events(state, spans)}
+            return {"guard": verdict.as_dict(), "events": _events(state, spans)}
+        if speculative is None:
+            return {"guard": verdict.as_dict(), "events": _events(state, spans)}
+        router_spans = speculative["events"][len(state.get("events") or []) :]
+        return {**speculative, "guard": verdict.as_dict(), "events": [*_events(state, spans), *router_spans]}
 
     # --- Router Agent ---------------------------------------------------------------------------------
 
@@ -145,7 +180,7 @@ class Nodes:
 
         prompt_parts = [
             render_memory(state),
-            f"Caller: {_caller(principal)}",
+            f"Caller: {_caller(principal)}. {today_line()}",
             f"<merchant_message>\n{neutralize_delimiters(state['message'])}\n</merchant_message>",
             render_observations(observations),
             language_rule(_language(state)),
@@ -206,16 +241,44 @@ class Nodes:
                 action=name,
                 step=steps + 1,
                 thought=str(args.get("thought", ""))[:400],
-                task=str(args.get("task") or args.get("question") or "")[:MAX_TASK_CHARS],
+                task=str(
+                    args.get("task")
+                    or args.get("question")
+                    or " | ".join(f"{t.get('agent')}: {t.get('task')}" for t in (args.get("tasks") or []) if isinstance(t, dict))
+                )[:MAX_TASK_CHARS],
                 remaining_plan=plan,
             )
+            def already_done(agent: str, task: str) -> bool:
+                return any(o.get("agent") == agent and o.get("task", "").casefold() == task.casefold() for o in observations)
+
             if name in ("delegate_knowledge", "delegate_support"):
                 agent = "knowledge" if name == "delegate_knowledge" else "support"
                 task = str(args.get("task") or "").strip()[:MAX_TASK_CHARS] or state["message"]
-                if any(o.get("agent") == agent and o.get("task", "").casefold() == task.casefold() for o in observations):
+                if already_done(agent, task):
                     bounce(f"Refused: you already delegated this exact task to the {agent} agent. Use that observation, change the task, or finish.")
                 else:
                     update.update(next=agent, pending={"task": task})
+            elif name == "delegate_parallel":
+                tasks: list[dict[str, str]] = []
+                skipped: list[str] = []
+                for item in (args.get("tasks") or [])[: settings.max_parallel_tasks]:
+                    agent = str((item or {}).get("agent") or "")
+                    task = str((item or {}).get("task") or "").strip()[:MAX_TASK_CHARS]
+                    if agent not in ("knowledge", "support") or not task:
+                        continue
+                    if already_done(agent, task) or any(t["agent"] == agent and t["task"].casefold() == task.casefold() for t in tasks):
+                        skipped.append(task)
+                    else:
+                        tasks.append({"agent": agent, "task": task})
+                if skipped:
+                    observations.append({"agent": "router", "note": f"Not repeated (already delegated): {'; '.join(skipped)}"})
+                    update["observations"] = observations
+                if not tasks:
+                    bounce("Refused: every parallel task was empty or already delegated. Use the observations or finish.")
+                elif len(tasks) == 1:
+                    update.update(next=tasks[0]["agent"], pending={"task": tasks[0]["task"]})
+                else:
+                    update.update(next="parallel", pending={"tasks": tasks})
             elif name == "escalate_to_human":
                 if not principal.is_merchant:
                     bounce("Refused: a human-review ticket needs a signed-in merchant. Tell the caller to sign in or use the official support channels.")
@@ -266,7 +329,7 @@ class Nodes:
                 role=role,
                 instructions=instructions,
                 prompt=(
-                    f"Caller: {_caller(ctx.principal)}\n<task>\n{neutralize_delimiters(task)}\n</task>\n\n"
+                    f"Caller: {_caller(ctx.principal)}. {today_line()}\n<task>\n{neutralize_delimiters(task)}\n</task>\n\n"
                     f"<observations>\n{body}\n</observations>\n\n"
                     + (
                         "No further tool calls are available: call report now."
@@ -302,11 +365,16 @@ class Nodes:
         return {}, tool_results, degraded
 
     def _ctx(self, state: AgentState) -> ToolContext:
-        return ToolContext(self.rt, Principal.from_dict(state["principal"]), state.get("thread_key", ""), state.get("turn_id", ""))
+        return ToolContext(
+            self.rt,
+            Principal.from_dict(state["principal"]),
+            state.get("thread_key", ""),
+            state.get("turn_id", ""),
+            merchant_message=state.get("message", ""),
+        )
 
-    def knowledge(self, state: AgentState) -> dict[str, Any]:
+    def _knowledge_observation(self, state: AgentState, task: str) -> tuple[dict[str, Any], Spans, bool]:
         spans = Spans("knowledge")
-        task = state["pending"]["task"]
         report, tool_results, degraded = self._run_specialist(
             spans,
             role="knowledge",
@@ -335,15 +403,10 @@ class Nodes:
         if dropped:
             observation["dropped_citations"] = dropped
             self.rt.metrics.inc("fabricated_citations_dropped_total", len(dropped))
-        return {
-            "observations": [*(state.get("observations") or []), observation],
-            "degraded": bool(state.get("degraded")) or degraded,
-            "events": _events(state, spans),
-        }
+        return observation, spans, degraded
 
-    def support(self, state: AgentState) -> dict[str, Any]:
+    def _support_observation(self, state: AgentState, task: str) -> tuple[dict[str, Any], Spans, bool]:
         spans = Spans("support")
-        task = state["pending"]["task"]
         report, tool_results, degraded = self._run_specialist(
             spans,
             role="support",
@@ -365,11 +428,43 @@ class Nodes:
             },
             "evidence": tool_results,
         }
+        return observation, spans, degraded
+
+    def _observe(self, state: AgentState, agent: str, task: str) -> tuple[dict[str, Any], Spans, bool]:
+        return (self._knowledge_observation if agent == "knowledge" else self._support_observation)(state, task)
+
+    def _specialist_update(self, state: AgentState, results: list[tuple[dict[str, Any], Spans, bool]], *head: Spans) -> dict[str, Any]:
+        events = list(state.get("events") or [])
+        for spans in head:
+            events += spans.items
+        for _, spans, _ in results:
+            events += spans.items
         return {
-            "observations": [*(state.get("observations") or []), observation],
-            "degraded": bool(state.get("degraded")) or degraded,
-            "events": _events(state, spans),
+            "observations": [*(state.get("observations") or []), *(observation for observation, _, _ in results)],
+            "degraded": bool(state.get("degraded")) or any(degraded for _, _, degraded in results),
+            "events": events,
         }
+
+    def knowledge(self, state: AgentState) -> dict[str, Any]:
+        return self._specialist_update(state, [self._observe(state, "knowledge", state["pending"]["task"])])
+
+    def support(self, state: AgentState) -> dict[str, Any]:
+        return self._specialist_update(state, [self._observe(state, "support", state["pending"]["task"])])
+
+    def parallel(self, state: AgentState) -> dict[str, Any]:
+        """Independent subtasks the Router sent together run at the same time, each in its own bounded tool loop.
+
+        The Router only gets control back once every branch has reported, so its next decision sees all of them.
+        Each branch is an ordinary specialist run: same allow-list, same tool budget, same identity scoping.
+        """
+        tasks = state["pending"]["tasks"]
+        head = Spans("router")
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="specialist") as pool:
+            results = list(pool.map(lambda t: self._observe(state, t["agent"], t["task"]), tasks))
+        head.add("parallel", branches=[t["agent"] for t in tasks], ms=int((time.perf_counter() - started) * 1000))
+        self.rt.metrics.inc("parallel_delegations_total")
+        return self._specialist_update(state, results, head)
 
     # --- Human Escalation Agent -----------------------------------------------------------------------
 
@@ -471,6 +566,17 @@ class Nodes:
         invented_urls = fabricated_urls(draft, observations, state["message"], memory)
         expected_language = _language(state)
         wrong_language = language_mismatch(draft, expected_language)
+        draft_language = detect_language(draft) or expected_language
+        checklist = evidence_checklist(state["message"], draft, observations, compare_text=draft_language in (None, "en"))
+        checklist_text = (
+            "\n\nEvidence checklist (extracted in code from the evidence; rule on each in checklist):\n"
+            + "\n".join(
+                f"- {c['item']} [{'not found in the draft' if c['found_in_draft'] is False else 'check the draft'}]"
+                for c in checklist
+            )
+            if checklist
+            else ""
+        )
 
         response = llm_step(
             self.rt,
@@ -482,7 +588,7 @@ class Nodes:
                 f"{render_observations(observations)}\n\n<draft_answer>\n{draft}\n</draft_answer>\n\n"
                 f"Automatic checks: numbers in the draft not found in the evidence: {suspicious_numbers or 'none'}; "
                 f"URLs in the draft not returned by any tool: {invented_urls or 'none'}. "
-                f"{language_rule(expected_language)}"
+                f"{language_rule(expected_language)}{checklist_text}"
             ),
             tools=[prompts.CRITIC_REVIEW],
             tool_choice="review",
@@ -492,6 +598,7 @@ class Nodes:
                 "observations": observations,
                 "unsupported_numbers": suspicious_numbers,
                 "fabricated_urls": invented_urls,
+                "checklist": checklist,
             },
         )
         args = response.tool_calls[0].arguments if response.tool_calls else {}
@@ -506,12 +613,31 @@ class Nodes:
             self.rt.metrics.inc("critic_unavailable_total")
         review = {
             "round": rounds + 1,
+            "model_verdict": str(args.get("verdict") or "none"),
             "verdict": "revise" if args.get("verdict") == "revise" else "approve",
             "grounded": bool(args.get("grounded", True)),
             "complete": bool(args.get("complete", True)),
             "issues": [str(i)[:400] for i in (args.get("issues") or [])][:6],
             "needs_more_evidence": str(args.get("needs_more_evidence") or "")[:400],
+            "checklist": [
+                {"item": str(c.get("item", ""))[:300], "status": str(c.get("status", "")), "reason": str(c.get("reason", ""))[:200]}
+                for c in (args.get("checklist") or [])
+                if isinstance(c, dict)
+            ][:MAX_CHECKLIST_ITEMS],
         }
+        # Completeness is derived from the itemised review, not taken from a free boolean: a part left unanswered
+        # or an evidence item the Critic itself says must be added sends the draft back.
+        unanswered = [str(p.get("part", ""))[:200] for p in (args.get("parts") or []) if isinstance(p, dict) and p.get("answered") is False]
+        must_add = [c["item"] for c in review["checklist"] if c["status"] == "must_add"]
+        if unanswered or must_add:
+            review["verdict"], review["complete"] = "revise", False
+            review["issues"] += [f"Answer this part of the question: {p}" for p in unanswered]
+            review["issues"] += [f"Add what the evidence says: {item}" for item in must_add]
+        elif review["verdict"] == "revise" and review["grounded"] and not review["issues"] and not review["needs_more_evidence"]:
+            # A revision with nothing to fix cannot be acted on: the Router would rewrite blind (s11 looped three
+            # rounds on this). Grounded and nothing named, so it is an approval; the hard rules below still apply.
+            review["verdict"] = "approve"
+            self.rt.metrics.inc("critic_empty_revisions_total")
         if invented_urls:  # hard rule: a citation no tool returned is never acceptable
             review["verdict"], review["grounded"] = "revise", False
             review["issues"].append(f"Remove these citations, no tool returned them: {', '.join(invented_urls)}")

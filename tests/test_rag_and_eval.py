@@ -230,3 +230,156 @@ def test_splits_are_summarised_separately_and_repeats_report_the_range():
     assert summary["heldout"]["semantic_pass_rate"]["min"] == 0.5 and summary["heldout"]["semantic_pass_rate"]["max"] == 1.0
     assert summary["items_failed_in_n_runs"] == {"i1": 2}
     assert len(dataset_hashes()["golden.jsonl"]) == 64
+
+
+def test_search_also_reaches_english_passages_a_portuguese_query_misses(client):
+    # s04, 2026-11-16: every search was a Portuguese reformulation and BM25 over the English corpus never
+    # returned "up to 5 devices". The merchant's own words and the English form are searched too.
+    from src.security.auth import Principal
+    from src.tools.registry import KNOWLEDGE_TOOLS, ToolContext, run_tool
+
+    runtime = client.app.state.runtime
+    merchant = Principal("cliente1988", "merchant")
+    portuguese = {"query": "quantidade limite dispositivos loja Get Smart"}
+
+    def has_passage(out):
+        return [r["matched_by"] for r in out["results"] if "up to 5 devices" in r["text"]]
+
+    alone = run_tool(ToolContext(runtime, merchant), "search_getnet_knowledge", portuguese, KNOWLEDGE_TOOLS)
+    assert not has_passage(alone) and "also_searched" not in alone
+
+    asked = "How many devices can I use in one store with the Get Smart?"
+    with_message = run_tool(ToolContext(runtime, merchant, merchant_message=asked), "search_getnet_knowledge", portuguese, KNOWLEDGE_TOOLS)
+    assert has_passage(with_message) == ["merchant_message"]
+    k = runtime.settings.retrieval_top_k
+    assert [r["chunk_id"] for r in with_message["results"][:k]] == [r["chunk_id"] for r in alone["results"]], "the query's own ranking is kept"
+    assert len(with_message["results"]) <= k + 2 and with_message["relevance"] == "good"
+
+    english = {**portuguese, "query_en": "maximum number of devices per store Get Smart"}
+    with_english = run_tool(ToolContext(runtime, merchant), "search_getnet_knowledge", english, KNOWLEDGE_TOOLS)
+    assert has_passage(with_english) == ["query_en"]
+
+    same = run_tool(ToolContext(runtime, merchant, merchant_message=asked), "search_getnet_knowledge", {"query": asked}, KNOWLEDGE_TOOLS)
+    assert "also_searched" not in same and len(same["results"]) == k, "a wording identical to the query is not searched twice"
+
+
+def test_evidence_checklist_lists_dropped_procedure_steps_and_prices():
+    from src.agents.checks import evidence_checklist, procedure_steps
+
+    runbook = (
+        "First-line steps for the merchant, in order: 1) restart the terminal and wait for the network indicator; "
+        "2) if Wi-Fi is available, connect the terminal to the store Wi-Fi; 3) with the terminal off, reseat the SIM chip "
+        "and power it back on; 4) run the communication test described in the Getnet FAQ. If the terminal is still offline, open a ticket."
+    )
+    assert procedure_steps(runbook)[0][1] == "if Wi-Fi is available, connect the terminal to the store Wi-Fi"
+    assert procedure_steps(runbook)[0][3] == "run the communication test described in the Getnet FAQ"
+    assert procedure_steps("Choose 2) or 3) as you like") == []
+
+    def obs(*texts):
+        rows = [{"text": t, "source_url": f"https://x.test/{i}"} for i, t in enumerate(texts)]
+        return [{"agent": "knowledge", "evidence": [{"tool": "search_getnet_knowledge", "result": {"results": rows}}]}]
+
+    message = "It is still offline after I restarted it. What else can I try?"
+    without_wifi = "Restart it and wait for the network indicator, then reseat the SIM chip with the terminal off and run the communication test."
+    items = evidence_checklist(message, without_wifi, obs(runbook))
+    assert [i["found_in_draft"] for i in items] == [False] and "store Wi-Fi" in items[0]["item"]
+    assert evidence_checklist(message, without_wifi + " Or connect it to the store Wi-Fi.", obs(runbook)) == []
+    assert evidence_checklist(message, "Please contact support.", obs(runbook)) == [], "a procedure the draft does not follow is not in play"
+    portuguese = "Reinicie a maquininha e conecte ao Wi-Fi da loja."
+    assert evidence_checklist(message, portuguese, obs(runbook), compare_text=False) == [], "uncited and not comparable: not in play"
+    cited = evidence_checklist(message, portuguese + " Fonte: https://x.test/0", obs(runbook), compare_text=False)
+    assert len(cited) == 4 and {i["found_in_draft"] for i in cited} == {None}
+    twice = obs(runbook)
+    twice[0]["evidence"].append({"tool": "search_getnet_knowledge", "result": {"results": [{"text": runbook, "source_url": "https://x.test/0", "score": 2}]}})
+    assert len(evidence_checklist(message, without_wifi, twice)) == 1, "the same passage from two searches is listed once"
+
+    prices = "Monthly rental: Get Clássica R$ 79.90 per month (for comparison: Get Mini R$ 14.90, Get Smart R$ 129.90)."
+    compare = "What's the difference between the Get Clássica and the Get Smart?"
+    items = evidence_checklist(compare, "The Get Smart is a 5-in-1 device; the Get Clássica is a classic POS.", obs(prices))
+    assert [i["item"] for i in items] == [
+        "Price the evidence states for Get Clássica: R$ 79.90",
+        "Price the evidence states for Get Smart: R$ 129.90",
+    ]
+    assert evidence_checklist(compare, "Rental is R$ 79.90 vs R$ 129.90.", obs(prices)) == []
+    assert evidence_checklist("Does the Get Smart print receipts?", "Yes, it has a printer.", obs(prices)) == [], "no price asked, one product"
+
+
+def test_a_human_decision_is_the_first_checklist_item_whatever_the_language():
+    from src.agents.checks import evidence_checklist
+
+    rejected = [{"agent": "escalation", "decision": "reject", "operator_message": "Try a different card first."}]
+    items = evidence_checklist("Minha maquininha recusa vendas.", "Tente outro cartão.", rejected, compare_text=False)
+    assert "did NOT approve" in items[0]["item"] and "different card" in items[0]["item"] and items[0]["found_in_draft"] is None
+    answered = [{"agent": "escalation", "decision": "answer", "operator_message": "Use Portal Minha Conta."}]
+    assert "must not say that a person cannot be reached" in evidence_checklist("Talk to a person", "x", answered)[0]["item"]
+    approved = [{"agent": "escalation", "decision": "approve", "action_result": {"executed": True}}]
+    assert "not finished" in evidence_checklist("fix it", "x", approved)[0]["item"]
+
+
+def test_fx_quote_defaults_to_reais(monkeypatch, client):
+    from src.security.auth import Principal
+    from src.tools.registry import KNOWLEDGE_TOOLS, TOOLS, ToolContext, run_tool
+
+    runtime = client.app.state.runtime
+    asked: list[tuple[str, str]] = []
+    monkeypatch.setattr(runtime.live, "fx_rate", lambda base, quote: asked.append((base, quote)) or {"available": True, "rate": 5.6})
+    run_tool(ToolContext(runtime, Principal("cliente1988", "merchant")), "get_fx_rate", {"base": "USD"}, KNOWLEDGE_TOOLS)
+    assert asked == [("USD", "BRL")] and TOOLS["get_fx_rate"].required == ("base",)
+
+
+def _golden_run(passes: int, n: int = 18, degraded: int = 0) -> list[dict]:
+    row = {
+        "split": "dev", "fact_coverage": 1.0, "forbidden_hits": [], "numeric_groundedness": 1.0, "citation_validity": 1.0,
+        "gold_source_hit": None, "language_ok": True, "routing_ok": True, "judge": None, "latency_ms": 1000, "cost_usd": 0.0,
+    }
+    return [{**row, "id": f"g{i:02d}", "semantic_pass": i < passes, "degraded": i < degraded} for i in range(n)]
+
+
+def _repeated(*runs: list[dict]) -> dict:
+    from eval.run import _golden_summary
+
+    return {"golden": _golden_summary(runs[0]), "golden_repeat_items": list(runs[1:])}
+
+
+def test_gate_reads_every_repeated_run_mean_and_worst():
+    # ADR-0019. dev has 18 items: one item is 0.0556. Floor 0.94.
+    floor = {"min": {"golden.dev.semantic_pass_rate": 0.94}}
+    assert check_gate(_repeated(_golden_run(17), _golden_run(18), _golden_run(18)), floor) == []
+    # one run a single item below the floor-minus-one-item band is tolerated when the mean holds...
+    assert check_gate(_repeated(_golden_run(16), _golden_run(18), _golden_run(18)), floor) == []
+    # ...but a run two items below is not, even with a passing mean
+    worst = check_gate(_repeated(_golden_run(18), _golden_run(18), _golden_run(15)), floor)
+    assert len(worst) == 1 and "more than one item below" in worst[0]
+    # and a mean below the floor fails however the runs are spread (the published 2026-11-16 dev: 0.833, 0.889, 0.889)
+    mean = check_gate(_repeated(_golden_run(15), _golden_run(16), _golden_run(16)), floor)
+    assert len(mean) == 1 and "(mean 0.8704)" in mean[0]
+    # a ceiling holds only if every run is within it
+    ceiling = {"max": {"golden.all.degraded_turns": 0}}
+    assert "in at least one run" in check_gate(_repeated(_golden_run(18), _golden_run(18, degraded=1)), ceiling)[0]
+    # a single run is gated exactly as before
+    assert check_gate(_repeated(_golden_run(16)), floor) and not check_gate(_repeated(_golden_run(17)), floor)
+
+
+
+def test_borderline_labels_merge_and_report_human_agreement_apart(tmp_path, monkeypatch):
+    import eval.borderline as bl
+    from src.llm.scripted import ScriptedLLM
+
+    dataset = tmp_path / "judge_borderline.jsonl"
+    rows = [{"id": f"b0{i}", "set": "borderline", "question": "q", "reference": "r", "evidence": "e", "answer": "a"} for i in range(1, 5)]
+    dataset.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    monkeypatch.setattr(bl, "DATASET", dataset)
+    ana, bruno, final = (tmp_path / f"borderline_{n}.csv" for n in ("ana", "bruno", "final"))
+    ana.write_text("id,label,comment\nb01,pass,\nb02,fail,\nb03,pass,\nb04,fail,\n", encoding="utf-8")
+    bruno.write_text("id,label,comment\nb01,pass,\nb02,fail,\nb03,fail,\nb04,fail,\n", encoding="utf-8")
+    final.write_text("id,label,comment\nb01,pass,\nb02,fail,\nb03,fail,\nb04,fail,\n", encoding="utf-8")
+    assert bl.agreement(bl.read_labels(ana), bl.read_labels(bruno))["disagreements"] == ["b03"]
+    assert bl.main([str(ana), str(bruno), "--final", str(final)]) == 0
+    merged = [json.loads(line) for line in dataset.read_text(encoding="utf-8").splitlines()]
+    assert merged[2]["label"] == "fail" and merged[2]["human_labels"] == {"ana": "pass", "bruno": "fail"}
+
+    clear = {"id": "c1", "set": "independent", "question": "q", "reference": "r", "evidence": "e", "answer": "a", "label": "pass"}
+    grade = call("grade", correctness=5, groundedness=5, relevance=5, helpfulness=5, rationale="ok")
+    result = calibrate(ScriptedLLM({"judge": grade}), [clear, *merged])
+    assert result["n"] == 1 and result["agreement"] == 1.0, "the headline is the clear-cut sets only"
+    assert result["by_set"]["borderline"]["human_agreement"] == 0.75 and "human_kappa" in result["by_set"]["borderline"]
