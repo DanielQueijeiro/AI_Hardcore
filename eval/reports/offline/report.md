@@ -1,9 +1,9 @@
 # Evaluation report (offline)
 
-- Generated: 2026-11-19T13:10:28+00:00
+- Generated: 2026-11-19T22:37:26+00:00
 - Answering model: `offline-rule-policy`; judge: `none`
 - Live web tools: off (answers must say live data is unavailable)
-- Code: `b6420de4954d`; input hashes in `provenance` of the JSON report
+- Code: `e031a8e446c3`; input hashes in `provenance` of the JSON report
 
 > This run used the deterministic offline policy, not a language model. It is the CI regression gate: it
 > proves the pipeline, tools, guardrails, memory and human-review flow work and that answers stay grounded.
@@ -76,10 +76,10 @@ Held-out queries with no relevant chunk in the top 4 (bm25): rh07, rh18, rh25, r
 
 | Split | n | Semantic pass | Fact coverage | Forbidden claims | Numeric groundedness | Citation validity | Language match | Gold source cited | Judge pass | Routing as expected | p50 ms | p95 ms | Mean cost USD |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| dev | 18 | 1.000 | 1.000 | 0.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 22 | 38 | 0.00000 |
-| validation | 94 | 0.660 | 0.748 | 0.000 | 1.000 | 1.000 | 0.553 | 0.739 | n/a | 0.851 | 21 | 37 | 0.00000 |
-| heldout | 24 | 0.458 | 0.636 | 0.000 | 1.000 | 1.000 | 0.333 | 0.625 | n/a | 0.917 | 26 | 41 | 0.00000 |
-| all | 136 | 0.669 | 0.762 | 0.000 | 1.000 | 1.000 | 0.574 | 0.742 | n/a | 0.882 | 22 | 39 | 0.00000 |
+| dev | 18 | 1.000 | 1.000 | 0.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 18 | 66 | 0.00000 |
+| validation | 94 | 0.660 | 0.748 | 0.000 | 1.000 | 1.000 | 0.553 | 0.739 | n/a | 0.851 | 17 | 27 | 0.00000 |
+| heldout | 24 | 0.458 | 0.636 | 0.000 | 1.000 | 1.000 | 0.333 | 0.625 | n/a | 0.917 | 19 | 28 | 0.00000 |
+| all | 136 | 0.669 | 0.762 | 0.000 | 1.000 | 1.000 | 0.574 | 0.742 | n/a | 0.882 | 17 | 28 | 0.00000 |
 
 Semantic pass = every required fact present, no forbidden claim, every number in the answer found in the collected evidence, no fabricated citation, expected status, and the judge's pass when a judge ran. Routing is reported but does not count. Language match (answer written in the merchant's language) is reported and gated on its own.
 

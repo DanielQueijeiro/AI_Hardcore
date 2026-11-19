@@ -1,6 +1,6 @@
 # v3: a gate that passes consistently, and evidence a reviewer can reproduce
 
-**Status:** in-progress
+**Status:** resolved (pending user walkthrough video)
 
 ## Problem
 

@@ -24,7 +24,7 @@ groups:
         for: 15m
         labels: {severity: ticket}
         annotations:
-          summary: "p95 chat turn latency above 45 s (measured p95 in the evaluation report: about 26 s)"
+          summary: "p95 chat turn latency above 45 s (measured p95 in v3 model runs: 20–29 s)"
 
       - alert: LowConfidenceFallbacksHigh
         # The Critic refused to send an ungrounded answer, or the Router ran out of steps.

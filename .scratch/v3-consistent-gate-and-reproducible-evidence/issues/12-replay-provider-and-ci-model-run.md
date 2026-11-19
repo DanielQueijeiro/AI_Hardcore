@@ -10,7 +10,7 @@
 
 **Blocked by:** none (the cassette for the final report is recorded in 13)
 
-**Status:** resolved in code; the cassette of the final report is recorded in 13
+**Status:** resolved
 
 - [x] `src/cassette.py`: recording and replaying wrappers for the model client (agents and judge), live tools and hosted embeddings, one shared cassette per run. `eval.run --record PATH` / `--replay PATH`; replay reapplies the recorded suite, repeats, selection and gate. [ADR-0021](../../../docs/adr/0021-recorded-model-runs-replayable-without-a-key.md).
 - [x] Prompts carry today's date: the cassette stores it, replay freezes `src/clock.py` to it.
@@ -19,7 +19,8 @@
 - [x] `eval.compare PUBLISHED.json REPLAYED.json`: every metric and every answer hash identical, latency/cost/timestamps/provenance excluded.
 - [x] Verified with the real model on 5 golden items (hosted dense retrieval, live weather, human approval and resume, parallel fan-out): 0 differences, 0 unused recorded calls. Three causes of mismatch were found this way and fixed (per-process canary in prompts, nondeterministic embeddings, a test sharing databases).
 - [x] CI: `model-eval` (manual) runs `--gate --repeat 3 --record eval/reports/openai/cassette.json.gz` with hosted retrieval and uploads report and cassette; `model-eval-replay` (every push) replays the committed cassette and runs `eval.compare` against the committed report, skipping with a message while no cassette is committed.
-- [ ] The final report (13) is recorded, its cassette committed, and the CI run linked from the README.
+- [x] The final report (13) is recorded in [CI run 44622842628](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44622842628) (commit `e031a8e`), its cassette (`eval/reports/openai/cassette.json.gz`) committed and verified offline (408 answers, 0 differences, 0 unused calls), and linked from `README.md` and `REVIEW_RESPONSE.md`.
+- [x] The model run evaluates golden conversations 4 at a time under per-conversation cassette scopes, re-runs API-degraded conversations and stops after a failing golden suite: eval step 39 min instead of 2 h 13 min ([ADR-0025](../../../docs/adr/0025-parallel-golden-conversations-and-fail-fast.md)).
 
 ## Comments
 

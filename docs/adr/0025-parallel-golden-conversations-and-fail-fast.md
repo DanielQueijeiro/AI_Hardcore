@@ -16,7 +16,7 @@ The `model-eval` CI job took 2–3 hours. Almost all of it is the golden suite: 
 
 ## Consequences
 
-- Wall-clock time of the golden suite drops roughly by the worker count (offline gate: 70 s → 30 s with 4 workers, identical results). A failing run reports after the golden suite instead of after every suite.
+- Wall-clock time drops roughly by the worker count for the golden suite: offline gate 70 s → 30 s with 4 workers (identical results); the CI model run's eval step took 39 min in [44622842628](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44622842628) against 2 h 13 min sequentially, with the same tokens (about USD 2). Its parallel recording replays offline with 0 differences in about 1.5 min. A failing run reports after the golden suite instead of after every suite.
 - Per-turn latency is still measured per conversation; with several conversations in flight it can read slightly higher if the API queues requests. Latency is reported, not gated.
 - More concurrent requests mean more exposure to API rate limits. Retries and the per-app breaker still apply, and a degraded turn still fails the gate; if that happens, lower `eval_workers`.
 - The adversarial, Critic and calibration suites stay sequential: the adversarial suite shares one app (ticket order matters) and the other two are short.
