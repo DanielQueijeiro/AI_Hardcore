@@ -315,6 +315,48 @@ def test_evidence_checklist_lists_dropped_procedure_steps_and_prices():
         "Price the evidence states for Get Smart: R$ 129.90, R$ 60 thousand",
     ]
 
+    # Two sections under the same source_url (internal://support-runbook has both OFFLINE_GPRS_TIMEOUT steps and
+    # ERR_51_ISSUER_DECLINE): citing the source for a decline answer must NOT pull the unrelated offline procedure
+    # into the checklist, in English or in Spanish/Portuguese.
+    both_sections = [
+        {
+            "agent": "knowledge",
+            "evidence": [
+                {
+                    "tool": "search_getnet_knowledge",
+                    "result": {
+                        "results": [
+                            {
+                                "chunk_id": "internal-support-runbook#1",
+                                "section": "Decline codes ERR_51_ISSUER_DECLINE and POS_KEY_SYNC_WARN",
+                                "text": "ERR_51_ISSUER_DECLINE with POS_KEY_SYNC_WARN requires L2 approval.",
+                                "source_url": "internal://support-runbook",
+                            },
+                            {
+                                "chunk_id": "internal-support-runbook#0",
+                                "section": "Telemetry status OFFLINE_GPRS_TIMEOUT (machine will not connect to the internet)",
+                                "text": runbook,
+                                "source_url": "internal://support-runbook",
+                            },
+                        ]
+                    },
+                }
+            ],
+        }
+    ]
+    decline_en = "The operator did not approve the re-key for ERR_51_ISSUER_DECLINE. Sources: internal://support-runbook"
+    assert evidence_checklist("My card machine is showing a transaction decline error.", decline_en, both_sections) == []
+    decline_es = "El operador rechazó el reemplazo por ERR_51_ISSUER_DECLINE. Fuentes: internal://support-runbook"
+    assert (
+        evidence_checklist(
+            "La terminal muestra error de transacción rechazada.",
+            decline_es,
+            both_sections,
+            compare_text=False,
+        )
+        == []
+    )
+
 
 def test_a_human_decision_is_the_first_checklist_item_whatever_the_language():
     from src.agents.checks import evidence_checklist

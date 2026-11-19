@@ -252,7 +252,7 @@ TOOLS: dict[str, Tool] = {
             _get_fx_rate,
             {
                 "base": {**_TEXT, "description": "ISO code, e.g. USD"},
-                "quote": {**_TEXT, "description": "ISO code; omit for BRL"},
+                "quote": {**_TEXT, "description": "Target ISO currency code; default 'BRL' (Brazilian real) whenever the merchant does not specify another quote currency."},
             },
             ("base",),
         ),

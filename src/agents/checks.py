@@ -235,13 +235,27 @@ def evidence_checklist(message: str, draft: str, observations: list[dict[str, An
                 found.append(
                     None if not compare_text else (not distinctive or len(distinctive & draft_tokens) / len(distinctive) >= 0.5)
                 )
-            # A procedure is in play when the draft follows part of it or cites its source. When the draft's words
-            # cannot be compared (another language), only the citation can tell; a retrieved but unused procedure
-            # would otherwise be listed for every answer that merely shares a search with it (s11).
+            # A procedure is in play when the draft follows part of it (compare_text=True), or — when the draft's
+            # language differs from the corpus (compare_text=False) — when its source is cited and, if multiple
+            # sections of that same page were retrieved (e.g. internal-support-runbook holds both offline steps and
+            # decline codes under one source_url), this section's heading overlaps the message or draft.
             source = str(passage.get("source_url", ""))
             cited = bool(source) and source.rstrip("/") in draft
-            if not cited and (not compare_text or not any(found)):
-                continue
+            if compare_text:
+                if not any(found):
+                    continue
+            else:
+                if not cited:
+                    continue
+                same_source = [p for p in passages if str(p.get("source_url", "")) == source]
+                if len(same_source) > 1:
+                    section_tokens = _tokens(str(passage.get("section", "")))
+                    other_tokens = set().union(
+                        *(_tokens(str(p.get("section", ""))) for p in same_source if p is not passage)
+                    )
+                    distinctive_section = section_tokens - other_tokens
+                    if distinctive_section and not (distinctive_section & (_tokens(message) | draft_tokens)):
+                        continue
             items += [
                 {"item": f"Step {i + 1} of the procedure in {source}: {step}", "found_in_draft": f}
                 for i, (step, f) in enumerate(zip(steps, found, strict=True))
