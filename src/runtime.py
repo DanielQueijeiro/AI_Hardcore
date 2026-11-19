@@ -28,14 +28,37 @@ class Runtime:
 
 
 def build_embedder(settings: Settings) -> Embedder:
-    if settings.embedding_provider == "openai" and settings.openai_api_key:
-        return OpenAIEmbedder(
+    provider = settings.effective_embedding_provider()
+    if provider == "replay":
+        from src.cassette import ReplayEmbedder, open_cassette
+
+        return ReplayEmbedder(open_cassette(settings.replay_from, "replay"))  # type: ignore[arg-type]
+    if provider == "openai":
+        embedder: Embedder = OpenAIEmbedder(
             api_key=settings.openai_api_key,
             model=settings.embedding_model,
             cache_path=settings.sqlite_db_path.parent / "embeddings_cache.json",
             base_url=settings.openai_base_url,
         )
+        if settings.record_to:
+            from src.cassette import RecordingEmbedder, open_cassette
+
+            embedder = RecordingEmbedder(embedder, open_cassette(settings.record_to, "record"))
+        return embedder
     return HashingEmbedder()
+
+
+def build_live(settings: Settings, metrics: Metrics) -> LiveData:
+    options = {"enabled": settings.enable_live_web, "timeout": settings.web_timeout_seconds, "metrics": metrics}
+    if settings.replay_from:
+        from src.cassette import ReplayLive, open_cassette
+
+        return ReplayLive(open_cassette(settings.replay_from, "replay"), scope=settings.cassette_scope, **options)
+    if settings.record_to:
+        from src.cassette import RecordingLive, open_cassette
+
+        return RecordingLive(open_cassette(settings.record_to, "record"), scope=settings.cassette_scope, **options)
+    return LiveData(**options)
 
 
 def build_runtime(
@@ -55,7 +78,7 @@ def build_runtime(
         llm=llm or build_llm(settings),
         retriever=retriever or build_retriever(settings.corpus_dir, build_embedder(settings), settings.index_raw_pages),
         ops=ops,
-        live=live or LiveData(enabled=settings.enable_live_web, timeout=settings.web_timeout_seconds, metrics=metrics),
+        live=live or build_live(settings, metrics),
         metrics=metrics,
     )
     logger.info(

@@ -2,7 +2,7 @@
 
     guard ──blocked──────────────────────────────────────────────┐
       │                                                           ▼
-      └─▶ router ⇄ knowledge | support            critic ──▶ finalize ─▶ END
+      └─▶ router ⇄ knowledge | support | parallel   critic ──▶ finalize ─▶ END
             │  ▲      (observe → re-plan)            ▲  │
             │  └── escalation ─▶ human_review        │  └─ revise ─▶ router
             │        (interrupt: human decides)      │
@@ -61,6 +61,17 @@ def prune_checkpoints(checkpointer: BaseCheckpointSaver, thread_id: str) -> int:
         return removed
 
 
+def _route(state: AgentState) -> str:
+    return {"supervisor": "router"}.get(state["next"], state["next"])
+
+
+def _after_guard(state: AgentState) -> str:
+    """Blocked -> finalize. Allowed -> wherever the speculative first Router step chose, or the Router itself."""
+    if state["guard"].get("allowed") is False:
+        return "finalize"
+    return _route(state) if state.get("steps", 0) > 0 else "router"
+
+
 def build_graph(runtime: Runtime, checkpointer: BaseCheckpointSaver) -> Any:
     nodes = Nodes(runtime)
     graph = StateGraph(AgentState)
@@ -68,22 +79,19 @@ def build_graph(runtime: Runtime, checkpointer: BaseCheckpointSaver) -> Any:
     graph.add_node("router", nodes.supervisor)
     graph.add_node("knowledge", nodes.knowledge)
     graph.add_node("support", nodes.support)
+    graph.add_node("parallel", nodes.parallel)
     graph.add_node("escalation", nodes.escalation)
     graph.add_node("human_review", nodes.human_review)
     graph.add_node("critic", nodes.critic)
     graph.add_node("finalize", nodes.finalize)
 
     graph.add_edge(START, "guard")
-    graph.add_conditional_edges(
-        "guard", lambda s: "finalize" if s["guard"].get("allowed") is False else "router", ["finalize", "router"]
-    )
-    graph.add_conditional_edges(
-        "router",
-        lambda s: {"supervisor": "router"}.get(s["next"], s["next"]),
-        ["router", "knowledge", "support", "escalation", "critic"],
-    )
+    routes = ["router", "knowledge", "support", "parallel", "escalation", "critic"]
+    graph.add_conditional_edges("guard", _after_guard, ["finalize", *routes])
+    graph.add_conditional_edges("router", _route, routes)
     graph.add_edge("knowledge", "router")
     graph.add_edge("support", "router")
+    graph.add_edge("parallel", "router")
     graph.add_edge("escalation", "human_review")
     graph.add_edge("human_review", "router")
     graph.add_conditional_edges(

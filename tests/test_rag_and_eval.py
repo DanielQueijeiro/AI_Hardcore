@@ -230,3 +230,425 @@ def test_splits_are_summarised_separately_and_repeats_report_the_range():
     assert summary["heldout"]["semantic_pass_rate"]["min"] == 0.5 and summary["heldout"]["semantic_pass_rate"]["max"] == 1.0
     assert summary["items_failed_in_n_runs"] == {"i1": 2}
     assert len(dataset_hashes()["golden.jsonl"]) == 64
+
+
+def test_search_also_reaches_english_passages_a_portuguese_query_misses(client):
+    # s04, 2026-11-16: every search was a Portuguese reformulation and BM25 over the English corpus never
+    # returned "up to 5 devices". The merchant's own words and the English form are searched too.
+    from src.security.auth import Principal
+    from src.tools.registry import KNOWLEDGE_TOOLS, ToolContext, run_tool
+
+    runtime = client.app.state.runtime
+    merchant = Principal("cliente1988", "merchant")
+    portuguese = {"query": "quantidade limite dispositivos loja Get Smart"}
+
+    def has_passage(out):
+        return [r["matched_by"] for r in out["results"] if "up to 5 devices" in r["text"]]
+
+    alone = run_tool(ToolContext(runtime, merchant), "search_getnet_knowledge", portuguese, KNOWLEDGE_TOOLS)
+    assert not has_passage(alone) and "also_searched" not in alone
+
+    asked = "How many devices can I use in one store with the Get Smart?"
+    with_message = run_tool(ToolContext(runtime, merchant, merchant_message=asked), "search_getnet_knowledge", portuguese, KNOWLEDGE_TOOLS)
+    assert has_passage(with_message) == ["merchant_message"]
+    k = runtime.settings.retrieval_top_k
+    assert [r["chunk_id"] for r in with_message["results"][:k]] == [r["chunk_id"] for r in alone["results"]], "the query's own ranking is kept"
+    assert len(with_message["results"]) <= k + 2 and with_message["relevance"] == "good"
+
+    english = {**portuguese, "query_en": "maximum number of devices per store Get Smart"}
+    with_english = run_tool(ToolContext(runtime, merchant), "search_getnet_knowledge", english, KNOWLEDGE_TOOLS)
+    assert has_passage(with_english) == ["query_en"]
+
+    same = run_tool(ToolContext(runtime, merchant, merchant_message=asked), "search_getnet_knowledge", {"query": asked}, KNOWLEDGE_TOOLS)
+    assert "also_searched" not in same and len(same["results"]) == k, "a wording identical to the query is not searched twice"
+
+
+def test_evidence_checklist_lists_dropped_procedure_steps_and_prices():
+    from src.agents.checks import evidence_checklist, procedure_steps
+
+    runbook = (
+        "First-line steps for the merchant, in order: 1) restart the terminal and wait for the network indicator; "
+        "2) if Wi-Fi is available, connect the terminal to the store Wi-Fi; 3) with the terminal off, reseat the SIM chip "
+        "and power it back on; 4) run the communication test described in the Getnet FAQ. If the terminal is still offline, open a ticket."
+    )
+    assert procedure_steps(runbook)[0][1] == "if Wi-Fi is available, connect the terminal to the store Wi-Fi"
+    assert procedure_steps(runbook)[0][3] == "run the communication test described in the Getnet FAQ"
+    assert procedure_steps("Choose 2) or 3) as you like") == []
+
+    def obs(*texts):
+        rows = [{"text": t, "source_url": f"https://x.test/{i}"} for i, t in enumerate(texts)]
+        return [{"agent": "knowledge", "evidence": [{"tool": "search_getnet_knowledge", "result": {"results": rows}}]}]
+
+    message = "It is still offline after I restarted it. What else can I try?"
+    without_wifi = "Restart it and wait for the network indicator, then reseat the SIM chip with the terminal off and run the communication test."
+    items = evidence_checklist(message, without_wifi, obs(runbook))
+    assert [i["found_in_draft"] for i in items] == [False] and "store Wi-Fi" in items[0]["item"]
+    assert evidence_checklist(message, without_wifi + " Or connect it to the store Wi-Fi.", obs(runbook)) == []
+    assert evidence_checklist(message, "Please contact support.", obs(runbook)) == [], "a procedure the draft does not follow is not in play"
+    portuguese = "Reinicie a maquininha e conecte ao Wi-Fi da loja."
+    assert evidence_checklist(message, portuguese, obs(runbook), compare_text=False) == [], "uncited and not comparable: not in play"
+    cited = evidence_checklist(message, portuguese + " Fonte: https://x.test/0", obs(runbook), compare_text=False)
+    assert len(cited) == 4 and {i["found_in_draft"] for i in cited} == {None}
+    twice = obs(runbook)
+    twice[0]["evidence"].append({"tool": "search_getnet_knowledge", "result": {"results": [{"text": runbook, "source_url": "https://x.test/0", "score": 2}]}})
+    assert len(evidence_checklist(message, without_wifi, twice)) == 1, "the same passage from two searches is listed once"
+
+    prices = "Monthly rental: Get Clássica R$ 79.90 per month (for comparison: Get Mini R$ 14.90, Get Smart R$ 129.90)."
+    compare = "What's the difference between the Get Clássica and the Get Smart?"
+    items = evidence_checklist(compare, "The Get Smart is a 5-in-1 device; the Get Clássica is a classic POS.", obs(prices))
+    assert [i["item"] for i in items] == [
+        "Price the evidence states for Get Clássica: R$ 79.90",
+        "Price the evidence states for Get Smart: R$ 129.90",
+    ]
+    assert evidence_checklist(compare, "Rental is R$ 79.90 vs R$ 129.90.", obs(prices)) == []
+    assert evidence_checklist("Does the Get Smart print receipts?", "Yes, it has a printer.", obs(prices)) == [], "no price asked, one product"
+
+    # Comparative sentence where prices appear *before* each product and 'versus' separates them (get-smart#5):
+    # each product must only receive its own prices, never the other product's.
+    versus = (
+        "Rental without minimum volume is R$ 79.90 per month for the Get Clássica versus R$ 129.90 for the Get Smart, "
+        "and the rental waiver starts at R$ 10 thousand of monthly sales for the Get Clássica versus R$ 60 thousand for the Get Smart."
+    )
+    items = evidence_checklist(compare, "The Get Smart is a 5-in-1 device; the Get Clássica is a classic POS.", obs(versus))
+    assert [i["item"] for i in items] == [
+        "Price the evidence states for Get Clássica: R$ 79.90, R$ 10 thousand",
+        "Price the evidence states for Get Smart: R$ 129.90, R$ 60 thousand",
+    ]
+
+    # Two sections under the same source_url (internal://support-runbook has both OFFLINE_GPRS_TIMEOUT steps and
+    # ERR_51_ISSUER_DECLINE): citing the source for a decline answer must NOT pull the unrelated offline procedure
+    # into the checklist, in English or in Spanish/Portuguese.
+    both_sections = [
+        {
+            "agent": "knowledge",
+            "evidence": [
+                {
+                    "tool": "search_getnet_knowledge",
+                    "result": {
+                        "results": [
+                            {
+                                "chunk_id": "internal-support-runbook#1",
+                                "section": "Decline codes ERR_51_ISSUER_DECLINE and POS_KEY_SYNC_WARN",
+                                "text": "ERR_51_ISSUER_DECLINE with POS_KEY_SYNC_WARN requires L2 approval.",
+                                "source_url": "internal://support-runbook",
+                            },
+                            {
+                                "chunk_id": "internal-support-runbook#0",
+                                "section": "Telemetry status OFFLINE_GPRS_TIMEOUT (machine will not connect to the internet)",
+                                "text": runbook,
+                                "source_url": "internal://support-runbook",
+                            },
+                        ]
+                    },
+                }
+            ],
+        }
+    ]
+    decline_en = "The operator did not approve the re-key for ERR_51_ISSUER_DECLINE. Sources: internal://support-runbook"
+    assert evidence_checklist("My card machine is showing a transaction decline error.", decline_en, both_sections) == []
+    decline_es = "El operador rechazó el reemplazo por ERR_51_ISSUER_DECLINE. Fuentes: internal://support-runbook"
+    assert (
+        evidence_checklist(
+            "La terminal muestra error de transacción rechazada.",
+            decline_es,
+            both_sections,
+            compare_text=False,
+        )
+        == []
+    )
+
+
+def test_a_human_decision_is_the_first_checklist_item_whatever_the_language():
+    from src.agents.checks import evidence_checklist
+
+    rejected = [{"agent": "escalation", "decision": "reject", "operator_message": "Try a different card first."}]
+    items = evidence_checklist("Minha maquininha recusa vendas.", "Tente outro cartão.", rejected, compare_text=False)
+    assert "did NOT approve" in items[0]["item"] and "different card" in items[0]["item"] and items[0]["found_in_draft"] is None
+    answered = [{"agent": "escalation", "decision": "answer", "operator_message": "Use Portal Minha Conta."}]
+    assert "must not say that a person cannot be reached" in evidence_checklist("Talk to a person", "x", answered)[0]["item"]
+    approved = [{"agent": "escalation", "decision": "approve", "action_result": {"executed": True}}]
+    assert "not finished" in evidence_checklist("fix it", "x", approved)[0]["item"]
+
+
+def test_checklist_keeps_the_decline_code_settlement_amounts_and_compared_rates():
+    from src.agents.checks import evidence_checklist
+
+    # g08: after the operator decided on the re-key, half of the code is not the diagnosis the merchant asked for.
+    diagnostics = {
+        "agent": "support",
+        "evidence": [
+            {
+                "tool": "get_pos_diagnostics",
+                "result": {"last_transaction_decline": {"transaction_id": "TX-88410", "decline_code": "ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN"}},
+            }
+        ],
+    }
+    decided = [diagnostics, {"agent": "escalation", "decision": "approve", "proposed_action": "terminal_rekey_or_swap"}]
+    half = "The decline is POS_KEY_SYNC_WARN. The re-key was approved; service order SO-D68D5A35 was created."
+    items = evidence_checklist("My card machine is showing a transaction decline error.", half, decided)
+    assert [i["found_in_draft"] for i in items[1:]] == [False] and "ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN on transaction TX-88410" in items[1]["item"]
+    whole = "The decline is ERR_51_ISSUER_DECLINE / POS_KEY_SYNC_WARN. The re-key was approved."
+    assert len(evidence_checklist("decline error", whole, decided)) == 1, "only the decision item when the code is there"
+    assert len(evidence_checklist("decline error", half, [diagnostics])) == 0, "no decision, no post-decision item"
+
+    # g17: every modality the draft schedules must carry its amount; a modality it does not mention is left alone.
+    settlements = [
+        {
+            "agent": "support",
+            "evidence": [
+                {
+                    "tool": "get_settlements",
+                    "result": {
+                        "settlements": [
+                            {"modality": "Pix Sales", "net_amount_brl": "R$ 410.00", "scheduled_window": "Instant (D+0, already credited)"},
+                            {"modality": "Debit Card Sales", "net_amount_brl": "R$ 620.00", "scheduled_window": "Today (D+1) by 14:00 BRT"},
+                            {"modality": "Credit Card Sales (1x)", "gross_amount_brl": "R$ 1,100.00", "net_amount_brl": "R$ 1,067.00"},
+                        ]
+                    },
+                }
+            ],
+        }
+    ]
+    message = "When will the money from yesterday's sales be deposited?"
+    no_amounts = "Pix was credited instantly; debit is scheduled for today by 2:00 p.m.; credit card 1x follows D+30."
+    items = evidence_checklist(message, no_amounts, settlements)
+    assert [i["item"].split(":")[0] for i in items] == ["Amount for Pix Sales", "Amount for Debit Card Sales", "Amount for Credit Card Sales (1x)"]
+    with_amounts = "Pix R$410 was credited instantly; debit R$ 620.00 is due today; credit card 1x R$1,067 follows D+30."
+    assert evidence_checklist(message, with_amounts, settlements) == []
+    portuguese = "O Pix (R$ 410,00) já caiu; o débito (R$ 620,00) cai hoje; o crédito à vista (R$ 1.067,00) segue D+30."
+    assert evidence_checklist("Quando cai o dinheiro?", portuguese, settlements, compare_text=False) == []
+    crediario = "Crediário sales are credited in one payment within 2 business days after capture."
+    assert evidence_checklist("When do I receive the crediário money?", crediario, settlements) == [], "'credited' is not the credit modality"
+
+    # g01: comparing two machines from a passage that names both and states their card rates.
+    def obs(text):
+        return [{"agent": "knowledge", "evidence": [{"tool": "search_getnet_knowledge", "result": {"results": [{"text": text, "source_url": "https://x.test/0"}]}}]}]
+
+    lineup = (
+        "Get Clássica and Get Smart are POS machines sold with the same published card rates (debit 1.69%, installments from "
+        "7.98% to 12.88%). Rental is R$ 79.90 for the Get Clássica versus R$ 129.90 for the Get Smart."
+    )
+    compare = "What's the difference between the Get Clássica and the Get Smart?"
+    draft = "The Get Smart is a 5-in-1 device. Rental is R$ 79.90 for the Clássica and R$ 129.90 for the Smart."
+    items = evidence_checklist(compare, draft, obs(lineup))
+    assert len(items) == 1 and items[0]["item"].startswith("Card rates the evidence states for Get Clássica and Get Smart: Get Clássica and Get Smart are POS")
+    assert evidence_checklist(compare, draft + " Their published card rates are the same.", obs(lineup)) == []
+    assert evidence_checklist("Does the Get Smart print?", "Yes.", obs(lineup)) == [], "one product: no comparison"
+
+
+def test_checklist_flags_a_handoff_offer_when_there_is_nothing_to_escalate():
+    from src.agents.checks import evidence_checklist
+
+    def diagnostics(status, decline=None):
+        result = {"found": True, "model": "Get Clássica", "connectivity_status": status, "last_transaction_decline": decline}
+        return [{"agent": "support", "evidence": [{"tool": "get_pos_diagnostics", "result": result}]}]
+
+    message = "My card machine is showing a transaction decline error."
+    offer = "No decline is recorded. If it continues, I can hand this to a human specialist."
+    plain = "Your Get Clássica is online and no decline is recorded, so there is nothing to escalate. What does the screen show?"
+    items = evidence_checklist(message, offer, diagnostics("ONLINE_4G_OK"))
+    assert len(items) == 1 and "nothing to escalate" in items[0]["item"] and items[0]["found_in_draft"] is False
+    assert evidence_checklist(message, plain, diagnostics("ONLINE_4G_OK")) == []
+    assert evidence_checklist(message, offer, diagnostics("OFFLINE_GPRS_TIMEOUT")) == [], "offline: a swap may need a person"
+    decline = {"transaction_id": "TX-1", "decline_code": "X", "requires_human_approved_action": True}
+    assert evidence_checklist(message, offer, diagnostics("ONLINE_4G_OK", decline)) == [], "a recorded decline may need a person"
+    assert evidence_checklist("I want to talk to a human about this decline.", offer, diagnostics("ONLINE_4G_OK")) == []
+    channel = "Nothing is recorded, so there is nothing to escalate; a Getnet support agent can help at 4002-4000."
+    assert evidence_checklist(message, channel, diagnostics("ONLINE_4G_OK")) == [], "naming a support channel is not a handoff"
+
+    # g08: after an approved re-key, offline troubleshooting the merchant did not ask about.
+    decided = [
+        {"agent": "support", "evidence": [{"tool": "get_pos_diagnostics", "result": {"last_transaction_decline": {"decline_code": "A / B"}}}]},
+        {"agent": "escalation", "decision": "approve", "proposed_action": "terminal_rekey_or_swap", "operator_message": "ok"},
+    ]
+    focused = "The re-key was approved for decline A / B; service order SO-1 was created."
+    assert len(evidence_checklist(message, focused, decided)) == 1, "only the decision item"
+    wandering = focused + " The terminal is also offline: reconnect it to Wi-Fi and run the communication test."
+    assert "Leave out connectivity troubleshooting" in evidence_checklist(message, wandering, decided)[-1]["item"]
+    assert len(evidence_checklist("My machine won't connect and shows a decline error.", wandering, decided)) == 1
+
+
+def test_fx_quote_defaults_to_reais(monkeypatch, client):
+    from src.security.auth import Principal
+    from src.tools.registry import KNOWLEDGE_TOOLS, TOOLS, ToolContext, run_tool
+
+    runtime = client.app.state.runtime
+    asked: list[tuple[str, str]] = []
+    monkeypatch.setattr(runtime.live, "fx_rate", lambda base, quote: asked.append((base, quote)) or {"available": True, "rate": 5.6})
+    run_tool(ToolContext(runtime, Principal("cliente1988", "merchant")), "get_fx_rate", {"base": "USD"}, KNOWLEDGE_TOOLS)
+    assert asked == [("USD", "BRL")] and TOOLS["get_fx_rate"].required == ("base",)
+
+    # g07: the model asked for EUR/USD although the merchant named only the euro.
+    def fx(message, base, quote):
+        asked.clear()
+        ctx = ToolContext(runtime, Principal("cliente1988", "merchant"), merchant_message=message)
+        run_tool(ctx, "get_fx_rate", {"base": base, "quote": quote}, KNOWLEDGE_TOOLS)
+        return asked[0]
+
+    assert fx("What's the euro exchange rate today?", "EUR", "USD") == ("EUR", "BRL")
+    assert fx("Qual a cotação do euro em dólares?", "EUR", "USD") == ("EUR", "USD"), "the merchant named the quote currency"
+    assert fx("How many USD is one euro?", "EUR", "usd") == ("EUR", "USD")
+    assert fx("¿Cuál es el tipo de cambio de la libra esterlina?", "GBP", "BRL") == ("GBP", "BRL")
+
+
+def test_a_date_taken_from_todays_date_line_is_grounded():
+    from datetime import date
+
+    from eval import metrics as m
+    from src import clock
+    from src.agents.nodes import today_line
+
+    clock.freeze(date(2026, 11, 19))
+    try:
+        answer = "Debit card proceeds are scheduled for today, November 19, by 14:00."
+        observations = [{"agent": "support", "evidence": [{"result": {"scheduled_window": "Today (D+1) by 14:00 BRT"}}]}]
+        assert m.numeric_groundedness(answer, observations)[1] == ["19"]
+        assert m.numeric_groundedness(answer, observations, today_line()) == (1.0, [])
+    finally:
+        clock.freeze(None)
+
+
+def _golden_run(passes: int, n: int = 18, degraded: int = 0) -> list[dict]:
+    row = {
+        "split": "dev", "fact_coverage": 1.0, "forbidden_hits": [], "numeric_groundedness": 1.0, "citation_validity": 1.0,
+        "gold_source_hit": None, "language_ok": True, "routing_ok": True, "judge": None, "latency_ms": 1000, "cost_usd": 0.0,
+    }
+    return [{**row, "id": f"g{i:02d}", "semantic_pass": i < passes, "degraded": i < degraded} for i in range(n)]
+
+
+def _repeated(*runs: list[dict]) -> dict:
+    from eval.run import _golden_summary
+
+    return {"golden": _golden_summary(runs[0]), "golden_repeat_items": list(runs[1:])}
+
+
+def test_gate_reads_every_repeated_run_mean_and_worst():
+    # ADR-0019. dev has 18 items: one item is 0.0556. Floor 0.94.
+    floor = {"min": {"golden.dev.semantic_pass_rate": 0.94}}
+    assert check_gate(_repeated(_golden_run(17), _golden_run(18), _golden_run(18)), floor) == []
+    # one run a single item below the floor-minus-one-item band is tolerated when the mean holds...
+    assert check_gate(_repeated(_golden_run(16), _golden_run(18), _golden_run(18)), floor) == []
+    # ...but a run two items below is not, even with a passing mean
+    worst = check_gate(_repeated(_golden_run(18), _golden_run(18), _golden_run(15)), floor)
+    assert len(worst) == 1 and "more than one item below" in worst[0]
+    # and a mean below the floor fails however the runs are spread (the published 2026-11-16 dev: 0.833, 0.889, 0.889)
+    mean = check_gate(_repeated(_golden_run(15), _golden_run(16), _golden_run(16)), floor)
+    assert len(mean) == 1 and "(mean 0.8704)" in mean[0]
+    # a ceiling holds only if every run is within it
+    ceiling = {"max": {"golden.all.degraded_turns": 0}}
+    assert "in at least one run" in check_gate(_repeated(_golden_run(18), _golden_run(18, degraded=1)), ceiling)[0]
+    # a single run is gated exactly as before
+    assert check_gate(_repeated(_golden_run(16)), floor) and not check_gate(_repeated(_golden_run(17)), floor)
+
+
+
+def test_borderline_labels_merge_and_report_human_agreement_apart(tmp_path, monkeypatch):
+    import eval.borderline as bl
+    from src.llm.scripted import ScriptedLLM
+
+    dataset = tmp_path / "judge_borderline.jsonl"
+    rows = [{"id": f"b0{i}", "set": "borderline", "question": "q", "reference": "r", "evidence": "e", "answer": "a"} for i in range(1, 5)]
+    dataset.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    monkeypatch.setattr(bl, "DATASET", dataset)
+    ana, bruno, final = (tmp_path / f"borderline_{n}.csv" for n in ("ana", "bruno", "final"))
+    ana.write_text("id,label,comment\nb01,pass,\nb02,fail,\nb03,pass,\nb04,fail,\n", encoding="utf-8")
+    bruno.write_text("id,label,comment\nb01,pass,\nb02,fail,\nb03,fail,\nb04,fail,\n", encoding="utf-8")
+    final.write_text("id,label,comment\nb01,pass,\nb02,fail,\nb03,fail,\nb04,fail,\n", encoding="utf-8")
+    assert bl.agreement(bl.read_labels(ana), bl.read_labels(bruno))["disagreements"] == ["b03"]
+    assert bl.main([str(ana), str(bruno), "--final", str(final)]) == 0
+    merged = [json.loads(line) for line in dataset.read_text(encoding="utf-8").splitlines()]
+    assert merged[2]["label"] == "fail" and merged[2]["human_labels"] == {"ana": "pass", "bruno": "fail"}
+
+    clear = {"id": "c1", "set": "independent", "question": "q", "reference": "r", "evidence": "e", "answer": "a", "label": "pass"}
+    grade = call("grade", correctness=5, groundedness=5, relevance=5, helpfulness=5, rationale="ok")
+    result = calibrate(ScriptedLLM({"judge": grade}), [clear, *merged])
+    assert result["n"] == 1 and result["agreement"] == 1.0, "the headline is the clear-cut sets only"
+    assert result["by_set"]["borderline"]["human_agreement"] == 0.75 and "human_kappa" in result["by_set"]["borderline"]
+
+
+def test_multi_query_dense_search_batches_embeddings_into_one_call(client):
+    from src.rag import Retriever, load_corpus
+    from src.security.auth import Principal
+    from src.tools.registry import KNOWLEDGE_TOOLS, ToolContext, run_tool
+
+    batches: list[list[str]] = []
+
+    class CountingEmbedder:
+        name = "counting-dense"
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            batches.append(list(texts))
+            return [[1.0, float(len(t) % 7) + 0.1] for t in texts]
+
+    runtime = client.app.state.runtime
+    runtime.retriever = Retriever(load_corpus(CORPUS), CountingEmbedder())
+    runtime.settings = runtime.settings.model_copy(update={"retrieval_mode": "dense"})
+    ctx = ToolContext(runtime, Principal("cliente1988", "merchant"), merchant_message="How many devices in one store?")
+    run_tool(ctx, "search_getnet_knowledge", {"query": "limite dispositivos loja", "query_en": "device limit per store"}, KNOWLEDGE_TOOLS)
+    assert len(batches) == 2, "one batch for corpus chunks, one batch for all three query wordings"
+    assert len(batches[1]) == 3
+
+
+def test_markdown_report_renders_heldout_retrieval_glossary_ablation_borderline_and_cassette(settings):
+    from eval.run import render_markdown
+
+    retrieval = run_retrieval(settings)
+    report = {
+        "mode": "openai",
+        "model": "m",
+        "judge_model": "j",
+        "live_web": True,
+        "generated_at": "2026-11-18T00:00:00+00:00",
+        "cassette": {"mode": "replay", "path": "eval/reports/openai/cassette.json.gz", "recorded_on": "2026-11-18", "unused_recorded_calls": 0},
+        "retrieval": retrieval,
+        "calibration": {
+            "n": 1,
+            "agreement": 1.0,
+            "kappa": 1.0,
+            "false_pass": 0,
+            "false_fail": 0,
+            "by_set": {
+                "independent": {"n": 1, "agreement": 1.0, "kappa": 1.0, "false_pass": 0, "false_fail": 0},
+                "borderline": {"n": 4, "agreement": 0.75, "kappa": 0.5, "false_pass": 0, "false_fail": 1, "human_agreement": 0.85, "human_kappa": 0.7},
+            },
+            "rows": [],
+        },
+    }
+    md = render_markdown(report)
+    assert "### Glossary ablation (dev, glossary off)" in md
+    assert "### Held-out queries (36 queries, written after the glossary)" in md
+    assert "### Held-out queries, glossary off" in md
+    assert "Reviewer agreement | Reviewer kappa" in md and "0.850 | 0.700" in md
+    assert "Cassette (replay): `eval/reports/openai/cassette.json.gz`" in md
+
+
+def test_critic_calibration_reports_dev_and_heldout_separately(settings):
+    from eval.run import render_markdown, run_critic
+
+    result = run_critic(settings)
+    assert set(result["by_set"]) == {"dev", "heldout"}
+    assert result["by_set"]["dev"]["n"] == 32 and result["by_set"]["heldout"]["n"] == 16
+    assert result["by_set"]["heldout"]["recall"] == 0.125 and result["by_set"]["heldout"]["false_revise_rate"] == 0.0
+    md = render_markdown({"mode": "offline", "model": "m", "judge_model": "none", "live_web": False, "generated_at": "now", "critic": result})
+    assert "| Set | n | Recall | False revise |" in md and "| heldout | 16 | 0.125 | 0.000 |" in md
+
+
+def test_wait_for_breaker_sleeps_only_when_open(monkeypatch):
+    import eval.run as eval_run
+
+    slept: list[float] = []
+    monkeypatch.setattr(eval_run.time, "sleep", slept.append)
+    monkeypatch.setattr(eval_run.time, "monotonic", lambda: 100.0)
+
+    class Closed:
+        breaker_open = False
+
+    class Open:
+        breaker_open = True
+        cooldown_seconds = 15.0
+        _open_until = 110.0
+
+    eval_run._wait_for_breaker(Closed())
+    assert slept == []
+    eval_run._wait_for_breaker(Open())
+    assert len(slept) == 1 and 10.0 <= slept[0] <= 11.0

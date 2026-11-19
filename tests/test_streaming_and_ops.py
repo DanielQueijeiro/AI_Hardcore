@@ -302,6 +302,7 @@ def test_adjudication_is_tied_to_the_exact_answer_and_never_changes_the_gate():
 
     report["adjudication"] = adj
     report["golden"]["dev"] = {"semantic_pass_rate": 1 / 3}
+    del report["golden_repeat_items"]  # these rows are minimal; the repeated-run rule has its own test
     failures = ev.check_gate(report, {"min": {"golden.dev.semantic_pass_rate": 0.6}})
     assert failures == ["golden.dev.semantic_pass_rate = 0.3333 is below the baseline 0.6"], "the gate reads the raw rate"
 

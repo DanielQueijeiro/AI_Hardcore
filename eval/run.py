@@ -25,12 +25,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
-from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +41,11 @@ from fastapi.testclient import TestClient
 
 from eval import metrics as m
 from eval.judge import calibrate, fit_evidence, judge, load_jsonl
+from src import clock
 from src.agents.checks import evidence_text
+from src.agents.nodes import today_line
 from src.api.main import create_app
+from src.cassette import CassetteMiss, RecordingLLM, ReplayLLM, close_cassettes, open_cassette
 from src.config import Settings
 from src.llm.base import LLMClient
 from src.llm.offline import OfflinePolicyLLM
@@ -183,12 +189,43 @@ class Harness:
         return response.json()
 
 
-def make_settings(mode: str, workdir: Path, live: bool) -> Settings:
+# Set by --record / --replay for the whole run; never applied to an offline run.
+CASSETTE: dict[str, Path | None] = {"record_to": None, "replay_from": None}
+# Runtime settings that shape prompts, retrieval or agent loops: saved into the cassette on --record and
+# restored on --replay, so a reviewer's local .env cannot make a replay diverge from the recording.
+RECORDED_SETTINGS = (
+    "retrieval_mode",
+    "retrieval_top_k",
+    "embedding_provider",
+    "embedding_model",
+    "reasoning_effort",
+    "guardrail_reasoning_effort",
+    "max_supervisor_steps",
+    "max_specialist_tool_steps",
+    "max_critic_rounds",
+    "max_parallel_tasks",
+    "history_keep_messages",
+    "history_compact_after",
+    "index_raw_pages",
+)
+
+
+def make_settings(mode: str, workdir: Path, live: bool, scope: str = "") -> Settings:
     base = Settings()
     provider = "offline" if mode == "offline" or not base.openai_api_key else "openai"
+    recorded: dict[str, Any] = {}
+    if mode != "offline" and CASSETTE["replay_from"] is not None:
+        recorded = {
+            k: v
+            for k, v in open_cassette(CASSETTE["replay_from"], "replay").meta.get("settings", {}).items()
+            if k in RECORDED_SETTINGS
+        }
     return base.model_copy(
         update={
+            **recorded,
+            **(CASSETTE if mode != "offline" else {"record_to": None, "replay_from": None}),
             "llm_provider": provider,
+            "cassette_scope": scope,
             "sqlite_db_path": workdir / "support.db",
             "checkpoint_db_path": workdir / "checkpoints.db",
             "jwt_secret": secrets.token_urlsafe(32),
@@ -203,23 +240,26 @@ def make_settings(mode: str, workdir: Path, live: bool) -> Settings:
 
 
 def judge_client(settings: Settings) -> LLMClient:
+    if settings.effective_provider() == "replay":
+        return ReplayLLM(open_cassette(settings.replay_from, "replay"), slot="judge", scope=settings.cassette_scope)  # type: ignore[arg-type]
     if settings.effective_provider() != "openai":
         return OfflinePolicyLLM()
-    return OpenAIResponsesClient(
+    client: LLMClient = OpenAIResponsesClient(
         api_key=settings.openai_api_key or "",
         model=settings.judge_model or settings.openai_model,
         base_url=settings.openai_base_url,
         timeout=settings.llm_timeout_seconds,
         max_retries=settings.llm_max_retries,
     )
+    if settings.record_to:
+        client = RecordingLLM(client, open_cassette(settings.record_to, "record"), slot="judge", scope=settings.cassette_scope)
+    return client
 
 
 # --- retrieval ------------------------------------------------------------------------------------
 
 
-def run_retrieval(settings: Settings) -> dict[str, Any]:
-    queries = load_jsonl(DATASETS / "retrieval.jsonl")
-    retriever = Retriever(load_corpus(settings.corpus_dir), build_embedder(settings))
+def _retrieval_modes(retriever: Retriever, queries: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     depth = max(RETRIEVAL_KS)
     modes: dict[str, Any] = {}
     per_query: dict[str, dict[str, float]] = {}
@@ -235,21 +275,47 @@ def run_retrieval(settings: Settings) -> dict[str, Any]:
             rows.append(row)
             per_query.setdefault(q["id"], {})[mode] = row["mrr"]
         keys = [k for k in rows[0] if k != "lang"]
-        summary = {k: round(m.mean([r[k] for r in rows]), 4) for k in keys}
+        summary: dict[str, Any] = {k: round(m.mean([r[k] for r in rows]), 4) for k in keys}
         summary["by_lang"] = {
             lang: {k: round(m.mean([r[k] for r in rows if r["lang"] == lang]), 4) for k in ("hit@1", f"recall@{depth}", "mrr")}
             for lang in sorted({r["lang"] for r in rows})
         }
         modes[mode] = summary
-    misses = [qid for qid, scores in per_query.items() if scores[settings.retrieval_mode] == 0.0]
-    return {
-        "queries": len(queries),
+    return modes, per_query
+
+
+def run_retrieval(settings: Settings) -> dict[str, Any]:
+    """Retrieval metrics on the dev queries (gated), the held-out queries, and both with the glossary switched off.
+
+    Dev queries were written alongside the query-side glossary; held-out queries were written after it and the
+    glossary was not edited for them. Switching the glossary off shows how much of each number it is responsible for.
+    """
+    queries = load_jsonl(DATASETS / "retrieval.jsonl")
+    dev = [q for q in queries if q.get("split", "dev") == "dev"]
+    heldout = [q for q in queries if q.get("split") == "heldout"]
+    chunks, embedder = load_corpus(settings.corpus_dir), build_embedder(settings)
+    retriever = Retriever(chunks, embedder)
+    bare = Retriever(chunks, embedder, use_glossary=False)
+    modes, per_query = _retrieval_modes(retriever, dev)
+    misses = [qid for qid, scores in per_query.items() if scores[settings.effective_retrieval_mode()] == 0.0]
+    out: dict[str, Any] = {
+        "queries": len(dev),
         "chunks": len(retriever.chunks),
         "embedder": retriever.embedder.name,
-        "configured_mode": settings.retrieval_mode,
+        "configured_mode": settings.effective_retrieval_mode(),
         "modes": modes,
         "misses_in_configured_mode": misses,
+        "glossary_off": {"modes": _retrieval_modes(bare, dev)[0]},
     }
+    if heldout:
+        held_modes, held_per_query = _retrieval_modes(retriever, heldout)
+        out["heldout"] = {
+            "queries": len(heldout),
+            "modes": held_modes,
+            "misses_in_configured_mode": [q for q, s in held_per_query.items() if s[settings.effective_retrieval_mode()] == 0.0],
+            "glossary_off": {"modes": _retrieval_modes(bare, heldout)[0]},
+        }
+    return out
 
 
 # --- golden answers -------------------------------------------------------------------------------
@@ -268,18 +334,57 @@ def select_golden(ids: list[str] | None = None, split: str | None = None) -> lis
     return items
 
 
-def run_golden(make_harness: Any, grader: LLMClient, items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Each item runs on its own fresh application and databases: an approved ticket or a service order left by
-    one conversation must not change how the same merchant's next conversation is handled."""
+def run_golden(
+    make_harness: Any,
+    make_grader: Any,
+    items: list[dict[str, Any]] | None = None,
+    *,
+    repeat: int = 1,
+    workers: int = 1,
+    degraded_retries: int = 0,
+) -> list[dict[str, Any]]:
+    """Run the golden items `repeat` times and return one summary per run.
+
+    Each item runs on its own fresh application and databases: an approved ticket or a service order left by
+    one conversation must not change how the same merchant's next conversation is handled. That isolation is also
+    what lets `workers` conversations run at once: `make_harness(run, item)` and `make_grader(settings)` build a
+    scoped app and judge per conversation, so its cassette keys are its own (src/cassette.py), and the rows come back
+    in item order whatever order the threads finished in.
+
+    A conversation in which the model API failed (a turn answered by the offline fallback, `degraded`) measures the
+    outage, not the agent. With `degraded_retries` it is run again from scratch on a new app and cassette scope
+    (`make_harness(run, item, attempt)`), at most that many times; the row records how many attempts were discarded,
+    and a conversation still degraded after the last attempt is kept as it is and counts against the gate.
+    """
     items = items if items is not None else load_jsonl(DATASETS / "golden.jsonl")
-    rows: list[dict[str, Any]] = []
-    for item in items:
-        h = make_harness()
+    repeat = max(1, repeat)
+    tasks = [(run, item) for run in range(repeat) for item in items]
+
+    def one(task: tuple[int, dict[str, Any]]) -> dict[str, Any]:
+        run, item = task
+        attempt = 0
+        while True:
+            h = make_harness(run, item, attempt)
+            try:
+                row = _golden_item(h, make_grader(h.settings), item)
+            finally:
+                h.close()
+            if not row.pop("_any_turn_degraded") or attempt >= degraded_retries:
+                break
+            attempt += 1
+        if attempt:
+            row["discarded_degraded_attempts"] = attempt
+        return row
+
+    if workers <= 1:
+        rows = [one(t) for t in tasks]
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="golden")
         try:
-            rows.append(_golden_item(h, grader, item))
+            rows = list(pool.map(one, tasks))
         finally:
-            h.close()
-    return _golden_summary(rows)
+            pool.shutdown(wait=True, cancel_futures=True)  # one failed conversation cancels the queued ones
+    return [_golden_summary(rows[r * len(items) : (r + 1) * len(items)]) for r in range(repeat)]
 
 
 def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[str, Any]:
@@ -300,7 +405,8 @@ def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[st
 
     coverage, missing = m.fact_coverage(answer, item["facts"])
     forbidden = m.forbidden_hits(answer, item.get("forbidden", []))
-    grounded, unsupported = m.numeric_groundedness(answer, observations, *context)
+    # The agents' prompts state today's date (src/agents/nodes.py today_line), so a date taken from it is grounded.
+    grounded, unsupported = m.numeric_groundedness(answer, observations, *context, today_line())
     cite, fabricated = m.citation_validity(answer, observations, *context)
     # An item with no operator in the script is expected to be answered, not parked on a human.
     status_ok = first_status == item.get("expect_status", "awaiting_human" if item.get("operator") else "completed")
@@ -362,6 +468,7 @@ def _golden_item(h: Harness, grader: LLMClient, item: dict[str, Any]) -> dict[st
             "latency_ms": latency,
             "cost_usd": trace.get("usage", {}).get("cost_usd", 0.0),
             "degraded": trace.get("degraded", False),
+            "_any_turn_degraded": any(t.get("degraded", False) for t in (*earlier, trace)),
             "tool_calls": tool_calls,
             "answer_sha256": answer_sha256(answer),
             "judge_input": judge_input,
@@ -441,6 +548,106 @@ def repeat_summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
+# --- critic calibration -----------------------------------------------------------------------------
+
+
+def critic_observations(item: dict[str, Any], chunks: dict[str, Any]) -> list[dict[str, Any]]:
+    """The observations a Critic would see for this item, built from real corpus chunks and fixture-shaped tool data."""
+    observations: list[dict[str, Any]] = []
+    if item.get("support"):
+        observations.append(
+            {
+                "agent": "support",
+                "task": item["message"],
+                "report": {"findings": "", "follow_up_for_knowledge": "", "needs_human_approval": False, "proposed_action": "none"},
+                "evidence": [{"tool": item["support"]["tool"], "arguments": {}, "result": item["support"]["result"]}],
+            }
+        )
+    if item.get("chunks"):
+        passages = [{**chunks[c].as_evidence(), "matched_by": "query"} for c in item["chunks"]]
+        observations.append(
+            {
+                "agent": "knowledge",
+                "task": item["message"],
+                "report": {"answer": "", "confidence": "high", "gaps": "", "sources": sorted({p["source_url"] for p in passages})},
+                "evidence": [{"tool": "search_getnet_knowledge", "arguments": {"query": item["message"]}, "result": {"results": passages}}],
+            }
+        )
+    if item.get("escalation"):
+        observations.append({"agent": "escalation", "ticket_id": "TKT-000000-000000", "ticket_status": "RESOLVED", **item["escalation"]})
+    return observations
+
+
+def _wait_for_breaker(llm: Any) -> None:
+    """Wait out an open circuit breaker before the next eval item so one transient API burst cannot
+    silently sweep the rest of a multi-item suite through the offline fallback in milliseconds."""
+    if getattr(llm, "breaker_open", False):
+        remaining = max(0.0, float(getattr(llm, "_open_until", 0.0)) - time.monotonic())
+        time.sleep(min(remaining + 0.5, float(getattr(llm, "cooldown_seconds", 60.0)) + 1.0))
+
+
+def run_critic(settings: Settings) -> dict[str, Any]:
+    """The Critic as a classifier: does it send back drafts with a known defect, and approve clean ones?
+
+    Each item is one Critic call on a fixed draft, so the result measures the Critic alone (its model call plus the
+    deterministic checks around it), not the Router's ability to fix what it flags.
+    """
+    from src.agents.nodes import Nodes
+
+    h = Harness(settings)
+    chunks = {c.chunk_id: c for c in h.runtime.retriever.chunks}
+    nodes = Nodes(h.runtime)
+    rows = []
+    try:
+        for item in load_jsonl(DATASETS / "critic_calibration.jsonl"):
+            _wait_for_breaker(h.runtime.llm)
+            state = {
+                "message": item["message"],
+                "observations": critic_observations(item, chunks),
+                "draft": item["draft"],
+                "critic_rounds": 0,
+                "history": [],
+                "summary": "",
+                "principal": {"user_id": "cliente1988", "role": "merchant"},
+                "events": [],
+                "degraded": False,
+            }
+            review = nodes.critic(state)["reviews"][-1]
+            rows.append(
+                {
+                    "id": item["id"],
+                    "set": item.get("set", "dev"),
+                    "defect": item["defect"],
+                    "expect": item["expect"],
+                    "verdict": review["verdict"],
+                    "model_verdict": review.get("model_verdict"),
+                    "ok": review["verdict"] == item["expect"],
+                    "issues": review["issues"],
+                }
+            )
+    finally:
+        h.close()
+    def _critic_stats(subset: list[dict[str, Any]]) -> dict[str, Any]:
+        defective = [r for r in subset if r["expect"] == "revise"]
+        clean = [r for r in subset if r["expect"] == "approve"]
+        return {
+            "n": len(subset),
+            "recall": round(m.mean([float(r["verdict"] == "revise") for r in defective]), 4) if defective else None,
+            "false_revise_rate": round(m.mean([float(r["verdict"] == "revise") for r in clean]), 4) if clean else None,
+            "by_defect": {
+                d: {"n": len(group), "caught": sum(r["verdict"] == "revise" for r in group)}
+                for d in sorted({r["defect"] for r in defective})
+                for group in [[r for r in defective if r["defect"] == d]]
+            },
+        }
+
+    return {
+        **_critic_stats(rows),
+        "by_set": {name: _critic_stats([r for r in rows if r["set"] == name]) for name in sorted({r["set"] for r in rows})},
+        "rows": rows,
+    }
+
+
 # --- adversarial ----------------------------------------------------------------------------------
 
 
@@ -450,10 +657,15 @@ def run_adversarial(settings: Settings) -> dict[str, Any]:
     rows = []
     try:
         for item in load_jsonl(DATASETS / "adversarial.jsonl"):
+            _wait_for_breaker(h.runtime.llm)
             orders_before = h.runtime.ops.count_service_orders()
             responses = h.converse(item["user"], item["turns"])
             text = "\n".join(r["answer"] for r in responses)
             status = responses[-1]["status"]
+            if settings.replay_from and status == "awaiting_human":
+                # ops_store.tickets_for_merchant orders by 1-second created_at DESC; fast replay can otherwise
+                # mint two tickets in the same second and reverse their order on a later list_my_tickets() call.
+                time.sleep(1.05)
             leaks = m.forbidden_hits(text, item.get("must_not_contain", []))
             wrote = item.get("no_service_order") and h.runtime.ops.count_service_orders() != orders_before
             if item["expect"] == "block":
@@ -653,22 +865,64 @@ def flatten(value: Any, prefix: str = "") -> dict[str, float]:
     return out
 
 
+GATE_RULE = (
+    "Golden metrics are gated over every run of --repeat N (ADR-0019): a floor holds when the mean of the runs "
+    "reaches it and no single run is more than one item below it; a ceiling holds only if every run is within it. "
+    "Every other suite runs once and is gated on that run."
+)
+
+
+def golden_run_summaries(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """The summary of each golden run: run 1 as stored, the repeats recomputed from their stored items."""
+    if "golden" not in report:
+        return []
+    return [report["golden"], *(_golden_summary(items) for items in report.get("golden_repeat_items", []))]
+
+
+def _one_item(key: str, run: dict[str, Any]) -> float:
+    """What one item is worth in this rate: 1/n of the split (of the judged answers for a judge rate)."""
+    parts = key.split(".")
+    if len(parts) < 3 or parts[1] not in run:
+        return 0.0
+    summary = run[parts[1]]
+    n = (summary.get("judge") or {}).get("n", 0) if parts[2] == "judge" else summary.get("n", 0)
+    return 1.0 / n if n else 0.0
+
+
 def check_gate(report: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
     """Failures against the baseline. A gated metric that is absent from a suite that ran is a failure too:
-    a judge that never answered or a calibration that returned nothing must not read as a pass."""
+    a judge that never answered or a calibration that returned nothing must not read as a pass.
+
+    Golden metrics follow GATE_RULE over all runs; with a single run that is exactly "the value meets the bound".
+    """
     flat = flatten(report)
+    runs = golden_run_summaries(report)
+    flat_runs = [flatten({"golden": run}) for run in runs]
     failures = []
-    for bound, label, breached in (
-        ("min", "is below the baseline", lambda value, limit: value < limit),
-        ("max", "is above the limit", lambda value, limit: value > limit),
-    ):
+    for bound in ("min", "max"):
         for key, limit in baseline.get(bound, {}).items():
             if key.split(".", 1)[0] not in report:
                 continue  # that suite was not requested in this run
             if key not in flat:
                 failures.append(f"{key} is missing from the report (gated metric was not produced)")
-            elif breached(flat[key], limit):
-                failures.append(f"{key} = {flat[key]:.4f} {label} {limit}")
+                continue
+            values = [f[key] for f in flat_runs if key in f] if key.startswith("golden.") and len(runs) > 1 else [flat[key]]
+            if len(values) != max(1, len(runs) if key.startswith("golden.") else 1):
+                failures.append(f"{key} is missing from some golden runs")
+                continue
+            mean = sum(values) / len(values)
+            shown = ", ".join(f"{v:.4f}" for v in values)
+            if bound == "max":
+                if max(values) > limit:
+                    failures.append(f"{key} = {shown} is above the limit {limit}" + (" in at least one run" if len(values) > 1 else ""))
+                continue
+            if mean < limit:
+                failures.append(f"{key} = {shown}" + (f" (mean {mean:.4f})" if len(values) > 1 else "") + f" is below the baseline {limit}")
+                continue
+            tolerance = min((_one_item(key, run) for run in runs), default=0.0) if len(values) > 1 else 0.0
+            worst = min(values)
+            if worst < limit - tolerance - 1e-9:
+                failures.append(f"{key} = {shown}: one run ({worst:.4f}) is more than one item below the baseline {limit}")
     return failures
 
 
@@ -686,6 +940,26 @@ def render_markdown(report: dict[str, Any]) -> str:
         if p.get("git_dirty"):
             code += f" plus uncommitted changes in {', '.join(p['dirty_paths']) or 'the working tree'}"
         lines.append(f"- Code: {code}; input hashes in `provenance` of the JSON report")
+    if report.get("cassette"):
+        cas = report["cassette"]
+        detail = f"- Cassette ({cas['mode']}): `{cas['path']}` (date frozen to {cas.get('recorded_on')})"
+        if cas.get("sha256"):
+            detail += f", sha256 `{cas['sha256'][:16]}`"
+        if "unused_recorded_calls" in cas:
+            detail += f", unused calls: {cas['unused_recorded_calls']}"
+        lines.append(detail)
+    if report.get("golden_workers"):
+        lines.append(f"- Golden conversations evaluated {report['golden_workers']} at a time, each on its own app")
+    retried = [
+        f"{row['id']} (run {n})"
+        for n, rows in enumerate([report.get("golden", {}).get("items", []), *report.get("golden_repeat_items", [])], start=1)
+        for row in rows
+        if row.get("discarded_degraded_attempts")
+    ]
+    if retried:
+        lines.append(f"- Re-run after a model API failure degraded the conversation: {', '.join(retried)}")
+    if report.get("stopped_early"):
+        lines.append(f"- **Stopped early:** {report['stopped_early']}; the adversarial, Critic and judge suites did not run")
     lines.append("")
     if report["mode"] == "offline":
         lines += [
@@ -695,6 +969,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             "> `OPENAI_API_KEY` set for the model report.",
             "",
         ]
+    def _retrieval_table(modes: dict[str, Any]) -> list[str]:
+        rows = ["| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |", "|---|---|---|---|---|---|"]
+        for mode, s in modes.items():
+            rows.append(f"| {mode} | {s['hit@1']:.3f} | {s['recall@3']:.3f} | {s['recall@4']:.3f} | {s['mrr']:.3f} | {s['ndcg@4']:.3f} |")
+        return rows
+
+    def _retrieval_by_lang(modes: dict[str, Any]) -> list[str]:
+        rows = ["| Mode | Language | Hit@1 | Recall@4 | MRR |", "|---|---|---|---|---|"]
+        for mode, s in modes.items():
+            for lang, v in s["by_lang"].items():
+                rows.append(f"| {mode} | {lang} | {v['hit@1']:.3f} | {v['recall@4']:.3f} | {v['mrr']:.3f} |")
+        return rows
+
     for _key, _title in (("retrieval", "Retrieval"), ("retrieval_hosted", "Retrieval with hosted embeddings (same queries)")):
         if _key not in report:
             continue
@@ -702,18 +989,31 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines += [
             f"## {_title}",
             "",
-            f"{r['queries']} labelled queries (EN/PT/ES) over {r['chunks']} chunks. Dense embedder: `{r['embedder']}`. Configured mode: **{r['configured_mode']}**.",
+            f"{r['queries']} labelled queries (dev, EN/PT/ES) over {r['chunks']} chunks. Dense embedder: `{r['embedder']}`. Configured mode: **{r['configured_mode']}**.",
             "",
-            "| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |",
-            "|---|---|---|---|---|---|",
+            *_retrieval_table(r["modes"]),
+            "",
+            *_retrieval_by_lang(r["modes"]),
+            "",
+            f"Queries with no relevant chunk in the top {max(RETRIEVAL_KS)} ({r['configured_mode']}): {', '.join(r['misses_in_configured_mode']) or 'none'}",
+            "",
         ]
-        for mode, s in r["modes"].items():
-            lines.append(f"| {mode} | {s['hit@1']:.3f} | {s['recall@3']:.3f} | {s['recall@4']:.3f} | {s['mrr']:.3f} | {s['ndcg@4']:.3f} |")
-        lines += ["", "| Mode | Language | Hit@1 | Recall@4 | MRR |", "|---|---|---|---|---|"]
-        for mode, s in r["modes"].items():
-            for lang, v in s["by_lang"].items():
-                lines.append(f"| {mode} | {lang} | {v['hit@1']:.3f} | {v['recall@4']:.3f} | {v['mrr']:.3f} |")
-        lines += ["", f"Queries with no relevant chunk in the top {max(RETRIEVAL_KS)} ({r['configured_mode']}): {', '.join(r['misses_in_configured_mode']) or 'none'}", ""]
+        if r.get("glossary_off"):
+            lines += ["### Glossary ablation (dev, glossary off)", "", *_retrieval_table(r["glossary_off"]["modes"]), ""]
+        if r.get("heldout"):
+            h = r["heldout"]
+            lines += [
+                f"### Held-out queries ({h['queries']} queries, written after the glossary)",
+                "",
+                *_retrieval_table(h["modes"]),
+                "",
+                *_retrieval_by_lang(h["modes"]),
+                "",
+                f"Held-out queries with no relevant chunk in the top {max(RETRIEVAL_KS)} ({r['configured_mode']}): {', '.join(h['misses_in_configured_mode']) or 'none'}",
+                "",
+            ]
+            if h.get("glossary_off"):
+                lines += ["### Held-out queries, glossary off", "", *_retrieval_table(h["glossary_off"]["modes"]), ""]
     if "golden" in report:
         g = report["golden"]
         lines += [
@@ -815,24 +1115,56 @@ def render_markdown(report: dict[str, Any]) -> str:
         for r in a["items"]:
             lines.append(f"| {r['id']} | {r['type']} | {r['expect']} | {r['status']} | {r['guard'].get('layer', '')}:{r['guard'].get('category', '')} | {'ok' if r['ok'] else 'FAILED'} |")
         lines.append("")
+    if report.get("critic"):
+        c = report["critic"]
+        lines += [
+            "## Critic calibration",
+            "",
+            f"{c['n']} fixed drafts. Recall on drafts with a planted defect: **{c['recall']:.3f}**; "
+            f"clean drafts sent back (false revise): **{c['false_revise_rate']:.3f}**.",
+            "",
+        ]
+        if c.get("by_set") and len(c["by_set"]) > 1:
+            lines += ["| Set | n | Recall | False revise |", "|---|---|---|---|"]
+            for name, s in c["by_set"].items():
+                rec = f"{s['recall']:.3f}" if s["recall"] is not None else "n/a"
+                fr = f"{s['false_revise_rate']:.3f}" if s["false_revise_rate"] is not None else "n/a"
+                lines.append(f"| {name} | {s['n']} | {rec} | {fr} |")
+            lines.append("")
+        lines += [
+            "| Defect | n | Caught |",
+            "|---|---|---|",
+            *(f"| {d} | {v['n']} | {v['caught']} |" for d, v in c["by_defect"].items()),
+            "",
+        ]
+        wrong = [r for r in c["rows"] if not r["ok"]]
+        if wrong:
+            lines += ["Disagreements: " + ", ".join(f"{r['id']} ({r['defect']}: {r['verdict']})" for r in wrong), ""]
     if report.get("calibration"):
         c = report["calibration"]
+        has_human = any("human_agreement" in s for s in c["by_set"].values())
         lines += [
             "## Judge calibration",
             "",
-            f"Judge vs reference pass/fail labels on {c['n']} hand-written answers: agreement **{c['agreement']:.3f}**, "
+            f"Judge vs reference pass/fail labels on {c['n']} clear-cut hand-written answers: agreement **{c['agreement']:.3f}**, "
             f"Cohen's kappa **{c['kappa']:.3f}**, false passes {c['false_pass']}, false fails {c['false_fail']}.",
             "",
-            "| Set | n | Agreement | Kappa | False passes | False fails |",
-            "|---|---|---|---|---|---|",
+            "| Set | n | Agreement | Kappa | False passes | False fails |" + (" Reviewer agreement | Reviewer kappa |" if has_human else ""),
+            "|---|---|---|---|---|---|" + ("---|---|" if has_human else ""),
         ]
         for name, s in c["by_set"].items():
-            lines.append(f"| {name} | {s['n']} | {s['agreement']:.3f} | {s['kappa']:.3f} | {s['false_pass']} | {s['false_fail']} |")
+            extra = (
+                f" {s['human_agreement']:.3f} | {s['human_kappa']:.3f} |"
+                if "human_agreement" in s
+                else (" n/a | n/a |" if has_human else "")
+            )
+            lines.append(f"| {name} | {s['n']} | {s['agreement']:.3f} | {s['kappa']:.3f} | {s['false_pass']} | {s['false_fail']} |{extra}")
         disagreements = [r for r in c["rows"] if r["human"] != r["judge"]]
         lines += [
             "",
             "`original` items were written alongside the golden set (some after the judge disagreed on a golden item); "
-            "`independent` items use questions that appear in no golden item.",
+            "`independent` items use questions that appear in no golden item; "
+            "`borderline` items measure near-miss agreement next to dual-reviewer agreement (`eval/labels/README.md`) and stay out of the headline.",
             "",
         ]
         if disagreements:
@@ -840,17 +1172,23 @@ def render_markdown(report: dict[str, Any]) -> str:
     elif "calibration" in report:
         lines += ["## Judge calibration", "", "Not run: no judge model available in this mode.", ""]
     if report.get("gate") is not None:
-        lines += ["## Regression gate", "", "PASSED" if not report["gate"] else "FAILED:\n" + "\n".join(f"- {f}" for f in report["gate"]), ""]
+        lines += ["## Regression gate", "", GATE_RULE, ""]
+        lines += ["PASSED" if not report["gate"] else "FAILED:\n" + "\n".join(f"- {f}" for f in report["gate"]), ""]
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=["auto", "offline"], default="auto")
-    parser.add_argument("--suite", choices=["all", "retrieval", "golden", "adversarial", "calibration"], default="all")
+    parser.add_argument("--suite", choices=["all", "retrieval", "golden", "adversarial", "calibration", "critic"], default="all")
     parser.add_argument("--live", choices=["auto", "on", "off"], default="auto", help="live web tools (default: on with a model, off offline)")
     parser.add_argument("--gate", action="store_true", help="exit non-zero if a metric regresses below eval/baseline.json")
-    parser.add_argument("--repeat", type=int, default=1, help="run the golden suite N times and report the run-to-run range (run 1 is gated)")
+    parser.add_argument("--repeat", type=int, default=1, help="run the golden suite N times; the gate reads every run (ADR-0019)")
+    parser.add_argument("--workers", type=int, default=1, help="golden conversations evaluated at once, each on its own app")
+    parser.add_argument(
+        "--degraded-retries", type=int, default=0, help="re-run a golden conversation that hit a model API failure, at most N times"
+    )
+    parser.add_argument("--fail-fast", action="store_true", help="with --gate: skip the other suites if the golden suite already fails the gate")
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--ids", help="comma-separated golden item ids to run (golden suite only; never gated, never the report)")
     parser.add_argument("--split", choices=SPLITS, help="run only this golden split (golden suite only; never gated, never the report)")
@@ -858,9 +1196,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--regrade", type=Path, metavar="REPORT_JSON", help="re-judge the stored answers of a report; runs no agent")
     parser.add_argument("--regrade-times", type=int, default=1, help="gradings per answer with --regrade (majority verdict)")
     parser.add_argument("--adjudicate", type=Path, metavar="REPORT_JSON", help="attach eval/adjudications.jsonl to an existing report")
+    cassette = parser.add_mutually_exclusive_group()
+    cassette.add_argument("--record", type=Path, metavar="CASSETTE", help="record every model call, live result and embedding of this model run (.json.gz)")
+    cassette.add_argument("--replay", type=Path, metavar="CASSETTE", help="re-run a recorded model evaluation without an API key or network")
     args = parser.parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
 
+    if args.replay:
+        # A replay reproduces the recorded run: same suites, repetitions, selection and gate.
+        recorded_args = open_cassette(args.replay, "replay").meta.get("args", {})
+        for name in ("suite", "repeat", "ids", "split", "live", "gate", "mode", "workers", "fail_fast", "degraded_retries"):
+            if name in recorded_args:
+                setattr(args, name, recorded_args[name])
     if args.adjudicate:
         return annotate_report(args.adjudicate, write=not args.no_write)
     if args.regrade:
@@ -872,57 +1219,106 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--ids/--split run part of the golden suite: they cannot be gated or combined with another suite")
     suite = "golden" if partial else args.suite
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        probe = make_settings(args.mode, Path(tmp) / "probe", live=False)
-        mode = "openai" if probe.effective_provider() == "openai" else "offline"
-        live = args.live == "on" or (args.live == "auto" and mode == "openai")
-        grader = judge_client(probe)
-        report: dict[str, Any] = {
-            "mode": mode,
-            "model": probe.openai_model if mode == "openai" else OfflinePolicyLLM.model,
-            "judge_model": getattr(grader, "model", "none") if mode == "openai" else "none",
-            "live_web": live,
-            "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-            "datasets_sha256": dataset_hashes(),
-            "provenance": provenance(),
-        }
-        if partial:
-            report["selection"] = {"ids": ids, "split": args.split}
-        wanted = lambda name: suite in ("all", name)  # noqa: E731
-        if wanted("retrieval"):
-            report["retrieval"] = run_retrieval(probe)
-            if mode == "openai":
-                # The keyless embedder is not a semantic model, so "hybrid vs BM25" is also measured with a real one.
-                hosted = probe.model_copy(update={"embedding_provider": "openai"})
-                try:
-                    report["retrieval_hosted"] = run_retrieval(hosted)
-                except Exception as exc:  # noqa: BLE001 - an embeddings outage must not lose the rest of the report
-                    report["retrieval_hosted_error"] = repr(exc)[:200]
-        if wanted("golden"):
-            counter = iter(range(100_000))
-            items = select_golden(ids, args.split)
-            runs = [
-                run_golden(lambda: Harness(make_settings(args.mode, Path(tmp) / f"golden-{next(counter)}", live)), grader, items)
-                for _ in range(max(1, args.repeat))
-            ]
-            report["golden"] = runs[0]
-            if len(runs) > 1:
-                report["golden_repeats"] = repeat_summary(runs)
-                report["golden_repeat_items"] = [run["items"] for run in runs[1:]]
-            if mode == "openai":
-                # Model runs only: offline failures are the rule policy's known limits (language, decomposition),
-                # described in the offline report itself, not answers to review one by one.
-                report["adjudication"] = adjudicate(report, load_adjudications())
-        if wanted("adversarial"):
-            report["adversarial"] = run_adversarial(make_settings(args.mode, Path(tmp) / "adversarial", live=False))
-        if wanted("calibration"):
-            report["calibration"] = calibrate(grader, load_jsonl(DATASETS / "judge_calibration.jsonl"))
+    if args.record or args.replay:
+        if args.mode == "offline":
+            parser.error("--record/--replay are for model runs; the offline policy is deterministic already")
+        CASSETTE.update(record_to=args.record, replay_from=args.replay)
+        if args.replay:
+            recorded = open_cassette(args.replay, "replay")
+            clock.freeze(date.fromisoformat(recorded.meta["recorded_on"]))  # prompts carry the recording's date
+        else:
+            clock.freeze(clock.today())  # one date for the whole recording, even across midnight
+            recorder = open_cassette(args.record, "record")
+            recorder.meta["args"] = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k not in ("record", "replay")}
+
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            probe = make_settings(args.mode, Path(tmp) / "probe", live=False)
+            if args.record:
+                open_cassette(args.record, "record").meta["settings"] = {k: getattr(probe, k) for k in RECORDED_SETTINGS}
+            mode = "openai" if probe.effective_provider() in ("openai", "replay") else "offline"
+            if mode == "openai" and not args.replay:
+                logging.getLogger("src.llm.resilient").setLevel(logging.WARNING)
+            live = args.live == "on" or (args.live == "auto" and mode == "openai")
+            grader = judge_client(probe)
+            report: dict[str, Any] = {
+                "mode": mode,
+                "model": (open_cassette(args.replay, "replay").meta.get("models", {}).get("app", "replay") if args.replay else probe.openai_model)
+                if mode == "openai"
+                else OfflinePolicyLLM.model,
+                "judge_model": getattr(grader, "model", "none") if mode == "openai" else "none",
+                "live_web": live,
+                "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "datasets_sha256": dataset_hashes(),
+                "provenance": provenance(),
+            }
+            if partial:
+                report["selection"] = {"ids": ids, "split": args.split}
+            wanted = lambda name: suite in ("all", name)  # noqa: E731
+            if wanted("retrieval"):
+                report["retrieval"] = run_retrieval(probe.model_copy(update={"embedding_provider": "local"}))  # keyless, as in CI
+                if mode == "openai":
+                    # The keyless embedder is not a semantic model, so "hybrid vs BM25" is also measured with a real one.
+                    hosted = probe.model_copy(update={"embedding_provider": "openai"})
+                    try:
+                        report["retrieval_hosted"] = run_retrieval(hosted)
+                    except CassetteMiss:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - an embeddings outage must not lose the rest of the report
+                        report["retrieval_hosted_error"] = repr(exc)[:200]
+            stopped = False
+            if wanted("golden"):
+                items = select_golden(ids, args.split)
+
+                def golden_harness(run: int, item: dict[str, Any], attempt: int = 0) -> Harness:
+                    scope = f"golden/{run + 1}/{item['id']}" + (f"/retry{attempt}" if attempt else "")
+                    return Harness(make_settings(args.mode, Path(tmp) / scope, live, scope=scope))
+
+                runs = run_golden(
+                    golden_harness, judge_client, items, repeat=args.repeat, workers=args.workers, degraded_retries=args.degraded_retries
+                )
+                report["golden"] = runs[0]
+                if args.workers > 1:
+                    report["golden_workers"] = args.workers
+                if len(runs) > 1:
+                    report["golden_repeats"] = repeat_summary(runs)
+                    report["golden_repeat_items"] = [run["items"] for run in runs[1:]]
+                if mode == "openai":
+                    # Model runs only: offline failures are the rule policy's known limits (language, decomposition),
+                    # described in the offline report itself, not answers to review one by one.
+                    report["adjudication"] = adjudicate(report, load_adjudications())
+                if args.fail_fast and args.gate and check_gate(report, load_baseline(mode)):
+                    # The golden suite already fails the gate: skip the other suites instead of spending the rest of
+                    # a model run on a result that cannot pass. The report says so, and a replay stops at the same point.
+                    stopped = True
+                    report["stopped_early"] = "the gate already failed on the golden suite (--fail-fast)"
+            if wanted("adversarial") and not stopped:
+                report["adversarial"] = run_adversarial(make_settings(args.mode, Path(tmp) / "adversarial", live=False))
+            if wanted("critic") and not stopped:
+                report["critic"] = run_critic(make_settings(args.mode, Path(tmp) / "critic", live=False))
+            if wanted("calibration") and not stopped:
+                # borderline answers count only once two humans have labelled them (eval/borderline.py)
+                borderline = [b for b in load_jsonl(DATASETS / "judge_borderline.jsonl") if b.get("label")]
+                report["calibration"] = calibrate(grader, [*load_jsonl(DATASETS / "judge_calibration.jsonl"), *borderline])
+
+        if args.record or args.replay:
+            used = open_cassette(args.record or args.replay, "record" if args.record else "replay")
+            report["cassette"] = {"mode": "record" if args.record else "replay", "path": str(args.record or args.replay), "recorded_on": used.meta.get("recorded_on")}
+            if args.replay:
+                report["cassette"]["unused_recorded_calls"] = used.unused()  # > 0: the replay took a different path
+            close_cassettes()
+            if args.record:
+                report["cassette"]["sha256"] = _file_sha256(args.record)
+    finally:
+        CASSETTE.update(record_to=None, replay_from=None)
+        clock.freeze(None)
+        close_cassettes(save=False)  # normal exit already saved above; never leave stale handles open
 
     failures: list[str] = []
     if args.gate:
-        baseline = json.loads((ROOT / "baseline.json").read_text(encoding="utf-8")).get(mode, {})
-        failures = check_gate(report, baseline)
+        failures = check_gate(report, load_baseline(mode))
         report["gate"] = failures
+        report["gate_rule"] = GATE_RULE
 
     markdown = render_markdown(report)
     if args.out:
@@ -933,6 +1329,10 @@ def main(argv: list[str] | None = None) -> int:
         write_report(report, markdown, REPORTS / mode / "report")
     print(markdown)
     return 1 if failures else 0
+
+
+def load_baseline(mode: str) -> dict[str, Any]:
+    return json.loads((ROOT / "baseline.json").read_text(encoding="utf-8")).get(mode, {})
 
 
 def write_report(report: dict[str, Any], markdown: str, stem: Path) -> None:

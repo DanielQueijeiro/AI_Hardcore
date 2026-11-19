@@ -1,0 +1,21 @@
+id,label,comment
+b01a,fail,rounds published fee 1.69% to about 1.7% and drops 'from' qualifier
+b01b,pass,exact debit rate with 'from' qualifier; extra credit rate is grounded
+b02a,pass,accurate paraphrase of up to 2 business days in a single payment
+b02b,fail,contradicts evidence: payout is a single payment not in installments
+b03a,pass,direct accurate and grounded
+b03b,fail,hedges on an explicit yes and omits without a card machine
+b04a,pass,covers all remaining troubleshooting steps after restart
+b04b,fail,omits the store Wi-Fi troubleshooting step
+b05a,pass,accurate and grounded abstention
+b05b,fail,unsupported claim that Pix is free; evidence only says no fee is published
+b06a,fail,drops the conflicting R$ 20 thousand threshold and confirmation caveat
+b06b,pass,reports both conflicting thresholds and caveat to confirm
+b07a,fail,drops the caveat that maximum term and interest depend on the card issuer
+b07b,fail,contradicts evidence with unsupported 'no interest' claim
+b08a,pass,accurate answer plus grounded extra details
+b08b,pass,concise exact and grounded
+b09a,pass,accurate and grounded
+b09b,fail,contradicts evidence: individuals can register with a CPF
+b10a,fail,presents marketing slogan 'in seconds' without the up-to-one-calendar-day caveat
+b10b,pass,complete accurate and includes both caveat and marketing claim

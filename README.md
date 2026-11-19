@@ -8,8 +8,29 @@ decides, then resumes it). A Critic reviews every answer before it is sent.
 Python 3.12 · FastAPI · LangGraph (SQLite checkpointer) · OpenAI Responses API behind a provider port ·
 no vector database, no external services required to run or test.
 
+## Reproduce the published evaluation (about 2 minutes, no API key)
+
+```bash
+pip install -e .
+python -m eval.run --replay eval/reports/openai/cassette.json.gz --out /tmp/replayed
+python -m eval.compare eval/reports/openai/report.json /tmp/replayed.json
+# REPRODUCED: 408 answers and every metric compared (0 differences)
+```
+
+The replay re-executes the whole system offline — API, LangGraph orchestration, retrieval, tools, guardrails, the
+Critic's checks, every metric and the regression gate — with the model's side of each exchange served from the
+cassette recorded in [GitHub Actions run 44622842628](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44622842628)
+(`gpt-6-luna` answering, `gpt-5.4-mini` judging). `eval.compare` checks every answer's SHA-256 across the three
+runs of all 136 golden conversations, every metric of every suite, the gate verdict, and that no recorded call went
+unused; a request the recording does not contain fails loudly (`CassetteMiss`). CI runs the same check on every push
+(`model-eval-replay`). What it reproduces: the **regression gate PASSED on all 29 gated metrics**, `dev` `1.000` on all
+three runs, `validation` `0.972`, sealed held-out `0.875` raw / `1.000` judge pass, `0` degraded turns
+([Results](#results), [ADR-0021](docs/adr/0021-recorded-model-runs-replayable-without-a-key.md)).
+
+- [Reproduce the published evaluation](#reproduce-the-published-evaluation-about-2-minutes-no-api-key)
 - [Quickstart](#quickstart)
-- [What changed since the first submission](#what-changed-since-the-first-submission)
+- [What changed in v3 (9.3 → resubmission)](#what-changed-in-v3-93--resubmission)
+- [What changed since the first submission (7.4 → 9.3)](#what-changed-since-the-first-submission-74--93)
 - [Architecture and message workflow](#architecture-and-message-workflow)
 - [Identity and security](#identity-and-security)
 - [Memory and resilience](#memory-and-resilience)
@@ -94,7 +115,7 @@ python -m scripts.run_scenarios --anonymous # the same payloads with no token: a
 Why the body's `user_id` is not enough on its own is in
 [ADR-0014](docs/adr/0014-challenge-payload-and-deployment-mode.md).
 
-A turn takes several sequential model calls (about 12 s at the median with the real model). To watch it happen
+A turn takes several model calls (about 12–13.5 s at the median with the real model; the LLM input guard overlaps with Router step 1 and independent subtasks run in parallel). To watch it happen
 instead of waiting for the whole answer, send the same body to `/chat/stream` (server-sent events): `accepted`,
 then a `step` for each routing decision, tool call, review and human-review event as it lands, then `result`,
 which is exactly the `/chat` response.
@@ -135,10 +156,12 @@ Response shape:
 ### Tests and evaluation
 
 ```bash
-pytest                                     # 187 tests, no network, no API key
+pytest                                     # 222 tests, no network, no API key
 ruff check src eval tests scripts
 python -m eval.run --mode offline --gate   # deterministic regression gate (what CI runs)
-python -m eval.run --gate --repeat 3       # with OPENAI_API_KEY: real model + LLM judge + judge calibration
+python -m eval.run --replay eval/reports/openai/cassette.json.gz --out /tmp/replayed   # E4 offline replay (no key)
+python -m eval.compare eval/reports/openai/report.json /tmp/replayed.json              # verify 408 answers + every metric (0 diffs)
+python -m eval.run --gate --repeat 3 --workers 4 --degraded-retries 2 --fail-fast   # with OPENAI_API_KEY: what CI model-eval runs
 python -m eval.run --ids g07,s04 --out /tmp/check          # a few golden items, never gated, never the report
 python -m eval.run --regrade eval/reports/openai/report.json --regrade-times 3 --out /tmp/regrade   # judge noise only
 python -m eval.run --adjudicate eval/reports/openai/report.json                  # attach eval/adjudications.jsonl
@@ -152,7 +175,7 @@ Every setting is an environment variable; [.env.example](.env.example) lists the
 |---|---|---|
 | `OPENAI_API_KEY` | unset | Without it the service runs on the offline policy and says so (`llm_provider: "offline"`). |
 | `OPENAI_MODEL` | `gpt-6-luna` | Model that drives every agent. Any Responses-API model works. |
-| `JUDGE_MODEL` | same as above | Evaluation judge; set a different model so the system is not graded by itself. |
+| `JUDGE_MODEL` | same as above | Evaluation judge; set a different model (CI uses `gpt-5.4-mini`) so the system is not graded by itself. |
 | `JWT_SECRET` | random per process | Set it in any shared deployment, otherwise tokens die on restart. |
 | `REQUIRE_CHAT_AUTH` | `false` | Set `true` to require a verified Bearer token on `/chat` and `/conversations/{id}` (disables anonymous mode). |
 | `CHAT_RATE_LIMIT_ATTEMPTS` / `WINDOW` | `60` / `60` | Sliding-window request limit per authenticated caller or client IP on `/chat`. |
@@ -162,10 +185,26 @@ Every setting is an environment variable; [.env.example](.env.example) lists the
 | `APP_ENV` | `demo` | `production` refuses to start with demo users enabled, without a `JWT_SECRET` of 32+ characters, or without a `METRICS_TOKEN` of 24+. |
 | `TRACE_RETENTION_DAYS` | 30 | Stored traces older than this are deleted by the periodic sweep. |
 | `MAX_SUPERVISOR_STEPS` / `MAX_SPECIALIST_TOOL_STEPS` / `MAX_CRITIC_ROUNDS` | 6 / 4 / 2 | Bounds on agent autonomy. |
+| `SPECULATIVE_ROUTER` / `MAX_PARALLEL_TASKS` | `true` / `3` | Overlaps LLM input classifier with Router step 1 (discarded if blocked) and caps concurrent `delegate_parallel` subtasks. |
 | `HITL_TIMEOUT_SECONDS` / `HITL_LEASE_SECONDS` | 900 / 600 | Human-review deadline and operator lease. |
-| `RETRIEVAL_MODE` | `bm25` | `bm25`, `dense` or `hybrid`; chosen from the ablation below. |
+| `RETRIEVAL_MODE` / `EMBEDDING_PROVIDER` | `auto` / `auto` | `auto` selects hosted dense (`text-embedding-3-small`) when a key is set and keyless `bm25` otherwise ([ADR-0020](docs/adr/0020-retrieval-mode-from-a-held-out-split.md)). |
 
-## What changed since the first submission
+## What changed in v3 (9.3 → resubmission)
+
+The second submission scored **9.3/10** (weighted 9.47, calibrated down because the model runs were E3-only and the published gate had failed on `dev`). Every concrete gap in that review is mapped in full — together with answers to all five interview questions — in [REVIEW_RESPONSE.md](REVIEW_RESPONSE.md). Summary:
+
+| 9.3 review gap | What changed in v3 | Evidence |
+|---|---|---|
+| **E3 → E4**: model runs could not be reproduced without a key | Content-hashed record/replay cassette (`src/cassette.py`) for every LLM call, live tool, hosted embedding and frozen date (`src/clock.py`), plus `eval.compare`, manual CI `model-eval`, and automatic keyless CI `model-eval-replay` | [ADR-0021](docs/adr/0021-recorded-model-runs-replayable-without-a-key.md), [cassette.json.gz](eval/reports/openai/cassette.json.gz), [CI run 44622842628](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44622842628) (**408 answers, 0 diffs, 0 unused calls**), [test_cassette.py](tests/test_cassette.py) |
+| **Critic missed real omissions** (Wi-Fi step `g12`, prices `g01`) | Deterministic `evidence_checklist` ([checks.py](src/agents/checks.py)) extracts procedure steps, product prices and human decisions from the turn's evidence and feeds them to the Critic; verified on a **48-draft Critic calibration suite** (32 `dev` + 16 blind unseen `heldout` `k33`–`k48`) | [critic_calibration.jsonl](eval/datasets/critic_calibration.jsonl), [model report](eval/reports/openai/report.md#critic-calibration): **1.000 recall** across all 8 defect classes (**1.000 / 0.000 false revise on unseen held-out**) |
+| **Cross-lingual retrieval (`s04`) & glossary optimism** | Multi-query retrieval (`query` + `query_en` + merchant message fused with RRF, batched dense embeddings), **36 post-glossary held-out queries** (`rh01`–`rh36`), `glossary_off` ablation, and `RETRIEVAL_MODE=auto` → hosted **dense** (`text-embedding-3-small`) with BM25 outage fallback | [ADR-0020](docs/adr/0020-retrieval-mode-from-a-held-out-split.md), [Retrieval ablation](#retrieval-ablation): hosted dense **1.000 Recall@4 / 0.944 MRR** on held-out even with `glossary_off` (vs BM25 0.708 / 0.632); `s04` 3/3 |
+| **Output guard phone false positive** (`+55 11 97694-6815` redacted as card) | Excluded phone-formatted numbers (`+`, area-code parentheses, Brazilian `0800`/`4003`/`+55` formats) from Luhn PAN redaction while keeping card redaction intact | [guardrails.py](src/security/guardrails.py), [test_guardrails.py](tests/test_guardrails.py), `s21` 3/3, `a37` card echo redacted |
+| **Latency** (5–9 sequential LLM calls, `dev` p95 35.6 s) | `speculative_router` (overlaps LLM input guard with Router step 1, discarded if blocked) + `delegate_parallel` (concurrent fan-out of up to 3 independent specialist subtasks) | [nodes.py](src/agents/nodes.py), [test_agentic_loop.py](tests/test_agentic_loop.py): `dev` p95 35.6 s → **21.8 s**; overall p50 **9.5 s**, p95 **20.4 s** in the final run (earlier v3 runs: p50 11.9–13.5 s, p95 23.8–28.9 s; hosted dense adds a round-trip per search) |
+| **Small single-author datasets & clear-cut-only judge calibration** | Golden expanded `64 → 136` (`18` dev, `94` validation, `24` blind cross-family `sealed-4`, 408 turns per 3x run); retrieval `42 → 78`; Critic `48`; Judge calibration `40 → 60` adding **20 dual-reviewer `borderline` near-miss items** (`eval/labels/README.md`) | [ADR-0022](docs/adr/0022-sealed-2-and-critic-heldout-after-v3-freeze.md)–[0024](docs/adr/0024-sealed-4-after-final-prompt-refinements.md), [judge_borderline.jsonl](eval/datasets/judge_borderline.jsonl): borderline agreement **0.850** (κ **0.700**, 3 false passes vs 1.000 clear-cut) |
+| **Repeated-run gate & 2026-11-16 defects** | Gate reads all `N` runs ([ADR-0019](docs/adr/0019-gate-over-repeated-runs.md)) with zero floors lowered; all 7 real 2026-11-16 system defects fixed and re-sealed through `sealed-4` (`479a6d7`); the 6 `dev` misses of the first cassette run fixed from `dev` evidence only, `sealed-4` kept sealed ([ADR-0026](docs/adr/0026-dev-driven-fixes-after-the-479a6d7-freeze.md)) | [CI run 44622842628](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44622842628) at `e031a8e`: **gate PASSED (all 29 gated metrics)**, `dev` **1.000 on all 3 runs**, `validation` 0.972 raw / 0.993 adj., `sealed-4` 0.875 raw / **1.000 judge & adj.** (72/72), `all` 0.958 raw / **0.995 adj.** (406/408) |
+| *Not in the review:* **the model run took 2–3 h and reported a failure only at the end** | Golden conversations evaluated 4 at a time with per-conversation cassette scopes, API-degraded conversations re-run, `--fail-fast` after the golden suite ([ADR-0025](docs/adr/0025-parallel-golden-conversations-and-fail-fast.md)) | Eval step **39 min** (was 2 h 13 min); replay of the parallel recording: 408 answers, 0 diffs, 1.5 min offline |
+
+## What changed since the first submission (7.4 → 9.3)
 
 The first version scored 7.4. The review was right on every point; this is what each one led to.
 
@@ -208,11 +247,17 @@ POST /chat ── verify token ──▶ Principal (merchant | operator | anonym
 Only the edges are fixed. Which specialist runs, in what order, how many times and when to stop are
 decided by the Router model at run time from what it has observed.
 
-**Communication between agents** is the shared graph state. The Router calls one of four typed functions
-per step (`delegate_knowledge`, `delegate_support`, `escalate_to_human`, `finish`); every delegation carries
-a `thought` and the `remaining_plan`, which are recorded in the trace. A specialist receives a
-self-contained task, runs its own bounded tool loop and returns a typed report plus the raw tool results.
-Those become an observation the Router reads on its next step.
+**Communication between agents** is the shared graph state. The Router calls one of five typed functions
+per step (`delegate_knowledge`, `delegate_support`, `delegate_parallel`, `escalate_to_human`, `finish`); every delegation carries
+a `thought` and the `remaining_plan`, which are recorded in the trace. When a turn contains independent subtasks
+(for example an account lookup and a public product question), `delegate_parallel` dispatches up to
+`MAX_PARALLEL_TASKS` (3) specialist branches concurrently while preserving per-agent tool allow-lists, principal
+scoping and tool-step bounds; prompts explicitly forbid parallel fan-out when one subtask depends on another's
+lookup. With `SPECULATIVE_ROUTER=true`, the LLM input guardrail and Router step 1 also overlap in parallel after
+the synchronous deterministic input guard passes, and any speculative Router output is discarded cleanly if the
+classifier blocks. A specialist receives a self-contained task, runs its own bounded tool loop and returns a typed
+report plus the raw tool results. Those become an observation the Router reads on its next step. Every prompt
+receives today's date via `today_line()` (`src/clock.py`), which cassettes freeze during replay.
 
 **One turn, concretely** ("My card machine is showing a transaction decline error", signed in as `cliente1988`):
 
@@ -235,6 +280,7 @@ Those become an observation the Router reads on its next step.
 |---|---|---|
 | Router step budget (6) | `Nodes.supervisor` | The next call is forced to `finish` |
 | Duplicate delegation | `Nodes.supervisor` | Refused with an observation explaining why |
+| Parallel fan-out cap (`MAX_PARALLEL_TASKS=3`) | `Nodes.supervisor` | Excess tasks truncated; dependent subtasks sequenced one at a time |
 | Specialist tool budget (4), repeated tool call | `Nodes._run_specialist` | Forced `report`. A tool without parameters is offered once; a repeated call is not executed and the next step can only report. One tool call per model step |
 | One escalation per turn; none for anonymous callers | `Nodes.supervisor` | Refused with an observation |
 | Critic rounds (2) | `Nodes.critic` | A draft that is still ungrounded is replaced by an explicit "could not verify" answer |
@@ -242,13 +288,15 @@ Those become an observation the Router reads on its next step.
 | Critic returns no review | `Nodes.critic` | The deterministic checks decide; an unsupported number or unreturned URL forces a revision |
 | Graph recursion limit (60) | `ChatService` | Hard stop |
 
-**The Critic** gets the question, the evidence and the draft, plus two automatic findings: numbers in the draft
-that appear nowhere in the evidence, and URLs no tool returned. It answers through a typed `review` call. A
-fabricated URL forces a revision regardless of the model's verdict, and so does a draft written in a language
-other than the merchant's. On `revise` the Router sees the issues and may gather more evidence before
-rewriting, which is the quality-based retry. It is told to send a draft back only for a material problem,
-because every round is latency the merchant waits through, and that "could not confirm" is acceptable only if
-the right specialist was actually asked.
+**The Critic** gets the question, the evidence and the draft, plus deterministic findings computed in code
+([checks.py](src/agents/checks.py)): numbers in the draft that appear nowhere in the evidence, URLs no tool
+returned, and an **`evidence_checklist`** extracting concrete procedure steps (scoped to sections matching the
+turn's telemetry/question), product rental prices, and human-operator decisions/service-order numbers from the
+collected evidence. It answers through a typed `review` call. A fabricated URL forces a revision regardless of the
+model's verdict, and so does a draft written in a language other than the merchant's. On `revise` the Router sees
+the issues and may gather more evidence before rewriting, which is the quality-based retry. It is told to send a
+draft back only for a material problem, because every round is latency the merchant waits through, and that "could
+not confirm" is acceptable only if the right specialist was actually asked.
 
 **Reply language** is detected in code from function words (English, Portuguese, Spanish) and stated in the
 Router, Escalation and Critic prompts. This exists because the first real-model run answered English
@@ -375,53 +423,61 @@ sentence of overlap. Page title and section heading are prepended to the indexed
 would add an operational dependency without changing recall at this size; the `Retriever.search` interface is
 where one would plug in.
 
-**Retrieval.** Three modes over the same chunks:
+**Retrieval.** Three modes over the same chunks (`RETRIEVAL_MODE=auto` and `EMBEDDING_PROVIDER=auto`,
+[ADR-0020](docs/adr/0020-retrieval-mode-from-a-held-out-split.md)):
 - `bm25`: accent-folded, stop-word-filtered tokens, with a query-side glossary that maps merchant wording in
-  EN/PT/ES to the terms the corpus uses.
-- `dense`: cosine over embeddings. Keyless default is a character n-gram hashing embedder; with
-  `EMBEDDING_PROVIDER=openai` it uses `text-embedding-3-small`, cached on disk.
+  EN/PT/ES to the terms the corpus uses. Default when running keyless (`offline` / CI).
+- `dense`: cosine over embeddings. Keyless default is a character n-gram hashing embedder; with an API key
+  (`EMBEDDING_PROVIDER=auto` or `openai`) it uses `text-embedding-3-small`, cached on disk, and degrades to BM25 if
+  the embeddings API fails so an outage never causes a tool error. Default when an API key is set.
 - `hybrid`: reciprocal rank fusion of the two.
 
-Every hit carries a `coverage` score (share of query terms present), surfaced to the agent as
-`relevance: good | partial | poor`. That is the abstention and re-query signal.
+`search_getnet_knowledge(query, query_en)` runs multi-query retrieval: the agent's query, its optional English
+translation (`query_en`), and the merchant's raw message are batched through `Retriever.search_many()` and fused
+with RRF, so a Portuguese or Spanish reformulation never blinds search to the English-curated corpus. Every hit
+carries a `coverage` score (share of query terms present), surfaced to the agent as `relevance: good | partial | poor`.
+That is the abstention and re-query signal.
 
 **Generation.** The Knowledge Agent answers only from tool results and reports its sources. Code then drops any
 reported URL that no tool returned; the Critic rejects answers with unsupported numbers or URLs.
 
 ### Retrieval ablation
 
-42 labelled queries (29 EN, 8 PT, 5 ES); relevance is labelled at section level. From
-[eval/reports/offline/report.md](eval/reports/offline/report.md):
+78 labelled queries over 30 chunks: **42 dev queries** (29 EN, 8 PT, 5 ES) and **36 held-out queries** (`rh01`–`rh36`,
+12 EN / 12 PT / 12 ES, colloquial wording written after the glossary was frozen), each evaluated with the glossary
+on and off ([ADR-0020](docs/adr/0020-retrieval-mode-from-a-held-out-split.md)).
 
-| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |
-|---|---|---|---|---|---|
-| bm25 | 0.905 | 0.988 | 0.988 | 0.948 | 0.951 |
-| dense (hashing embedder) | 0.857 | 0.941 | 0.952 | 0.913 | 0.909 |
-| hybrid (RRF) | 0.905 | 0.952 | 0.976 | 0.946 | 0.938 |
+**Keyless (`hashing-char-ngram-1024`)**, from [eval/reports/offline/report.md](eval/reports/offline/report.md):
 
-The same queries with hosted embeddings (`text-embedding-3-small`), from
-[eval/reports/openai/report.md](eval/reports/openai/report.md):
+| Split / setting | BM25 R@4 / MRR | Dense R@4 / MRR | Hybrid (RRF) R@4 / MRR |
+|---|---|---|---|
+| dev (42q), glossary on | **0.988 / 0.948** | 0.952 / 0.913 | 0.976 / 0.958 |
+| dev (42q), glossary off | 0.941 / 0.861 | 0.917 / 0.847 | 0.929 / 0.871 |
+| held-out (36q), glossary on | **0.708 / 0.632** (ES 0.375) | 0.764 / 0.627 | 0.806 / 0.662 |
+| held-out (36q), glossary off | 0.708 / 0.590 | 0.764 / 0.611 | 0.792 / 0.650 |
 
-| Mode | Hit@1 | Recall@3 | Recall@4 | MRR | nDCG@4 |
-|---|---|---|---|---|---|
-| bm25 | 0.905 | 0.988 | 0.988 | 0.948 | 0.951 |
-| dense (hosted) | 0.929 | 0.988 | 0.988 | 0.964 | 0.966 |
-| hybrid (RRF) | 0.929 | 0.988 | 1.000 | 0.964 | 0.969 |
+**Hosted embeddings (`text-embedding-3-small`)**, from [eval/reports/openai/report.md](eval/reports/openai/report.md):
 
-The first submission asserted a 0.45 / 0.35 / 0.20 hybrid without measuring it. Measured: with the keyless
-embedder the hybrid is not better than BM25 and is worse on Portuguese; with a real semantic embedder the
-hybrid is at least as good as BM25 on every metric. In both cases the gap is one or two queries out of 42, so
-the honest claim is "the hybrid helps slightly once the dense side is a real embedder", not more. The default
-stays `bm25` with the keyless embedder because it needs no key, network or cache; a deployment that has the
-key should set `EMBEDDING_PROVIDER=openai` and `RETRIEVAL_MODE=hybrid`. The query set is small, single-author
-and close to the ceiling, which limits how much it can discriminate.
+| Split / setting | BM25 R@4 / MRR | Dense (hosted) R@4 / MRR | Hybrid (hosted RRF) R@4 / MRR |
+|---|---|---|---|
+| dev (42q), glossary on | 0.988 / 0.948 | **0.988 / 0.976** (Hit@1 0.952) | 1.000 / 0.964 |
+| dev (42q), glossary off | 0.941 / 0.861 | **0.988 / 0.976** | 0.976 / 0.901 |
+| held-out (36q), glossary on | 0.708 / 0.632 | **1.000 / 0.944** (36/36; EN/ES/PT all 1.000) | 0.917 / 0.810 |
+| held-out (36q), glossary off | 0.708 / 0.590 | **1.000 / 0.944** (identical without glossary) | 0.931 / 0.843 |
+
+The 9.3 review called the earlier 0.988 BM25 Recall@4 optimistic because the glossary was built alongside the 42
+dev queries. The 36 post-glossary held-out queries proved that right: BM25 fell to 0.708 Recall@4 (0.375 on Spanish),
+whereas hosted multilingual dense (`text-embedding-3-small`) reached **1.000 Recall@4 / 0.944 MRR** with or without
+the glossary and beat hosted hybrid (0.917 / 0.810, where weak lexical rankings pulled dense hits down). That is why
+`RETRIEVAL_MODE=auto` and `EMBEDDING_PROVIDER=auto` now pick **hosted dense** whenever `OPENAI_API_KEY` is set and
+keep **BM25** when running keyless ([ADR-0020](docs/adr/0020-retrieval-mode-from-a-held-out-split.md)).
 
 ## Tools
 
 | Agent | Tool | Notes |
 |---|---|---|
-| Knowledge | `search_getnet_knowledge(query)` | Passages with `source_url`, `coverage`, relevance rating |
-| Knowledge | `get_fx_rate(base, quote)` | ECB reference rates via Frankfurter |
+| Knowledge | `search_getnet_knowledge(query, query_en?)` | Multi-query RRF search (`query` + `query_en` + merchant message) returning passages with `source_url`, `coverage`, relevance rating |
+| Knowledge | `get_fx_rate(base, quote="BRL")` | ECB reference rates via Frankfurter (defaults to `BRL` for Brazilian merchants) |
 | Knowledge | `get_weather_forecast(city)` | Open-Meteo geocoding + forecast |
 | Knowledge | `web_search(query)` | DuckDuckGo; results are sanitized as untrusted text |
 | Support | `get_settlements()` | Yesterday's sales per modality, for the signed-in merchant |
@@ -436,11 +492,11 @@ check, schema validation, identity arguments dropped, exceptions converted to st
 
 | Layer | What it does | Failure mode |
 |---|---|---|
-| Input, deterministic | Patterns over normalized views of the message: NFKC, zero-width removal, leetspeak, separator stripping, decoded base64. Injection, prompt extraction, bulk exfiltration, illicit requests, other merchants' ids (EN/PT/ES) | Always on |
-| Input, LLM classifier | Typed verdict through a forced function call; the message is passed as tagged data. A block is kept only if a second, more careful pass agrees, so one hasty verdict cannot refuse an ordinary question; the second pass runs only for flagged messages | Fail-open to the deterministic layer |
+| Input, deterministic | Patterns over normalized views of the message: NFKC, zero-width removal, leetspeak, separator stripping, decoded base64. Injection, prompt extraction, bulk exfiltration, illicit requests, other merchants' ids (EN/PT/ES). Runs synchronously before any model call | Always on |
+| Input, LLM classifier | Typed verdict through a forced function call; the message is passed as tagged data. Runs concurrently with speculative Router step 1 (`SPECULATIVE_ROUTER=true`), discarding speculative output before any tool call if blocked. A block is kept only if a second, more careful pass agrees | Fail-open to the deterministic layer |
 | Untrusted data | Retrieved passages, web results and operator notes: instruction-like sentences removed, delimiter tags neutralized, wrapped as data in every prompt | Always on |
 | Structural | Tool allow-lists, principal-scoped tools, human-gated writes | Always on |
-| Output | Prompt canary, other tenants' identifiers, credential-shaped strings, formatted CPF/CNPJ and Luhn-valid card numbers (redacted). Applied to final answers and to the waiting message sent when a turn pauses for a human | Fail-closed |
+| Output | Prompt canary, other tenants' identifiers, credential-shaped strings, formatted CPF/CNPJ and Luhn-valid card numbers (redacted; phone-formatted strings such as `+55 11 97694-6815`, `0800`, and `4003` are excluded so official support numbers are never masked as PANs). Applied to final answers and to waiting messages | Fail-closed |
 
 The structural layer is the one that carries the security argument; the others reduce how often it is tested.
 
@@ -456,146 +512,150 @@ now carries 30 benign controls whose false-positive rate is gated next to the at
 
 | Suite | Dataset | Measures |
 |---|---|---|
-| Retrieval | 42 labelled queries | Recall@k, Hit@k, MRR, nDCG@k per mode and language |
-| Golden answers | 64 conversations: 18 dev, 22 validation, 24 sealed held-out (single and multi-turn, EN/PT/ES, account, compound, HITL approve/reject/answer, abstention, contradictory source, anonymous). Each runs on its own fresh databases | Fact coverage, forbidden claims, numeric groundedness, citation validity, language match, gold source cited, LLM judge, latency, cost; routing separately |
+| Retrieval | 78 labelled queries: 42 dev + 36 post-glossary held-out (`rh01`–`rh36`), each tested with glossary on and off | Recall@k, Hit@k, MRR, nDCG@k per mode and language, keyless and hosted |
+| Golden answers | 136 conversations: 18 dev, 94 validation (`h01`–`h22`, `s01`–`s72`), 24 sealed held-out (`sealed-4`, `s73`–`s96`: EN/PT/ES, account, compound, memory, HITL approve/reject/answer, abstention, contradictory source, anonymous, live tools). Each runs on its own fresh databases | Fact coverage, forbidden claims, numeric groundedness, citation validity, language match, gold source cited, LLM judge, latency, cost; routing separately |
 | Adversarial | 38 attacks + 30 benign controls | Attack success rate, data leaks, unauthorized writes, false-positive rate |
-| Judge calibration | 40 good and bad answers with pass/fail labels: 16 original, 24 on questions that appear in no golden item | Judge agreement and Cohen's kappa, overall and per set; false passes |
+| Critic calibration | 48 fixed drafts (32 `dev` + 16 blind unseen `heldout` `k33`–`k48`) across 8 defect classes | Defect recall and clean-draft false-revise rate, overall and per set |
+| Judge calibration | 60 hand-written answers: 16 `original`, 24 `independent`, and 20 dual-reviewer `borderline` near-miss items ([eval/labels/README.md](eval/labels/README.md)) | Judge agreement and Cohen's kappa per set, false passes, and dual-reviewer agreement |
 
 **Required facts, and where they are brittle.** Each golden item lists the atomic facts a correct answer must
 carry, each as a set of acceptable phrasings (`["48"]`, `["129[.,]90"]`,
 `["does not (say|state|specify)", "não informa", ...]`), matched accent- and case-insensitively, plus claims
 that must not appear. For numbers, codes and product names this is exact and language-independent: a fluent
-answer with the wrong number fails. For wording (an abstention, "sign in") it is still pattern matching, and the
-model run shows its cost: g04 ("do not confirm") and s22 ("entre na sua conta") were correct answers that no
-listed phrasing matched. Those two are counted as failures and attributed to the grader in the adjudication
-below; moving wording checks from patterns to the judge is the planned fix.
+answer with the wrong number fails. For wording (an abstention, tense, hyphenation) it is still pattern matching,
+and the `sealed-4` results show its cost: hyphenated `"lump-sum"` (`s79`), `"3 continuous/consecutive hours"` (`s76`),
+past-tense Spanish `"aprobó"` (`s93`) and `"registro de transação"` (`s85`) were correct 5/5 answers that strict
+sealed regexes missed. On a sealed split those regexes are left untouched and attributed to `grader_facts` in the
+adjudication below; they are never edited to turn a sealed failure into a pass.
 
 **Groundedness** is measured against the evidence the agents collected in that turn (read from the trace):
 every number in the answer must occur in it, and every URL must have been returned by a tool. An agent's own
 report does not count as evidence for a URL.
 
-**LLM judge.** A separate call with its own rubric grades correctness, groundedness, relevance and helpfulness
-1–5 against a human-written reference and the evidence. The pass rule is applied in code from the scores. Its
-reliability is measured on the calibration set, where "false pass" (accepting an answer a human rejected) is
-the number to watch.
+**LLM judge.** A separate call (`gpt-5.4-mini` in CI) with its own rubric grades correctness, groundedness,
+relevance and helpfulness 1–5 against a reference and the evidence. The pass rule is applied in code from the
+scores. Its reliability is measured on both clear-cut pairs (`original` + `independent`) and near-miss
+`borderline` pairs labelled by two blind reviewers before running the judge.
 
 **Semantic pass** = all facts present, no forbidden claim, numeric groundedness 1.0, no fabricated citation,
 expected status, and the judge's pass when a judge ran.
 
-**Three splits, and exactly how clean each is** ([ADR-0016](docs/adr/0016-sealed-held-out-and-independent-judge-calibration.md)).
-`dev` (g01-g18) was used while writing prompts and the offline policy. `validation` (h01-h22) was written as
-a held-out split and stopped being one: it was run against the model, two items failed, general fixes
-followed, the acceptable phrasings of h07 and h11 were widened, and it was run again. It is reported under
-the name that describes it. `heldout` (s01-s24) is sealed: written after the last change to any prompt, never
-used to change one, its floor (0.80) fixed before its first model run and not raised afterwards. Its result
-is published as measured; a grader mistake in a sealed item is reported, not corrected into a pass. The
-sealed items were drafted with an LLM coding assistant from the corpus and the fixtures by this project, so
-they are unseen by the prompts, not written by an outside party.
+**Three splits, and the sealed-split discipline** ([ADR-0016](docs/adr/0016-sealed-held-out-and-independent-judge-calibration.md),
+[ADR-0022](docs/adr/0022-sealed-2-and-critic-heldout-after-v3-freeze.md)–[0024](docs/adr/0024-sealed-4-after-final-prompt-refinements.md)).
+Whenever an observed failure on a sealed split drives any change to `src/`, that split immediately becomes
+`validation` and a brand-new sealed split is authored blind after the new code freeze. `dev` (`g01`–`g18`) was
+used while writing prompts and the offline policy. `validation` (`h01`–`h22` plus former sealed splits `s01`–`s24`,
+`s25`–`s48`, `s49`–`s72`; 94 items total) drove earlier fixes and is reported under the name that describes it.
+`heldout` (`sealed-4`, `s73`–`s96`, 24 items, balanced 8 EN / 8 PT / 8 ES) was drafted after the `src/` freeze at
+commit `479a6d7` by an isolated Gemini subagent blind to prompts, Critic checks, guardrails and the retrieval
+glossary; its floor (`0.80`) was fixed before its first run and never touched afterwards. After that freeze, two
+commits (`e7cf787`, `e031a8e`) changed prompts and Critic checks to fix `dev` failures only; no `sealed-4` answer was
+opened while making them, so `sealed-4` stays held out ([ADR-0026](docs/adr/0026-dev-driven-fixes-after-the-479a6d7-freeze.md)).
 
-**One run is an anecdote.** `--repeat N` runs the golden suite N times with nothing changed in between and
-reports every run, the mean and which items failed in how many runs.
+**Repeated-run regression gate** ([ADR-0019](docs/adr/0019-gate-over-repeated-runs.md)). One run is an anecdote:
+`--repeat N` runs the golden suite `N` times with nothing changed in between. For golden metrics, `--gate` reads
+all `N` runs: a floor holds when the mean reaches it and no single run is more than one item (`1/n`) below it; a
+ceiling (`forbidden_claim_rate`, `degraded_turns`) holds only if every run is within it. Every other suite runs
+once and is gated on that run. No floor in [eval/baseline.json](eval/baseline.json) was lowered in v3.
 
-**Provenance.** Each report records the SHA-256 of the dataset files it ran and, from this version on, the git
-commit, whether the working tree differed from it, and hashes of the source tree, the prompts, the judge, the
-baseline, the corpus and the poisoned corpus. The current model report has all of it; the archived 2026-11-14
-report predates it and carries dataset hashes only.
+**Reproducible model runs without a key (E4)** ([ADR-0021](docs/adr/0021-recorded-model-runs-replayable-without-a-key.md)).
+`python -m eval.run --record CASSETTE.json.gz` records every LLM call (agents, guard, Critic, judge), live-tool
+response, hosted embedding and frozen date (`src/clock.py`) keyed by content hash. Anyone can re-execute the
+entire app, graph, retrieval, guardrails, checks, metrics and gate offline with
+`python -m eval.run --replay eval/reports/openai/cassette.json.gz --out /tmp/replayed` and verify
+`python -m eval.compare eval/reports/openai/report.json /tmp/replayed.json` (0 differences across all 408 answers
+and every metric, 0 unused calls; any unrecorded call raises `CassetteMiss`). CI runs this replay check on every
+push (`model-eval-replay`). Golden conversations run in parallel, each under its own cassette scope, so a recording
+replays exactly whatever order the threads ran in ([ADR-0025](docs/adr/0025-parallel-golden-conversations-and-fail-fast.md)).
 
-**Re-grading and adjudication.** Each golden item now stores the search queries and tool arguments of its turn
-and the exact input the judge saw, so `--regrade REPORT --regrade-times N` can grade the same answers again,
-N times each, without running the agents: judge noise measured on its own. Every failed answer is reviewed in
-[eval/adjudications.jsonl](eval/adjudications.jsonl), keyed to the SHA-256 of that exact answer, and attributed
-to the agent, the judge, the fact patterns or the harness. The report shows the raw and the adjudicated pass
-rate side by side; the gate reads only the raw one.
-
-**Regression gate.** [eval/baseline.json](eval/baseline.json) holds floors and ceilings per mode;
-`--gate` exits non-zero on a regression, on a gated metric that was never produced (a judge or calibration
-that did not answer), and, with a model, on any turn answered by the degraded fallback. CI runs the offline
-gate on every push.
+**Provenance, re-grading and adjudication.** Each report records the git commit, `git_dirty` status, and SHA-256
+hashes of the datasets, `src/`, `prompts.py`, `judge.py`, `baseline.json` and corpora. Every golden item stores
+the tool calls and exact `judge_input`, so `--regrade` isolates judge noise without re-running agents. Every
+failed answer across all committed model reports is adjudicated in [eval/adjudications.jsonl](eval/adjudications.jsonl),
+keyed to the SHA-256 of that exact answer text (enforced by a unit test). The gate always reads the raw numbers.
 
 ### Results
 
-**Real model** (`gpt-6-luna` answering, `gpt-5.4-mini` judging, live web tools on, 2026-11-16, code at
-commit `6202c2b` with a clean tree) — [full report](eval/reports/openai/report.md). Three runs of the golden
-suite with nothing changed between them; the table is run 1, the one the gate reads. **The gate failed on this
-run**: dev semantic pass 0.833 against a floor of 0.94. Every other gated metric passed, including the sealed
-split.
+**Real model** (`gpt-6-luna` answering, `gpt-5.4-mini` judging, `text-embedding-3-small` hosted dense retrieval,
+live web tools on, 2026-11-19, [GitHub Actions run 44622842628](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44622842628),
+code at `e031a8e`, clean tree, `0` degraded turns, `0` conversations re-run) — [full report](eval/reports/openai/report.md)
+· [replayable cassette](eval/reports/openai/cassette.json.gz) (verified offline: **408 answers, 0 diffs, 0 unused calls**).
+
+Three runs of all 136 conversations (408 turns) with nothing changed between them, 4 conversations in flight at a
+time; the table below is run 1:
 
 | Split | n | Semantic pass | Fact coverage | Numeric groundedness | Citation validity | Gold source cited | Language match | Judge pass | p50 | p95 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| dev | 18 | 0.833 | 0.963 | 1.000 | 1.000 | 1.000 | 1.000 | 0.889 | 16.0 s | 35.6 s |
-| validation | 22 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 11.8 s | 31.6 s |
-| heldout (sealed) | 24 | 0.958 | 0.958 | 1.000 | 1.000 | 1.000 | 1.000 | 0.958 | 10.9 s | 24.1 s |
-| all | 64 | 0.938 | 0.974 | 1.000 | 1.000 | 1.000 | 1.000 | 0.953 | 11.9 s | 26.4 s |
+| dev | 18 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 9.9 s | 21.8 s |
+| validation | 94 | 0.947 | 0.992 | 1.000 | 1.000 | 0.986 | 1.000 | 0.957 | 9.3 s | 20.4 s |
+| heldout (`sealed-4`) | 24 | 0.875 | 0.976 | 1.000 | 1.000 | 1.000 | 1.000 | **1.000** | 10.1 s | 17.7 s |
+| all | 136 | 0.941 | 0.990 | 1.000 | 1.000 | 0.989 | 1.000 | 0.971 | 9.5 s | 20.4 s |
 
-Run-to-run variation (semantic pass per run, then the mean), raw and after adjudication:
+Run-to-run variation across the three runs, raw and after SHA-256 adjudication:
 
-| Split | Run 1 | Run 2 | Run 3 | Mean | Adjudicated per run |
-|---|---|---|---|---|---|
-| dev | 0.833 | 0.889 | 0.889 | 0.870 | 0.889, 1.000, 0.944 |
-| validation | 1.000 | 1.000 | 0.955 | 0.985 | 1.000, 1.000, 0.955 |
-| heldout (sealed) | 0.958 | 0.917 | 0.917 | 0.931 | 0.958, 0.958, 0.958 |
-| all | 0.938 | 0.938 | 0.922 | 0.932 | 0.953, 0.984, 0.953 |
+| Split | n | Run 1 | Run 2 | Run 3 | Raw mean | Judge pass (3 runs) | Adjudicated per run | Adj. mean |
+|---|---|---|---|---|---|---|---|---|
+| dev | 18 | 1.000 | 1.000 | 1.000 | **1.000** | 1.000, 1.000, 1.000 (1.000) | 1.000, 1.000, 1.000 | **1.000** |
+| validation | 94 | 0.947 | 0.989 | 0.979 | 0.972 | 0.957, 0.989, 1.000 (0.982) | 0.979, 1.000, 1.000 | **0.993** |
+| heldout (`sealed-4`) | 24 | 0.875 | 0.917 | 0.833 | 0.875 | **1.000, 1.000, 1.000 (1.000)** | 1.000, 1.000, 1.000 | **1.000** |
+| all | 136 | 0.941 | 0.978 | 0.956 | 0.958 | 0.971, 0.993, 1.000 (0.988) | 0.985, 1.000, 1.000 | **0.995** |
 
-Thirteen answers failed across the three runs. Each is reviewed in
-[eval/adjudications.jsonl](eval/adjudications.jsonl) against the stored evidence and tool calls, which this
-report is the first to keep:
+**Regression gate verdict: PASSED — all 29 gated metrics in [eval/baseline.json](eval/baseline.json), no floor
+lowered.** Every one of the 17 raw failures across 408 turns is adjudicated against stored evidence in
+[eval/adjudications.jsonl](eval/adjudications.jsonl): **12 `grader_facts`** regex misses on correct answers (every
+raw miss on `sealed-4`: `"3 consecutive hours"` `s76`×2, plural `"transações"` and `"registro de transação"` `s85`×3,
+`"Se aprobó"` `s93`×2, imperative `"inicia sesión"` `s95`, `"não permite confirmar"` `s81`; sealed regexes left
+untouched), **3 `judge`** errors (`h18`, `s18`, `s43`: correct, grounded answers marked down for caveats or
+unrequested runbook steps), and **2 real `agent` defects**, both `validation` run 1: `s01` refused to state the
+Get Mini's R$ 14.90 rental that the evidence gives "for comparison", and `s63` told the merchant to select Pix for a
+QR Code payment because retrieval never surfaced the "select debit" passage (**406/408 = 0.995** adjudicated).
 
-| Item | Run | Cause | What happened |
-|---|---|---|---|
-| g01 (dev) | 1 | agent | Compared features but left out the rental prices (R$ 79.90 vs R$ 129.90); the judge passed it, the fact check did not |
-| g12 (dev) | 1 | agent | Left out the "connect to the store Wi-Fi" step again (it did in the 2026-11-14 report too) |
-| g15 (dev) | 1 | judge | Called "Pix or a Payment Link" unsupported; the stored judge evidence contains the runbook sentence that says it |
-| s04 (sealed) | 1 | agent | "No limit is published." Every search was a Portuguese reformulation, BM25 over the English corpus never returned the "up to 5 devices" passage, and it is absent from the evidence: a cross-lingual retrieval miss |
-| g08 (dev) | 2 | fact pattern | Says the re-key "has been scheduled under service order SO-…"; the pattern wants the word "approved" |
-| g18 (dev) | 2, 3 | fact pattern | "Telemetry did not return a decline code"; the pattern wants "no recent" |
-| s21 (sealed) | 2 | agent (output guard) | **System defect.** The output guard rewrote the official WhatsApp number +55 11 97694-6815 as "[redacted card number]": its 13 digits pass the Luhn check |
-| s23 (sealed) | 2 | fact pattern | "US$1 = R$5.6637"; the pattern wants the string "usd" |
-| g15 (dev) | 3 | agent | Never said the re-key was not approved, and appended connectivity troubleshooting nobody asked for |
-| h14 (validation) | 3 | agent | Gave R$ 10,000 as the waiver threshold without the caveat that another Getnet page says R$ 20,000 |
-| s21 (sealed) | 3 | agent | Relayed the operator's answer, then said "I can't connect you to a person" right after a person answered |
-| s24 (sealed) | 3 | fact pattern | Portuguese abstention ("não está publicado") against an English-only pattern |
+**How this run differs from the first cassette run.** The first cassette run on the `479a6d7` freeze
+([GitHub Actions run 44569607884](https://github.com/DanielQueijeiro/AI_Hardcore/actions/runs/44569607884), archived as
+[report-2026-11-19-44569607884.md](eval/reports/openai/report-2026-11-19-44569607884.md)) passed every gated metric
+but one: `dev` `0.889, 0.833, 0.944` (mean `0.889 < 0.94`). The floor was kept and the system changed instead, from
+`dev` evidence only ([ADR-0026](docs/adr/0026-dev-driven-fixes-after-the-479a6d7-freeze.md)): Critic checklist items
+for the whole decline code after an approved re-key, every settlement amount, compared card rates and "nothing to
+escalate"; rejections stated first and then stop; BRL as the default FX quote; no unrequested account data,
+hypotheticals or remarks about what a page does not cover. Before spending the final run, the `dev` split was
+measured locally against the real model six runs at a time until its mean held at `0.963`; the CI run then scored
+`1.000` on all three runs. `sealed-4` was not opened during any of this.
 
-Seven are the system's (six model behaviours and one output-guard bug), one is the judge and five are fact
-patterns that missed a correct phrasing. The sealed split is 23/24 in every run once grader errors are set aside;
-its real misses are s04 (retrieval across languages) and s21 (the guard bug, then a misleading sentence). Dev
-stays below its floor even adjudicated in run 1 (0.889). None of the thirteen has been fixed, the dev floor has
-not been lowered, and sealed fact patterns are left as written.
+Other suites in this run:
+- **Judge means (1–5, run 1, `n=136`)**: correctness `4.87`, groundedness `4.95`, relevance `4.92`, helpfulness
+  `4.79`. `0` forbidden claims, `0` fabricated citations, `0` degraded turns, `1.000` language match, `1.000` routing
+  as expected. Mean cost per turn USD `0.00198` at configured `PRICE_*_PER_MTOK`.
+- **Critic calibration (48 fixed drafts)**: overall recall **`1.000` (24/24 across all 8 defect classes, 3/3 each)**,
+  false revise **`0.167`** (4/24, all `dev`: `k17`, `k18`, `k20`, `k27`; ceiling `0.20`). On unseen **`heldout`
+  (`k33`–`k48`, 16 drafts): Recall `1.000` (8/8), False revise `0.000` (0/8)**. False revise was `0.042` before the
+  `e031a8e` checklist items and rejection rule; `k27`'s "clean" draft explains the error code after a rejection,
+  which the new rule forbids (label not edited after the result).
+- **Judge calibration (60 items)**: clear-cut headline (`original` 16/16 + `independent` 24/24) agreement **`1.000`**,
+  Cohen's kappa **`1.000`**, `0` false passes, `0` false fails. Dual-reviewer **`borderline`** (20 near-miss items,
+  1 human + 1 blind cross-family Gemini with reviewer agreement `1.000` / κ `1.000`, [eval/labels/README.md](eval/labels/README.md)):
+  agreement **`0.850`** (17/20, floor `0.75` passed), Cohen's kappa **`0.700`**, **3 false passes** (`b03b`, `b06a`,
+  `b07a`), `0` false fails.
+- **Adversarial (real LLM classifier)**: 38 attacks, attack success rate **`0.000`** (`28` blocked at input, `10`
+  contained downstream), `0` data leaks, `0` unauthorized writes; 30 benign controls, false-positive rate **`0.000`**.
+- **Retrieval**: unchanged from the published ablation (hosted dense held-out Recall@4 `1.000`, MRR `0.944`).
 
-The previous measurement (2026-11-14, same prompts, before the harness kept evidence) is kept as
-[report-2026-11-14.md](eval/reports/openai/report-2026-11-14.md): raw dev 0.833 / 0.944 / 0.944, sealed
-1.000 / 1.000 / 0.875, eight failures (four agent, four grader). Two items recur across both measurements: g12
-(the Wi-Fi step) and s04 (the device limit).
+Archived model reports remain in git for auditability:
+[report-2026-11-19-44569607884.md](eval/reports/openai/report-2026-11-19-44569607884.md) (first cassette run on the `479a6d7` freeze, `dev` gate failed; its format-2 cassette was superseded),
+[report-2026-11-16.md](eval/reports/openai/report-2026-11-16.md) (v2 baseline, `n=64`, raw `all` `0.932`, 7 agent/guard defects)
+and [report-2026-11-14.md](eval/reports/openai/report-2026-11-14.md) (first repeated run).
 
-- Judge means (1-5, run 1): correctness 4.81, groundedness 4.97, relevance 4.92, helpfulness 4.67. No
-  forbidden claim, no fabricated citation, no turn answered by the degraded fallback, routing as expected
-  1.000. Mean cost per turn USD 0.00184 at the configured prices (`PRICE_*_PER_MTOK`; set them to your
-  price list).
-- Judge calibration: 40 of 40 in agreement with the reference labels, Cohen's kappa 1.000, 0 false passes,
-  0 false fails; per set, 16 of 16 on `original` and 24 of 24 on `independent` (questions that appear in no
-  golden item). The independent labels were drafted with an LLM assistant against the rubric, so this is
-  agreement with a rubric-following labeller, not with an outside human.
-- Adversarial: 38 attacks, attack success rate 0.000 (28 blocked at input, 10 contained downstream), 0 data
-  leaks, 0 unauthorized writes; 30 benign controls, false-positive rate 0.000.
-
-How it got there is part of the evidence. The first run against the real model failed its gate (semantic
-pass 0.72, judge pass 0.78): English questions answered in Portuguese, the "card machine offline" scenario
-escalated to a human instead of answered, a tool called four times in a row. The evaluation found those; the
-fixes are in [ADR-0015](docs/adr/0015-what-the-first-model-run-changed.md). A later run at 0.925 (37/40:
-`h01`, `h09`, `g04`) led to tighter Portuguese/English language markers, bilingual and safety-refusal
-calibration in the judge, and Router faithfulness, after which a single run of the 40 dev and validation
-items passed 40/40 (that run's report was not kept, so the figure cannot be checked here). The three-run
-measurement above is what that single run did not show.
-
-**Offline policy** (deterministic; the CI gate) — [full report](eval/reports/offline/report.md):
+**Offline policy** (deterministic; the CI gate, `n=136`, `PASSED`) — [full report](eval/reports/offline/report.md):
 
 | Split | n | Semantic pass | Fact coverage | Numeric groundedness | Citation validity | Language match | Routing as expected |
 |---|---|---|---|---|---|---|---|
 | dev | 18 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
-| validation | 22 | 0.682 | 0.682 | 1.000 | 1.000 | 0.727 | 0.773 |
-| heldout (sealed) | 24 | 0.750 | 0.771 | 1.000 | 1.000 | 0.667 | 1.000 |
+| validation | 94 | 0.660 | 0.748 | 1.000 | 1.000 | 0.553 | 0.851 |
+| heldout (`sealed-4`) | 24 | 0.458 | 0.636 | 1.000 | 1.000 | 0.333 | 0.917 |
+| all | 136 | 0.669 | 0.762 | 1.000 | 1.000 | 0.574 | 0.882 |
 
-Adversarial: 38 attacks, attack success rate 0.000 (15 blocked at input, 23 contained downstream), 0 data
-leaks, 0 unauthorized writes; 30 benign controls, false-positive rate 0.000.
+Adversarial (offline): 38 attacks, attack success rate `0.000` (`15` blocked at input, `23` contained downstream), `0`
+data leaks, `0` unauthorized writes; 30 benign controls, false-positive rate `0.000`. Critic calibration (offline):
+`0.125` recall (catches `unsupported_number` deterministically), `0.000` false revise.
 
 What the offline numbers do and do not show: the pipeline, tools, guardrails, memory and human-review flow
 work, answers stay grounded, and no attack succeeds even without the classifier. They are not a measure of
@@ -632,31 +692,37 @@ A test fails if a rule names a metric the code does not emit.
 
 ## Testing strategy
 
-187 tests, all through public interfaces, no network and no key.
+222 tests, all through public interfaces, no network and no key.
 
 | File | What it proves |
 |---|---|
-| [test_agentic_loop.py](tests/test_agentic_loop.py) | Re-planning from observations, critic-driven retry, refusal to send an ungrounded answer, step budget, duplicate-delegation refusal, fabricated-citation handling, tool reconsideration, compound decomposition, provider outage, trace completeness |
+| [test_agentic_loop.py](tests/test_agentic_loop.py) | Re-planning from observations, critic-driven retry, `evidence_checklist` completeness & section scoping, parallel fan-out (`delegate_parallel`), speculative Router overlap/discard, refusal to send an ungrounded answer, step budget, duplicate-delegation refusal, fabricated-citation handling, tool reconsideration, compound decomposition, provider outage, trace completeness |
+| [test_cassette.py](tests/test_cassette.py) | Content-hashed record/replay across LLM calls, live tools, hosted embeddings, frozen clock, normalized runtime ids, FIFO repeats, per-conversation scopes, parallel golden runs equal to sequential ones, re-run of API-degraded conversations, loud `CassetteMiss` on changed prompts/code, `eval.compare` |
 | [test_memory.py](tests/test_memory.py) | Cross-request memory, pronoun follow-ups, restart recovery, compaction, isolation, poisoned-message handling |
 | [test_human_in_the_loop.py](tests/test_human_in_the_loop.py) | Interrupt/resume, approve/reject/answer, lease and conflicts, role checks, timeout (sweeper and lazy), restart mid-review, idempotent ticket, exactly-once write, code-level approval gate |
 | [test_identity_and_api.py](tests/test_identity_and_api.py) | Token-only identity, tenant isolation at the tool layer, token failure modes, rate limiting, logout, trace privacy, metrics |
-| [test_guardrails.py](tests/test_guardrails.py) | Every "block" attack in the adversarial dataset, benign controls, obfuscation, classifier layer and its fail-open, sanitizer on poisoned and real corpus, output guard |
+| [test_guardrails.py](tests/test_guardrails.py) | Every "block" attack in the adversarial dataset, benign controls, obfuscation, classifier layer and its fail-open, sanitizer on poisoned and real corpus, output guard (including Luhn PAN redaction vs phone-number preservation) |
 | [test_llm_adapters.py](tests/test_llm_adapters.py) | Request shape and parsing of the OpenAI adapter against a fake SDK client, fallback for models without reasoning controls, circuit breaker open/recover, provider selection |
-| [test_rag_and_eval.py](tests/test_rag_and_eval.py) | Chunking, the three retrieval modes, metric math, groundedness and citation checks, language detection, the gate (including a gated metric that was never produced), live tools with a mocked transport |
-| [test_streaming_and_ops.py](tests/test_streaming_and_ops.py) | `/chat/stream` events and admission checks, `respond?wait=false` plus long-poll, the long-poll cap, `X-Forwarded-For` trusted only from configured proxies, typed metrics and gauges, alert rules against emitted metrics, live-source retry/cache/breaker, full argument-schema validation, report provenance, partial runs, re-grading, adjudication tied to the exact answer |
-| [test_hardening.py](tests/test_hardening.py) | Ordinary wording that used to be blocked, output-guard false positives plus obfuscated canary and internal tool-name blocking, PT/ES injections in retrieved text, anonymous conversation ids, strict `REQUIRE_CHAT_AUTH` and `/chat` rate limiting, production mode, lease-aware timeout, recovery of a decision whose resume never ran, checkpoint and trace retention, usage after a resume, specialist `degraded` propagation, a Critic that returns nothing |
+| [test_rag_and_eval.py](tests/test_rag_and_eval.py) | Chunking, the three retrieval modes, multi-query RRF & dense `search_many()`, metric math, groundedness and citation checks, language detection, repeated-run gate (ADR-0019), breaker cooldown helper, live tools with a mocked transport |
+| [test_streaming_and_ops.py](tests/test_streaming_and_ops.py) | `/chat/stream` events and admission checks, `respond?wait=false` plus long-poll, the long-poll cap, `X-Forwarded-For` trusted only from configured proxies, typed metrics and gauges, alert rules against emitted metrics, live-source retry/cache/breaker, full argument-schema validation, report provenance, partial runs, re-grading, adjudication tied to the exact answer across every committed model report |
+| [test_hardening.py](tests/test_hardening.py) | Ordinary wording that used to be blocked, output-guard false positives (including `+55 11 97694-6815`) plus obfuscated canary and internal tool-name blocking, PT/ES injections in retrieved text, anonymous conversation ids, strict `REQUIRE_CHAT_AUTH` and `/chat` rate limiting, production mode, lease-aware timeout, recovery of a decision whose resume never ran, checkpoint and trace retention, usage after a resume, specialist `degraded` propagation, a Critic that returns nothing |
 
 A scripted model ([scripted.py](src/llm/scripted.py)) plays individual agents where exact behaviour must be
 asserted (for example "the Critic rejects, the Router must gather more evidence"); everything else runs the
 offline policy. Integration testing against the real model is the evaluation harness: same HTTP surface,
-scored on semantics rather than asserted on strings, with the gate as the pass/fail criterion.
+scored on semantics rather than asserted on strings, with the gate as the pass/fail criterion and a recorded
+cassette proving offline reproducibility.
 
 ## Production notes
 
 - **Container**: multi-stage build, non-root uid 10001, read-only root filesystem, all capabilities dropped,
   state in one volume. `/health` is liveness; `/ready` checks the database, migrations and the index.
 - **CI** ([ci.yml](.github/workflows/ci.yml)): lint, tests, offline eval gate, image build, non-root check,
-  read-only boot and a smoke test of the challenge contract. The model evaluation is a manual job.
+  read-only boot, smoke test of the challenge contract, and **`model-eval-replay`** (keyless offline replay of
+  `eval/reports/openai/cassette.json.gz` verified by `eval.compare` on every push). The live `model-eval` job is a
+  manual `workflow_dispatch` workflow backed by the `OPENAI_API_KEY` repository secret; it evaluates golden
+  conversations 4 at a time, re-runs API-degraded ones and stops after the golden suite if the gate already failed
+  ([ADR-0025](docs/adr/0025-parallel-golden-conversations-and-fail-fast.md)): about 40 minutes and USD 2 per run.
 - **Migrations**: numbered, forward-only, applied at startup and recorded in `schema_migrations`.
 - **Backup / rollback**: `python -m scripts.backup` takes a consistent online copy of both databases;
   `--restore` puts one back. Rolling back a release means restoring the backup taken before it.
@@ -673,65 +739,52 @@ scored on semantics rather than asserted on strings, with the gate as the pass/f
 
 Spec first, then code. [GLOSSARY.md](GLOSSARY.md) fixes the domain language; [SPEC.md](SPEC.md) fixes the
 contracts, agents, bounds and acceptance criteria; [docs/adr/](docs/adr/) records the decisions, including the
-ones this version reversed (ADR-0006 supersedes the deterministic state machine of ADR-0001). Work items live in
-[.scratch/](.scratch/) as one spec and one file per vertical slice.
+ones later versions reversed (ADR-0006 supersedes ADR-0001; ADR-0020 amends ADR-0008; ADRs 0019–0026 govern the
+v3 gate, retrieval, cassette replay, sealed splits, the parallel model run and the post-freeze `dev` fixes). Work items live in [.scratch/](.scratch/) as one spec and
+one file per vertical slice.
 
-LLM coding tools (Claude) were used throughout: to turn the review into a spec, to implement slices against
-tests, and to review the result. The decisions that shape the system were made deliberately and are written
-down: identity from tokens only, writes gated in code, untrusted data never promoted to instructions,
-retrieval mode chosen by measurement, and evaluation that reports failures instead of hiding them. Everything
-an LLM wrote is covered by the tests and the evaluation gate described above.
+LLM coding tools (Claude and Gemini) were used throughout: to turn reviews into specs, implement slices against
+tests, author blind cross-family sealed splits (`sealed-2`–`sealed-4` and Critic `k33`–`k48`), and review the
+result. The decisions that shape the system were made deliberately and are written down: identity from tokens
+only, writes gated in code, untrusted data never promoted to instructions, retrieval mode chosen from held-out
+ablations, and evaluation that reports raw failures alongside SHA-256 adjudications and reproducible cassettes.
+Everything written is covered by the tests and evaluation gates described above.
 
 ## Limitations
 
-- The committed model report (2026-11-16) fails its gate on the dev split in run 1 (0.833 against 0.94), and so did
-  the previous one (2026-11-14). Dev varies between 0.833 and 0.944 across six runs, and even adjudicated it is
-  0.889 in one run, so that floor, set from an earlier single run, is tighter than the system's measured variance.
-  It has not been lowered.
-- Known defects found by the 2026-11-16 run and not fixed in this version (fixing them changes answers, so it
-  waits for a new sealed split, see [ADR-0016](docs/adr/0016-sealed-held-out-and-independent-judge-calibration.md)):
-  the output guard's card-number check fires on a 13-digit phone number that happens to pass Luhn; Portuguese
-  reformulations of a search miss English-only passages (s04); the FX tool does not default to BRL; the Router
-  sometimes appends troubleshooting nobody asked for after a human decision; fact patterns miss correct
-  phrasings ("US$", "não está publicado", "no decline code").
-- The s04 miss starts in the system, not only in the model. The search tool's description and the Knowledge
-  Agent's instructions tell it to reformulate with the Portuguese product term
-  ([src/tools/registry.py](src/tools/registry.py), [src/agents/prompts.py](src/agents/prompts.py)), and in s04
-  the very first search was already in Portuguese although the question was in English. The corpus is restated
-  in English and BM25 is lexical, so those searches could not reach the "up to 5 devices" passage.
-- The Critic is asked whether a draft is complete, but in practice it does not catch omissions. It approved g12
-  in both model reports without the runbook's "connect to the store Wi-Fi" step, and in the 2026-11-16 answer
-  the draft also said that step was not documented.
-- The golden, adversarial and retrieval datasets are small (64, 68 and 42 items) and written by one person.
-  They catch regressions and gross errors; they are not a statistically strong estimate of quality. The
-  retrieval set has no held-out split and sits close to the ceiling.
-- Retrieval leans on a hand-written synonym glossary (`GLOSSARY` in [src/rag/index.py](src/rag/index.py)) that
-  maps Portuguese and Spanish terms onto the English corpus. It was written alongside the 42 retrieval queries,
-  so the reported recall (0.988 at 4 for BM25) is optimistic for wording the glossary does not list; it has no
-  entry for "dispositivos", "loja" or "quantidade", the words of the s04 searches.
-- Judge calibration is 1.000 agreement (kappa 1.000) on both sets, yet the same report holds a judge error
-  (g15, run 1: a sentence called unsupported that is in the judge's own input). The calibration pairs are
-  clear-cut by design: they show the judge separates plainly good from plainly bad answers, not that it is
-  reliable on borderline ones.
-- Latency: in the reported run a turn takes 11.9 seconds at the median and 26.4 at p95 (35.6 s at p95 on the dev
-  split, where the human-review items are). That is the price of a
-  classifier, a Router loop, specialist tool loops and a Critic run in sequence. `/chat/stream` shows progress
-  while it runs but does not make the turn shorter; running the input classifier in parallel with the first
-  Router step is the obvious next step and is not built. The final answer is not streamed token by token,
-  because it arrives as the argument of the Router's `finish` call and the Critic reviews it before it is sent.
-- The knowledge base is a curated snapshot of nine pages dated in each file's front matter. Fees change; a
-  production system would schedule the ingestion check and re-curate on change.
-- Merchant data, the runbook and the write action are mock fixtures.
-- The deterministic input patterns can be evaded by wording they do not anticipate (the adversarial set
-  includes paraphrased, German and French attacks that pass them); the LLM classifier and the structural
-  controls are what cover that, and the classifier fails open by design.
-- Reply-language detection covers English, Portuguese and Spanish. In any other language the Router still
-  gets the instruction to answer in the merchant's language, but nothing enforces it. Refusals and the
-  low-confidence fallback are fixed English strings.
-- A turn is five to nine sequential model calls; the evaluation report gives the measured latency.
-- Single worker, SQLite, in-process locks and rate limiter (see Production notes).
-- The alert rules in [deploy/prometheus/alerts.yml](deploy/prometheus/alerts.yml) are versioned and tested
-  against the metrics the code emits, but `docker-compose.yml` runs no Prometheus: the rules take effect only
-  where a Prometheus loads them.
-- Operators have an API, not a UI, and there is no notification when a ticket opens (the backlog alert is the
-  closest thing). Merchants learn a decision through the long-poll or their next message, not a push.
+- **Grader noise, and `dev` measures its own fixes.** The final run passed every gate, but 15 of its 17 raw
+  failures were the graders, not the agent: 12 sealed and validation fact regexes too strict for correct wording
+  (`"3 consecutive hours"`, `"Se aprobó"`, plural `"transações"`) and 3 single-call `gpt-5.4-mini` judge errors.
+  Sealed regexes are left as written, so `sealed-4` reads `0.875` raw against `1.000` judge and adjudicated.
+  `dev` reached `1.000` after fixes made on `dev` ([ADR-0026](docs/adr/0026-dev-driven-fixes-after-the-479a6d7-freeze.md));
+  `validation` and `sealed-4` are the evidence that they generalize. Measured locally over 18 runs, about one `dev`
+  conversation in 27 still fails at random, so a 3-run gate on 18 items can still fail on noise; majority-of-3 judging was considered
+  and not applied, to keep the instrument unchanged for the final measurement.
+- **Critic precision after the new checklist items.** False revise on fixed clean drafts rose from `0.042` to
+  `0.167` (`dev` only, under the `0.20` ceiling); a revision costs a model round-trip and, after two rounds, sends
+  the low-confidence fallback.
+- **Borderline judge reliability and annotator provenance.** While clear-cut judge calibration is `1.000` (40/40),
+  the 20 near-miss `borderline` items measure `gpt-5.4-mini` at `0.850` agreement (κ `0.700`, 3 false passes
+  including an omitted Wi-Fi step). Those 20 items were labelled independently by one human plus one blind
+  cross-family Gemini reviewer ([eval/labels/README.md](eval/labels/README.md)), not two external human annotators.
+- **Synthetic corpus and datasets.** Even after expanding to 136 golden conversations (`sealed-4` authored blind
+  by a separate model family after code freeze), 78 retrieval queries, 48 Critic drafts (`k33`–`k48` blind) and 68
+  adversarial cases, every benchmark is drawn from nine curated pages and two mock merchants, not real production
+  merchant traffic.
+- **Latency.** With `speculative_router` and `delegate_parallel`, `dev` p95 improved from `35.6 s` to `21.8 s` in
+  the final run (overall p50 `9.5 s`, p95 `20.4 s`; earlier v3 runs `11.9–13.5 s` / `23.8–28.9 s`, so API load
+  moves these numbers by several seconds). Turns stay in the 10–20 s range because hosted dense
+  embeddings add a round-trip per search and reasoning calls (`gpt-6-luna`) run across Router, specialist and
+  Critic. `/chat/stream` streams step progress while the turn runs, not final tokens (because the Critic reviews
+  the final draft before release).
+- **Knowledge base freshness & mock fixtures.** The knowledge base is a curated snapshot of nine Getnet Brazil
+  pages dated in each file's front matter (`python -m scripts.ingest_getnet --check` detects drift). Merchant data,
+  the internal support runbook and the service-order write action are mock fixtures.
+- **Security & language bounds.** Deterministic input patterns can be evaded by novel wording (covered by the LLM
+  classifier — which fails open by design — and by the structural tool/identity/HITL boundary). Reply-language
+  enforcement covers English, Portuguese and Spanish; refusals and the low-confidence fallback are fixed English
+  strings.
+- **Single worker & operator UX.** Single worker, SQLite, in-process locks and rate limiter (see Production notes).
+  Alert rules in [deploy/prometheus/alerts.yml](deploy/prometheus/alerts.yml) are versioned and tested against
+  emitted metrics, but `docker-compose.yml` does not bundle Prometheus. Operators have an API, not a UI, and
+  merchants learn of human decisions via long-poll or their next message rather than push notifications.

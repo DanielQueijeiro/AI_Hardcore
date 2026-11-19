@@ -9,6 +9,10 @@ from src.llm.resilient import ResilientLLM
 
 def build_llm(settings: Settings) -> LLMClient:
     offline = OfflinePolicyLLM()
+    if settings.effective_provider() == "replay":
+        from src.cassette import ReplayLLM, open_cassette
+
+        return ReplayLLM(open_cassette(settings.replay_from, "replay"), scope=settings.cassette_scope)  # type: ignore[arg-type]
     if settings.effective_provider() != "openai":
         return offline
     primary = OpenAIResponsesClient(
@@ -19,9 +23,14 @@ def build_llm(settings: Settings) -> LLMClient:
         max_retries=settings.llm_max_retries,
         default_effort=settings.reasoning_effort,
     )
-    return ResilientLLM(
+    client: LLMClient = ResilientLLM(
         primary,
         offline,
         failure_threshold=settings.breaker_failure_threshold,
         cooldown_seconds=settings.breaker_cooldown_seconds,
     )
+    if settings.record_to:
+        from src.cassette import RecordingLLM, open_cassette
+
+        client = RecordingLLM(client, open_cassette(settings.record_to, "record"), scope=settings.cassette_scope)
+    return client

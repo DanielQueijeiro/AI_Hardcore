@@ -12,11 +12,13 @@ Rules enforced here, in code, regardless of what a model asks for:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.cassette import CassetteMiss
 from src.db import support_store
 from src.runtime import Runtime
 from src.security.auth import Principal
@@ -34,6 +36,7 @@ class ToolContext:
     principal: Principal
     thread_key: str = ""
     turn_id: str = ""
+    merchant_message: str = ""  # the merchant's own words, searched alongside the model's query
 
 
 @dataclass(frozen=True)
@@ -61,29 +64,81 @@ class Tool:
 # --- knowledge tools ----------------------------------------------------------------------------------
 
 
-def _search_getnet_knowledge(ctx: ToolContext, query: str) -> dict[str, Any]:
+MAX_EXTRA_PASSAGES = 2
+
+
+def _search_getnet_knowledge(ctx: ToolContext, query: str, query_en: str = "") -> dict[str, Any]:
+    """Search with the model's query, then with other wordings of the same need.
+
+    The corpus is restated in English and BM25 is lexical, so a query in the wrong language can miss a passage
+    entirely (s04, 2026-11-16: six Portuguese reformulations never reached "up to 5 devices"). The model's query
+    keeps its top-k unchanged; the English form and the merchant's own words can each add a passage the first
+    ranking did not have, up to MAX_EXTRA_PASSAGES. Which wording found each passage is recorded in `matched_by`.
+    """
     settings = ctx.runtime.settings
-    hits = ctx.runtime.retriever.search(query, k=settings.retrieval_top_k, mode=settings.retrieval_mode)
+    k, mode = settings.retrieval_top_k, settings.effective_retrieval_mode()
+    variants: dict[str, str] = {}
+    for label, text in (("query_en", query_en), ("merchant_message", ctx.merchant_message[:MAX_STRING_ARG])):
+        text = " ".join(text.split())
+        if text and text.casefold() not in {query.casefold(), *(v.casefold() for v in variants.values())}:
+            variants[label] = text
+    all_rankings = ctx.runtime.retriever.search_many({"query": query, **variants}, k=k, mode=mode)
+    primary = all_rankings["query"]
+    found: list[tuple[str, Any]] = [("query", hit) for hit in primary]
+    seen = {hit.chunk.chunk_id for hit in primary}
+    rankings = {label: all_rankings[label] for label in variants}
+    extras: list[tuple[str, Any]] = []
+    for rank in range(k):  # interleave by rank, so each wording's best passage comes before anyone's second
+        for label, hits in rankings.items():
+            if rank < len(hits) and hits[rank].chunk.chunk_id not in seen and len(extras) < MAX_EXTRA_PASSAGES:
+                seen.add(hits[rank].chunk.chunk_id)
+                extras.append((label, hits[rank]))
     results: list[dict[str, Any]] = []
     filtered = False
-    for hit in hits:
+    for label, hit in [*found, *extras]:
         evidence = hit.as_evidence()
         evidence["text"], flagged = sanitize_untrusted(str(evidence["text"]))
+        evidence["matched_by"] = label
         filtered = filtered or flagged
         results.append(evidence)
-    best = max((h.coverage for h in hits), default=0.0)
+    # relevance is the best any wording achieved: a good English hit is a good result even if the query was poor
+    best = max([h.coverage for h in primary] + [h.coverage for hits in rankings.values() for h in hits[:1]], default=0.0)
     out: dict[str, Any] = {
         "query": query,
         "results": results,
         "best_coverage": round(best, 2),
         "relevance": "good" if best >= 0.6 else "partial" if best >= 0.34 else "poor",
     }
+    if variants:
+        out["also_searched"] = variants
     if filtered:
         out["injection_filtered"] = True
     return out
 
 
+_CURRENCY_NAMES = {
+    "USD": ("dollar", "dolar", "us$"),
+    "EUR": ("euro", "\u20ac"),
+    "GBP": ("pound", "sterling", "libra", "esterlina", "\u00a3"),
+    "ARS": ("peso argentino", "argentine peso"),
+    "JPY": ("yen", "iene"),
+    "CNY": ("yuan", "renminbi"),
+}
+
+
+def _names_currency(message: str, code: str) -> bool:
+    import unicodedata
+
+    folded = "".join(c for c in unicodedata.normalize("NFKD", message.lower()) if not unicodedata.combining(c))
+    return bool(re.search(rf"\b{re.escape(code.lower())}\b", folded)) or any(n in folded for n in _CURRENCY_NAMES.get(code, ()))
+
+
 def _get_fx_rate(ctx: ToolContext, base: str, quote: str = "BRL") -> dict[str, Any]:
+    quote = (quote or "BRL").upper()
+    if quote != "BRL" and ctx.merchant_message and not _names_currency(ctx.merchant_message, quote):
+        # Getnet merchants operate in Brazil: a rate is quoted in reais unless the merchant named the other currency
+        # (g07: "What's the euro exchange rate today?" was once quoted as EUR/USD).
+        quote = "BRL"
     return ctx.runtime.live.fx_rate(base, quote)
 
 
@@ -200,18 +255,29 @@ TOOLS: dict[str, Tool] = {
         Tool(
             "search_getnet_knowledge",
             "Search the Getnet knowledge base (public site snapshot plus the internal support runbook). Returns passages "
-            "with source_url and a relevance rating. If relevance is 'poor', reformulate (try the Portuguese product term, "
-            "e.g. 'antecipação', 'maquininha', 'crediário') before concluding the knowledge base does not cover it.",
+            "with source_url and a relevance rating. The passages are written in English with the Portuguese product "
+            "names kept (e.g. 'antecipação', 'maquininha', 'crediário'). The merchant's own message is searched too. "
+            "If relevance is 'poor', reformulate with different wording before concluding the knowledge base does not cover it.",
             _search_getnet_knowledge,
-            {"query": {**_TEXT, "description": "Focused search query, one topic per call."}},
+            {
+                "query": {**_TEXT, "description": "Focused search query, one topic per call, in any language."},
+                "query_en": {
+                    **_TEXT,
+                    "description": "The same query in English, the language of the knowledge base. Required when 'query' is not in English.",
+                },
+            },
             ("query",),
         ),
         Tool(
             "get_fx_rate",
-            "Today's reference exchange rate between two ISO currency codes (ECB data).",
+            "Today's reference exchange rate between two ISO currency codes (ECB data). The merchants are in Brazil: "
+            "when only one currency is named ('how much is the dollar today?'), it is quoted in reais (BRL).",
             _get_fx_rate,
-            {"base": {**_TEXT, "description": "ISO code, e.g. EUR"}, "quote": {**_TEXT, "description": "ISO code, e.g. BRL"}},
-            ("base", "quote"),
+            {
+                "base": {**_TEXT, "description": "ISO code, e.g. USD"},
+                "quote": {**_TEXT, "description": "Target ISO currency code; default 'BRL' (Brazilian real) whenever the merchant does not specify another quote currency."},
+            },
+            ("base",),
         ),
         Tool(
             "get_weather_forecast",
@@ -332,6 +398,8 @@ def run_tool(ctx: ToolContext, name: str, arguments: dict[str, Any], allowed: tu
     try:
         result = tool.handler(ctx, **clean)
         outcome = "error" if result.get("error") or result.get("available") is False else "ok"
+    except CassetteMiss:
+        raise
     except Exception as exc:  # noqa: BLE001 - a broken tool is an observation for the agent, not a crashed turn
         logger.exception("tool_failed", extra={"tool": name})
         result = {"error": "tool_failed", "detail": type(exc).__name__}

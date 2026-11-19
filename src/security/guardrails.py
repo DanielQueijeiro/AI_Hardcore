@@ -21,6 +21,7 @@ import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from src.cassette import CassetteMiss
 from src.llm.base import LLMClient
 from src.security.auth import Principal
 
@@ -85,11 +86,34 @@ _SECRET_PATTERNS = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
 )
 # Personal identifiers a support answer never needs to spell out. CPF and CNPJ are matched in their formatted
-# form (bare digit runs are too easily a phone, an amount or an id); a card number is any 13-19 digit run,
-# with optional spaces or dashes, that passes the Luhn check.
+# form (bare digit runs are too easily a phone, an amount or an id). A card number is a 13-19 digit run, with
+# optional spaces or dashes, that passes the Luhn check, has a length its issuer prefix allows, and is not
+# written as a phone number. Luhn alone is not enough: about one digit string in ten passes it, and the
+# official WhatsApp number +55 11 97694-6815 (13 digits) was redacted as a card in the 2026-11-16 run.
 _CPF = re.compile(r"(?<!\d)\d{3}\.\d{3}\.\d{3}-\d{2}(?!\d)")
 _CNPJ = re.compile(r"(?<!\d)\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}(?!\d)")
 _CARD_CANDIDATE = re.compile(r"(?<![\d.,])\d(?:[ -]?\d){12,18}(?![\d.,])")
+# Country code, area code, then a 4-5 digit block and a 4 digit block joined by a dash: 55 11 97694-6815.
+_PHONE_LAYOUT = re.compile(r"^(?:\d{1,3} )?\d{2} \d{4,5}-\d{4}$")
+
+
+def _issuer_allows(digits: str) -> bool:
+    """Card schemes start with 2-6, and the short lengths belong to one scheme each: 13 Visa (4),
+    14 Diners (30, 36, 38), 15 Amex (34, 37). 16-19 digits cover Visa, Mastercard, Elo, Hipercard, Discover."""
+    if digits[0] not in "23456":
+        return False
+    if len(digits) == 13:
+        return digits[0] == "4"
+    if len(digits) == 14:
+        return digits[:2] in {"30", "36", "38"}
+    if len(digits) == 15:
+        return digits[:2] in {"34", "37"}
+    return True
+
+
+def _written_as_phone(text: str, start: int, raw: str, digits: str) -> bool:
+    # ITU-T E.164 phone numbers are at most 15 digits; a leading '+' must not exempt a 16-19 digit PAN.
+    return (start > 0 and text[start - 1] == "+" and len(digits) <= 15) or bool(_PHONE_LAYOUT.match(raw))
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -106,14 +130,21 @@ def redact_personal_identifiers(text: str) -> str:
     text = _CNPJ.sub("[redacted CNPJ]", _CPF.sub("[redacted CPF]", text))
 
     def card(match: re.Match[str]) -> str:
-        digits = re.sub(r"\D", "", match.group(0))
-        return "[redacted card number]" if 13 <= len(digits) <= 19 and _luhn_valid(digits) else match.group(0)
+        raw = match.group(0)
+        digits = re.sub(r"\D", "", raw)
+        is_card = (
+            13 <= len(digits) <= 19
+            and _luhn_valid(digits)
+            and _issuer_allows(digits)
+            and not _written_as_phone(match.string, match.start(), raw, digits)
+        )
+        return "[redacted card number]" if is_card else raw
 
     return _CARD_CANDIDATE.sub(card, text)
 
 
 _ORCHESTRATION_TOOL_PATTERN = re.compile(
-    r"\b(?:delegate_knowledge|delegate_support|escalate_to_human|human_review_brief|guardrail_verdict)\b",
+    r"\b(?:delegate_knowledge|delegate_support|delegate_parallel|escalate_to_human|human_review_brief|guardrail_verdict)\b",
     re.I,
 )
 
@@ -261,6 +292,8 @@ def check_input(message: str, principal: Principal, llm: LLMClient, effort: str 
         if second is not None and second[0] in UNSAFE_CATEGORIES:
             return GuardVerdict(False, second[0], second[1] or reason, layer="llm")
         return GuardVerdict(True, "safe", f"first pass said {category}; not confirmed on review", layer="llm")
+    except CassetteMiss:
+        raise
     except Exception:  # noqa: BLE001 - classifier outage must not take support down; layer 1 already passed
         return GuardVerdict(True, "safe", "llm classifier unavailable; deterministic layer passed", layer="deterministic")
 

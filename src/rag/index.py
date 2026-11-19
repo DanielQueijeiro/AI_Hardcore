@@ -13,12 +13,14 @@ import json
 import logging
 import math
 import re
+import threading
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from src.cassette import CassetteMiss
 from src.rag.corpus import Chunk, load_corpus
 
 logger = logging.getLogger(__name__)
@@ -164,6 +166,7 @@ class OpenAIEmbedder:
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=2)
         self._cache_path = cache_path
         self._cache: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
         if cache_path.exists():
             try:
                 self._cache = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -171,16 +174,22 @@ class OpenAIEmbedder:
                 self._cache = {}
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        keys = [hashlib.sha256(f"{self.name}:{t}".encode()).hexdigest() for t in texts]
-        missing = [(k, t) for k, t in zip(keys, texts, strict=True) if k not in self._cache]
-        if missing:
-            response = self._client.embeddings.create(model=self.name, input=[t for _, t in missing])
-            for (key, _), item in zip(missing, response.data, strict=True):
-                self._cache[key] = list(item.embedding)
-            if len(missing) > 1:  # persist document embeddings; single query vectors stay in memory
-                self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-                self._cache_path.write_text(json.dumps(self._cache), encoding="utf-8")
-        return [self._cache[k] for k in keys]
+        with self._lock:
+            keys = [hashlib.sha256(f"{self.name}:{t}".encode()).hexdigest() for t in texts]
+            missing: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for key, text in zip(keys, texts, strict=True):
+                if key not in self._cache and key not in seen:
+                    seen.add(key)
+                    missing.append((key, text))
+            if missing:
+                response = self._client.embeddings.create(model=self.name, input=[t for _, t in missing])
+                for (key, _), item in zip(missing, response.data, strict=True):
+                    self._cache[key] = list(item.embedding)
+                if len(missing) >= 10:  # persist document batches; keep merchant query vectors in memory only
+                    self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._cache_path.write_text(json.dumps(self._cache), encoding="utf-8")
+            return [self._cache[k] for k in keys]
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -195,8 +204,9 @@ class Retriever:
     B = 0.6
     RRF_K = 60
 
-    def __init__(self, chunks: list[Chunk], embedder: Embedder | None = None) -> None:
+    def __init__(self, chunks: list[Chunk], embedder: Embedder | None = None, *, use_glossary: bool = True) -> None:
         self.chunks = chunks
+        self.use_glossary = use_glossary  # off only to measure what the hand-written glossary contributes
         self.embedder: Embedder = embedder or HashingEmbedder()
         self._doc_tokens = [tokenize(c.indexed_text) + tokenize(f"{c.title} {c.section}") for c in chunks]
         self._tf = [Counter(tokens) for tokens in self._doc_tokens]
@@ -207,11 +217,12 @@ class Retriever:
         n = len(chunks)
         self._idf = {term: math.log(1 + (n - f + 0.5) / (f + 0.5)) for term, f in df.items()}
         self._vectors: list[list[float]] | None = None
+        self._vectors_lock = threading.Lock()
 
     # --- rankers -------------------------------------------------------------------------------
 
     def _bm25(self, query: str) -> list[tuple[int, float]]:
-        terms = tokenize(query, expand=True)
+        terms = tokenize(query, expand=self.use_glossary)
         scores: list[tuple[int, float]] = []
         for idx, tf in enumerate(self._tf):
             length = len(self._doc_tokens[idx])
@@ -226,37 +237,64 @@ class Retriever:
                 scores.append((idx, score))
         return sorted(scores, key=lambda item: -item[1])
 
-    def _dense(self, query: str) -> list[tuple[int, float]]:
+    def _ensure_vectors(self) -> list[list[float]]:
         if self._vectors is None:
-            self._vectors = self.embedder.embed([c.indexed_text for c in self.chunks])
-        expanded = f"{query} {' '.join(t for t in tokenize(query, expand=True))}"
-        qv = self.embedder.embed([expanded if isinstance(self.embedder, HashingEmbedder) else query])[0]
-        scores = [(idx, _cosine(qv, vec)) for idx, vec in enumerate(self._vectors)]
+            with self._vectors_lock:
+                if self._vectors is None:
+                    self._vectors = self.embedder.embed([c.indexed_text for c in self.chunks])
+        return self._vectors
+
+    def _query_text(self, query: str) -> str:
+        if isinstance(self.embedder, HashingEmbedder):
+            return f"{query} {' '.join(t for t in tokenize(query, expand=self.use_glossary))}"
+        return query
+
+    def _dense(self, query: str, *, qv: list[float] | None = None) -> list[tuple[int, float]]:
+        vectors = self._ensure_vectors()
+        vec = qv if qv is not None else self.embedder.embed([self._query_text(query)])[0]
+        scores = [(idx, _cosine(vec, doc)) for idx, doc in enumerate(vectors)]
         return sorted(scores, key=lambda item: -item[1])
 
     def _coverage(self, query: str, idx: int) -> float:
         terms = set(tokenize(query, expand=False))
         if not terms:
             return 0.0
-        expanded = {t: {t, *(_stem(e) for e in GLOSSARY.get(t, ()))} for t in terms}
+        glossary = GLOSSARY if self.use_glossary else {}
+        expanded = {t: {t, *(_stem(e) for e in glossary.get(t, ()))} for t in terms}
         present = sum(1 for alts in expanded.values() if any(a in self._tf[idx] for a in alts))
         return present / len(terms)
 
     # --- public --------------------------------------------------------------------------------
 
-    def search(self, query: str, k: int = 4, mode: str = "hybrid") -> list[Hit]:
+    def _search_one(
+        self, query: str, k: int = 4, mode: str = "hybrid", *, qv: list[float] | None = None, dense_failed: bool = False
+    ) -> list[Hit]:
         if not self.chunks or not query.strip():
             return []
         if mode == "bm25":
             ranked = self._bm25(query)
         elif mode == "dense":
-            ranked = self._dense(query)
+            if dense_failed:
+                ranked = self._bm25(query)
+            else:
+                try:
+                    ranked = self._dense(query, qv=qv)
+                except CassetteMiss:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - an embedding outage degrades to lexical, never to a 500
+                    logger.warning("dense_retrieval_failed", extra={"error": repr(exc)})
+                    ranked = self._bm25(query)
         else:
-            try:
-                dense = self._dense(query)
-            except Exception as exc:  # noqa: BLE001 - embedding outage degrades to lexical, never to a 500
-                logger.warning("dense_retrieval_failed", extra={"error": repr(exc)})
-                dense = []
+            if dense_failed:
+                dense: list[tuple[int, float]] = []
+            else:
+                try:
+                    dense = self._dense(query, qv=qv)
+                except CassetteMiss:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - embedding outage degrades to lexical, never to a 500
+                    logger.warning("dense_retrieval_failed", extra={"error": repr(exc)})
+                    dense = []
             fused: dict[int, float] = {}
             for ranking in (self._bm25(query), dense[: max(20, k * 5)]):
                 for position, (idx, _) in enumerate(ranking):
@@ -266,6 +304,32 @@ class Retriever:
             Hit(chunk=self.chunks[idx], score=score, coverage=self._coverage(query, idx), rank=rank)
             for rank, (idx, score) in enumerate(ranked[:k], start=1)
         ]
+
+    def search(self, query: str, k: int = 4, mode: str = "hybrid") -> list[Hit]:
+        return self._search_one(query, k, mode)
+
+    def search_many(self, queries: dict[str, str], k: int = 4, mode: str = "hybrid") -> dict[str, list[Hit]]:
+        """Run several query wordings together, batching hosted embeddings into a single API call."""
+        if not self.chunks or not queries:
+            return {label: [] for label in queries}
+        vectors_by_label: dict[str, list[float]] = {}
+        dense_failed = False
+        if mode in ("dense", "hybrid"):
+            non_empty = [(label, q) for label, q in queries.items() if q.strip()]
+            if non_empty:
+                try:
+                    self._ensure_vectors()
+                    embedded = self.embedder.embed([self._query_text(q) for _, q in non_empty])
+                    vectors_by_label = {label: vec for (label, _), vec in zip(non_empty, embedded, strict=True)}
+                except CassetteMiss:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - an embedding outage degrades every wording to lexical
+                    logger.warning("dense_retrieval_failed", extra={"error": repr(exc)})
+                    dense_failed = True
+        return {
+            label: self._search_one(query, k, mode, qv=vectors_by_label.get(label), dense_failed=dense_failed)
+            for label, query in queries.items()
+        }
 
 
 def build_retriever(corpus_dir: Path, embedder: Embedder | None = None, include_raw: bool = False) -> Retriever:

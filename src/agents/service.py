@@ -29,10 +29,10 @@ RECURSION_LIMIT = 60
 # What a streaming client is shown while a turn runs: which agent decided what, which tool ran, the review outcome.
 # Model reasoning ("thought"), tool results and token counts stay in the trace, which is access-controlled.
 STREAMED_SPANS = frozenset(
-    {"guardrail_input", "decision", "tool", "review", "ticket_opened", "human_decision", "guardrail_output", "memory_compacted"}
+    {"guardrail_input", "decision", "tool", "review", "ticket_opened", "human_decision", "guardrail_output", "memory_compacted", "parallel"}
 )
 STREAMED_FIELDS = frozenset(
-    {"node", "kind", "action", "step", "tool", "error", "verdict", "outcome", "ticket_id", "status", "allowed", "category", "round"}
+    {"node", "kind", "action", "step", "tool", "error", "verdict", "outcome", "ticket_id", "status", "allowed", "category", "round", "branches"}
 )
 STILL_WAITING ="Your case is still with a human specialist (ticket {ticket_id}). You will get the outcome in this conversation as soon as they respond."
 
