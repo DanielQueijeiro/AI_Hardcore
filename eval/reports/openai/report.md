@@ -164,31 +164,31 @@ Every failed answer is reviewed and attributed to the agent, the judge, the dete
 | Run | Split | n | Semantic pass (raw) | Semantic pass (adjudicated) |
 |---|---|---|---|---|
 | 1 | dev | 18 | 1.000 | 1.000 |
-| 1 | validation | 94 | 0.947 | 0.979 |
+| 1 | validation | 94 | 0.947 | 0.968 |
 | 1 | heldout | 24 | 0.875 | 1.000 |
-| 1 | all | 136 | 0.941 | 0.985 |
+| 1 | all | 136 | 0.941 | 0.978 |
 | 2 | dev | 18 | 1.000 | 1.000 |
-| 2 | validation | 94 | 0.989 | 1.000 |
+| 2 | validation | 94 | 0.989 | 0.989 |
 | 2 | heldout | 24 | 0.917 | 1.000 |
-| 2 | all | 136 | 0.978 | 1.000 |
+| 2 | all | 136 | 0.978 | 0.993 |
 | 3 | dev | 18 | 1.000 | 1.000 |
 | 3 | validation | 94 | 0.979 | 1.000 |
 | 3 | heldout | 24 | 0.833 | 1.000 |
 | 3 | all | 136 | 0.956 | 1.000 |
 
-Failures by cause: judge 3, agent 2, grader_facts 12.
+Failures by cause: judge 1, agent 4, grader_facts 12.
 
 | Item | Run | Split | Cause | Outcome | Review note |
 |---|---|---|---|---|---|
-| h18 | 1 | validation | judge | pass | Answer gives the Get Smart product page waiver (R$ 60,000/month) first, then the all-machines page's conflicting R$ 40,000/R$ 80,000, both present in the evidence; the judge marked down a correct, grounded caveat as hedging. |
+| h18 | 1 | validation | judge | pass | Re-reviewed after the follow-up review and kept as a judge error. The answer gives the Get Smart product page waiver (R$ 60,000/month) first and then reports the all-machines page's conflicting R$ 40,000/80,000, both in the evidence, with a pointer to confirm. That is the standard the dual-reviewer borderline set requires for the same conflict on the Get Classica (b06a: an answer that drops the conflict is labelled fail); the judge marked down a correct caveat. |
 | s01 | 1 | validation | agent | fail | Evidence (get-classica page) states 'for comparison: Get Mini R$ 14.90'; the Knowledge Agent dismissed it as not a direct listing and the answer refused to give the price. Over-cautious abstention. |
-| s18 | 1 | validation | judge | pass | Status OFFLINE_GPRS_TIMEOUT and 'at least 3 consecutive hours' are both correct; the fact regex '3 hours' misses 'consecutive', and the judge called the runbook steps (present verbatim in the evidence) unsupported. Unrequested troubleshooting is verbose but grounded. |
+| s18 | 1 | validation | agent | fail | Re-reviewed after the follow-up review: status and the 3-hour charge are correct (the regex also misses '3 consecutive hours'), but the merchant asked for status and charging time and got the full offline runbook unasked. ADR-0026 treats unrequested content as a system defect, so this is an agent defect, not a judge error. |
 | s55 | 1 | validation | grader_facts | pass | Answer writes 'the cardholder does not recognize the transaction'; the regex requires 'not recogniz(ed/ing)'. Judge pass 5/5/5/5. |
 | s63 | 1 | validation | agent | fail | Model and terminal id correct, but the answer says to select Pix for a QR Code payment; retrieval never surfaced the passage that says to select debit, and the Knowledge Agent inferred Pix from 'Pix by QR Code'. |
 | s76 | 1 | heldout | grader_facts | pass | Answer writes 'for at least 3 consecutive hours'; the sealed regex requires a unit right after the number. Judge pass; sealed regex left untouched. |
 | s85 | 1 | heldout | grader_facts | pass | Answer writes 'Nao ha transacoes recusadas recentemente registradas' (plural 'transacoes'); the sealed regex only matches singular 'transacao'. Judge pass 5/5/5/5. |
 | s93 | 1 | heldout | grader_facts | pass | Answer writes 'Se aprobo la resincronizacion remota... orden de servicio SO-4A3076AB'; the sealed regex requires 'aprobado/aprobada'. Judge pass 5/5/5/5. |
-| s43 | 2 | validation | judge | pass | Answer reports the 4G session stalled (OFFLINE_GPRS_TIMEOUT) and Wi-Fi disabled, which is everything the reference asks; the judge claimed a key fact was missing. The added runbook steps are grounded but unrequested. |
+| s43 | 2 | validation | agent | fail | Re-reviewed after the follow-up review: the 4G and Wi-Fi status are right, but the answer adds the runbook unasked and says 'a orientacao nao confirma especificamente o significado...', the meta-remark ADR-0026 fixed as a defect on dev. Agent defect, not a judge error. |
 | s85 | 2 | heldout | grader_facts | pass | Answer writes 'Nao ha registro de transacao recusada recente'; the sealed regex does not allow 'registro de transacao' before 'recusada'. Judge pass 5/5/5/5. |
 | s95 | 2 | heldout | grader_facts | pass | Anonymous caller told to 'inicia sesion en tu cuenta'; the sealed regex accepts 'iniciar/inicie/inicies sesion' but not the imperative 'inicia'. Judge pass. |
 | s51 | 3 | validation | grader_facts | pass | All three rates correct and 'No se pueden combinar' stated; the regex 'no (se )?puede combin' misses the plural 'pueden'. Judge pass 5/5/5/5. |

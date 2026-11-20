@@ -436,6 +436,26 @@ def test_checklist_keeps_the_decline_code_settlement_amounts_and_compared_rates(
     assert evidence_checklist("Does the Get Smart print?", "Yes.", obs(lineup)) == [], "one product: no comparison"
 
 
+def test_fact_audit_finds_patterns_that_miss_known_correct_wordings(tmp_path):
+    import json
+
+    from eval.fact_audit import audit, render
+
+    items = [
+        {"id": "x1", "split": "heldout", "reference": "Charge it for 3 hours.", "facts": [["3 hours"], ["so-[a-z0-9]{8}"]]},
+        {"id": "x2", "split": "validation", "reference": "It is free.", "facts": [["paid"]]},
+    ]
+    report = tmp_path / "report.json"
+    answer = {"id": "x1", "answer": "Charge it for 3 consecutive hours. Order SO-1A2B3C4D.", "answer_sha256": "abc"}
+    report.write_text(json.dumps({"golden": {"items": [answer]}, "golden_repeat_items": []}), encoding="utf-8")
+    adjudications = [{"id": "x1", "run": 1, "answer_sha256": "abc", "cause": "grader_facts", "outcome": "pass"}]
+    result = audit(items, adjudications, [report])
+    assert result["reference_misses"] == {"x2": ["paid"]}, "service-order ids are minted at run time, never in a reference"
+    assert [x["pattern"] for x in result["correct_answer_misses"]["x1"]] == ["3 hours"]
+    assert result["fragile_by_split"] == {"heldout": 1, "validation": 1}
+    assert "2 of 3 fact pattern groups" in render(result)
+
+
 def test_checklist_flags_a_handoff_offer_when_there_is_nothing_to_escalate():
     from src.agents.checks import evidence_checklist
 
@@ -466,6 +486,11 @@ def test_checklist_flags_a_handoff_offer_when_there_is_nothing_to_escalate():
     wandering = focused + " The terminal is also offline: reconnect it to Wi-Fi and run the communication test."
     assert "Leave out connectivity troubleshooting" in evidence_checklist(message, wandering, decided)[-1]["item"]
     assert len(evidence_checklist("My machine won't connect and shows a decline error.", wandering, decided)) == 1
+    # Portuguese "Sim" (yes) is not the SIM card (follow-up review, 2026-11-19).
+    sim_yes = "Sim, o re-key foi aprovado para o código A / B e a ordem de serviço SO-1 foi criada."
+    assert len(evidence_checklist("Minha maquininha mostra um erro de recusa.", sim_yes, decided)) == 1, "only the decision item"
+    reseat = focused + " Then reseat the SIM and reboot."
+    assert "Leave out connectivity troubleshooting" in evidence_checklist(message, reseat, decided)[-1]["item"]
 
 
 def test_fx_quote_defaults_to_reais(monkeypatch, client):
