@@ -29491,7 +29491,7 @@
           },
           "validation": {
             "n": 94,
-            "pass_rate": 0.9787
+            "pass_rate": 0.9681
           },
           "heldout": {
             "n": 24,
@@ -29499,7 +29499,7 @@
           },
           "all": {
             "n": 136,
-            "pass_rate": 0.9853
+            "pass_rate": 0.9779
           }
         }
       },
@@ -29530,7 +29530,7 @@
           },
           "validation": {
             "n": 94,
-            "pass_rate": 1.0
+            "pass_rate": 0.9894
           },
           "heldout": {
             "n": 24,
@@ -29538,7 +29538,7 @@
           },
           "all": {
             "n": 136,
-            "pass_rate": 1.0
+            "pass_rate": 0.9926
           }
         }
       },
@@ -29583,8 +29583,8 @@
       }
     ],
     "failure_causes": {
-      "judge": 3,
-      "agent": 2,
+      "judge": 1,
+      "agent": 4,
       "grader_facts": 12
     },
     "failures": [
@@ -29594,7 +29594,7 @@
         "run": 1,
         "cause": "judge",
         "outcome": "pass",
-        "note": "Answer gives the Get Smart product page waiver (R$ 60,000/month) first, then the all-machines page's conflicting R$ 40,000/R$ 80,000, both present in the evidence; the judge marked down a correct, grounded caveat as hedging."
+        "note": "Re-reviewed after the follow-up review and kept as a judge error. The answer gives the Get Smart product page waiver (R$ 60,000/month) first and then reports the all-machines page's conflicting R$ 40,000/80,000, both in the evidence, with a pointer to confirm. That is the standard the dual-reviewer borderline set requires for the same conflict on the Get Classica (b06a: an answer that drops the conflict is labelled fail); the judge marked down a correct caveat."
       },
       {
         "id": "s01",
@@ -29608,9 +29608,9 @@
         "id": "s18",
         "split": "validation",
         "run": 1,
-        "cause": "judge",
-        "outcome": "pass",
-        "note": "Status OFFLINE_GPRS_TIMEOUT and 'at least 3 consecutive hours' are both correct; the fact regex '3 hours' misses 'consecutive', and the judge called the runbook steps (present verbatim in the evidence) unsupported. Unrequested troubleshooting is verbose but grounded."
+        "cause": "agent",
+        "outcome": "fail",
+        "note": "Re-reviewed after the follow-up review: status and the 3-hour charge are correct (the regex also misses '3 consecutive hours'), but the merchant asked for status and charging time and got the full offline runbook unasked. ADR-0026 treats unrequested content as a system defect, so this is an agent defect, not a judge error."
       },
       {
         "id": "s55",
@@ -29656,9 +29656,9 @@
         "id": "s43",
         "split": "validation",
         "run": 2,
-        "cause": "judge",
-        "outcome": "pass",
-        "note": "Answer reports the 4G session stalled (OFFLINE_GPRS_TIMEOUT) and Wi-Fi disabled, which is everything the reference asks; the judge claimed a key fact was missing. The added runbook steps are grounded but unrequested."
+        "cause": "agent",
+        "outcome": "fail",
+        "note": "Re-reviewed after the follow-up review: the 4G and Wi-Fi status are right, but the answer adds the runbook unasked and says 'a orientacao nao confirma especificamente o significado...', the meta-remark ADR-0026 fixed as a defect on dev. Agent defect, not a judge error."
       },
       {
         "id": "s85",
